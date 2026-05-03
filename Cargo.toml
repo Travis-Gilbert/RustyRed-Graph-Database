@@ -1,0 +1,22 @@
+[package]
+name = "theseus_native"
+version = "0.1.0"
+edition = "2021"
+description = "Native (Rust + PyO3) accelerators for Theseus retrieval. push_ppr is the first export."
+license = "MIT"
+repository = "https://github.com/Travis-Gilbert/index-api"
+rust-version = "1.78"
+
+[lib]
+name = "theseus_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22.5", features = ["abi3-py312", "extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"
