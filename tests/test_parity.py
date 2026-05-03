@@ -172,3 +172,43 @@ def test_native_matches_python_at_100k_nodes(
         python = sparse_ppr.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
 
     _assert_dicts_close(native, python, rel_tol=1e-5, abs_tol=1e-9)
+
+
+def _build_les_mis_like_adjacency() -> Adjacency:
+    """Two communities + bridge, matching the fixture in
+    apps/notebook/tests/test_sparse_ppr.py:_build_les_mis_like_adjacency.
+
+    Verifying parity on the same fixture the Django suite uses anchors
+    the native impl to the production test surface.
+    """
+    adj: Adjacency = {n: [] for n in range(10)}
+    edges: List[Tuple[int, int, float]] = []
+    for i in range(5):
+        for j in range(i + 1, 5):
+            edges.append((i, j, 1.0))
+    for i in range(5, 10):
+        for j in range(i + 1, 10):
+            edges.append((i, j, 1.0))
+    edges.append((4, 5, 0.3))
+    for u, v, w in edges:
+        adj[u].append((v, w))
+        adj[v].append((u, w))
+    return adj
+
+
+def test_les_mis_fixture_parity() -> None:
+    """Native and Python agree on the fixture used by the Django test suite."""
+    adj = _build_les_mis_like_adjacency()
+    seeds = {0: 1.0}
+
+    env_native = {k: v for k, v in os.environ.items() if k != "THESEUS_DISABLE_NATIVE"}
+    with patch.dict(os.environ, env_native, clear=True):
+        native = sparse_ppr.push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
+    with patch.dict(os.environ, {"THESEUS_DISABLE_NATIVE": "1"}):
+        python = sparse_ppr.push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
+
+    _assert_dicts_close(native, python, rel_tol=1e-5, abs_tol=1e-9)
+
+    # Top-5 set must match the existing NETWORKX_TOP5_NODES expectation.
+    top5_native = {nid for nid, _ in sorted(native.items(), key=lambda x: -x[1])[:5]}
+    assert top5_native == {0, 1, 2, 3, 4}
