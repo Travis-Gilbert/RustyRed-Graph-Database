@@ -43,6 +43,27 @@ The wrapper logs once at WARNING level on the first import that finds the wheel 
 
 Andersen, R., Chung, F., and Lang, K. (2006). Local Graph Partitioning using PageRank Vectors. FOCS 2006.
 
+## Benchmarks
+
+Single-threaded, single-seed PPR queries on random sparse graphs (avg degree 4, alpha 0.15, epsilon 1e-4), captured on the developer's M1 Max via the harness in `tests/test_benchmarks.py`:
+
+| Nodes | Native | Python | Speedup |
+|-------|--------|--------|---------|
+| 50K   | 0.0024s | 0.0318s | 13.2x |
+| 200K  | 0.0034s | 0.1753s | 51.3x |
+| 1M    | 0.0023s | 0.9573s | 413.9x (acceptance gate: must be >= 20x) |
+
+To re-run:
+
+```bash
+cd theseus_native
+python3 -m pytest tests/test_benchmarks.py -v -s
+```
+
+The fixture is generated with seed 42 for reproducibility. Numbers vary across hardware; the 20x floor is enforced on whatever runner executes the test.
+
+The native impl uses lazy on-demand neighbor extraction: ACL Push typically touches ~1/(epsilon*alpha) ~ 67k nodes for production params, so converting only those (not the full adjacency dict) eliminates the dominant FFI cost.
+
 ## License
 
 MIT.
