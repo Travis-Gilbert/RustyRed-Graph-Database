@@ -59,9 +59,16 @@ fn extract_adjacency(adjacency: &Bound<'_, PyDict>) -> PyResult<HashMap<i64, Vec
     Ok(adj)
 }
 
-/// Internal: extract `dict[int, float]` -> HashMap<i64, f64>.
-fn extract_seeds(seeds: &Bound<'_, PyDict>) -> PyResult<HashMap<i64, f64>> {
-    let mut out: HashMap<i64, f64> = HashMap::with_capacity(seeds.len());
+/// Internal: extract `dict[int, float]` -> (HashMap<i64, f64>, Vec<i64>).
+///
+/// Returns BOTH the value map AND an ordered key vec preserving the
+/// Python dict's insertion order. The seed pre-walk in `push_ppr` walks
+/// the ordered vec so node enqueue order matches the Python reference.
+/// Without this, ACL-Push's order-dependent residual accumulation drifts
+/// across the 1e-5 parity tolerance on graphs near the epsilon floor.
+fn extract_seeds(seeds: &Bound<'_, PyDict>) -> PyResult<(HashMap<i64, f64>, Vec<i64>)> {
+    let mut map: HashMap<i64, f64> = HashMap::with_capacity(seeds.len());
+    let mut order: Vec<i64> = Vec::with_capacity(seeds.len());
     for (key_obj, val_obj) in seeds.iter() {
         let u: i64 = key_obj
             .extract()
@@ -69,9 +76,10 @@ fn extract_seeds(seeds: &Bound<'_, PyDict>) -> PyResult<HashMap<i64, f64>> {
         let mass: f64 = val_obj
             .extract()
             .map_err(|_| PyTypeError::new_err("seeds values must be float"))?;
-        out.insert(u, mass);
+        map.insert(u, mass);
+        order.push(u);
     }
-    Ok(out)
+    Ok((map, order))
 }
 
 /// `push_ppr(adjacency, seeds, *, alpha=0.15, epsilon=1e-4, max_pushes=200_000)
@@ -90,7 +98,7 @@ pub fn push_ppr<'py>(
     max_pushes: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let adj = extract_adjacency(adjacency)?;
-    let seeds_map = extract_seeds(seeds)?;
+    let (seeds_map, seeds_order) = extract_seeds(seeds)?;
 
     let out_dict = PyDict::new_bound(py);
     if seeds_map.is_empty() {
@@ -99,6 +107,9 @@ pub fn push_ppr<'py>(
 
     // Per-node out-weight: sum of edge weights. Used to scale the
     // epsilon threshold so degree-1 hubs don't dominate the queue.
+    // Iteration order over `adj` is HashMap-arbitrary, but `out_weight`
+    // is only ever READ during the algorithm (never iterated), so this
+    // does not affect determinism.
     let mut out_weight: HashMap<i64, f64> = HashMap::with_capacity(adj.len());
     for (u, nbrs) in adj.iter() {
         if !nbrs.is_empty() {
@@ -115,21 +126,26 @@ pub fn push_ppr<'py>(
         epsilon * ow.max(1.0)
     };
 
-    // PPR estimate p[u] and residual r[u].
+    // PPR estimate p[u] and residual r[u]. Initialize r in seed-input
+    // order so subsequent push_back calls match Python's seed iteration.
     let mut p: HashMap<i64, f64> = HashMap::new();
     let mut r: HashMap<i64, f64> = HashMap::with_capacity(seeds_map.len() * 4);
-    for (u, mass) in seeds_map.iter() {
-        r.insert(*u, *mass);
+    for u in &seeds_order {
+        if let Some(mass) = seeds_map.get(u) {
+            r.insert(*u, *mass);
+        }
     }
 
     // FIFO queue. Python uses collections.deque; Rust VecDeque is the
-    // direct analogue. Iteration order over seeds_map differs between
-    // Python dict (insertion order) and HashMap (arbitrary), so the
-    // converged result is order-independent up to the per-node 1e-5
-    // tolerance the parity tests enforce.
+    // direct analogue. Walk `seeds_order` (the original Python dict
+    // insertion order) so node enqueue order matches the Python
+    // reference exactly. ACL-Push's residual accumulation is
+    // order-dependent at the 1e-5 floor on graphs that have many tiny
+    // residuals near threshold; matching Python order keeps the parity
+    // tests deterministic.
     let mut queue: VecDeque<i64> = VecDeque::with_capacity(seeds_map.len());
     let mut in_queue: HashSet<i64> = HashSet::with_capacity(seeds_map.len());
-    for u in seeds_map.keys() {
+    for u in &seeds_order {
         let ru = *r.get(u).unwrap_or(&0.0);
         if ru > threshold(*u, &out_weight) {
             queue.push_back(*u);
