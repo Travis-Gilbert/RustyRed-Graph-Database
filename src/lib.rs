@@ -17,11 +17,16 @@
 //! because Theseus PKs are arbitrary integers.
 
 mod push_ppr;
+mod search_kernel;
 
 use pyo3::prelude::*;
 
 #[pymodule]
 fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(push_ppr::push_ppr, m)?)?;
+    m.add_function(wrap_pyfunction!(search_kernel::search_normalize_urls_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(search_kernel::search_score_frontier_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(search_kernel::search_fuse_scores_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(search_kernel::search_cosine_topk, m)?)?;
     Ok(())
 }
