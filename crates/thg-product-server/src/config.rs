@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::auth::ApiToken;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
@@ -8,7 +10,7 @@ pub struct Config {
     pub redis_key_prefix: String,
     pub require_auth: bool,
     pub allowed_origins: Vec<String>,
-    pub api_tokens: Vec<String>,
+    pub api_tokens: Vec<ApiToken>,
 }
 
 impl Config {
@@ -44,9 +46,7 @@ impl Config {
         let api_tokens = env::var("THG_API_TOKENS")
             .unwrap_or_default()
             .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+            .filter_map(ApiToken::parse)
             .collect();
 
         Self {

@@ -1,16 +1,12 @@
 mod auth;
 mod config;
+mod router;
 mod state;
 
 use std::net::SocketAddr;
 
-use axum::{routing::get, Router};
 use config::Config;
 use state::AppState;
-
-async fn health() -> &'static str {
-    "ok"
-}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -20,9 +16,7 @@ async fn main() -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{exc}"))
     })?;
     let state = AppState::new(config);
-    let app = Router::new()
-        .route("/health", get(health))
-        .with_state(state);
+    let app = router::build_router(state);
 
     tracing::info!("THG_PRODUCT_READY {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;

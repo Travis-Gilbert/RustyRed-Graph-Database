@@ -1,5 +1,54 @@
 use axum::http::{HeaderMap, StatusCode};
 
+const ALL_SCOPES: [&str; 6] = [
+    "run:write",
+    "run:read",
+    "context:write",
+    "context:read",
+    "graph:read",
+    "admin:read",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiToken {
+    pub token: String,
+    pub scopes: Vec<String>,
+}
+
+impl ApiToken {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (token, scopes) = trimmed
+            .split_once('=')
+            .or_else(|| trimmed.split_once(':'))
+            .unwrap_or((trimmed, "*"));
+        let scopes = scopes
+            .split(['|', ' ', '+'])
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        Some(Self {
+            token: token.trim().to_string(),
+            scopes: if scopes.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                scopes
+            },
+        })
+    }
+
+    fn allows(&self, required_scope: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == required_scope)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
     pub token: String,
@@ -8,14 +57,14 @@ pub struct AuthContext {
 
 pub fn require_scope(
     headers: &HeaderMap,
-    valid_tokens: &[String],
+    valid_tokens: &[ApiToken],
     required_scope: &str,
     require_auth: bool,
 ) -> Result<AuthContext, StatusCode> {
     if !require_auth {
         return Ok(AuthContext {
             token: "dev".to_string(),
-            scopes: vec![required_scope.to_string()],
+            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_string()).collect(),
         });
     }
 
@@ -28,14 +77,17 @@ pub fn require_scope(
         .ok_or(StatusCode::UNAUTHORIZED)?
         .to_string();
 
-    let matched = valid_tokens.iter().any(|candidate| candidate == &token);
-    if !matched {
+    let matched = valid_tokens
+        .iter()
+        .find(|candidate| candidate.token == token)
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if !matched.allows(required_scope) {
         return Err(StatusCode::FORBIDDEN);
     }
 
     Ok(AuthContext {
         token,
-        scopes: vec![required_scope.to_string()],
+        scopes: matched.scopes.clone(),
     })
 }
 
@@ -43,12 +95,16 @@ pub fn require_scope(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
-    use super::require_scope;
+    use super::{require_scope, ApiToken};
 
     #[test]
     fn rejects_missing_bearer_token_when_auth_required() {
         let headers = HeaderMap::new();
-        let result = require_scope(&headers, &["secret".to_string()], "run:read", true);
+        let tokens = vec![ApiToken {
+            token: "secret".to_string(),
+            scopes: vec!["run:read".to_string()],
+        }];
+        let result = require_scope(&headers, &tokens, "run:read", true);
 
         assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
     }
@@ -57,10 +113,38 @@ mod tests {
     fn accepts_matching_bearer_token() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        let tokens = vec![ApiToken {
+            token: "secret".to_string(),
+            scopes: vec!["run:read".to_string()],
+        }];
 
-        let result = require_scope(&headers, &["secret".to_string()], "run:read", true).unwrap();
+        let result = require_scope(&headers, &tokens, "run:read", true).unwrap();
 
         assert_eq!(result.token, "secret");
         assert_eq!(result.scopes, vec!["run:read"]);
+    }
+
+    #[test]
+    fn rejects_token_without_required_scope() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        let tokens = vec![ApiToken {
+            token: "secret".to_string(),
+            scopes: vec!["run:read".to_string()],
+        }];
+
+        let result = require_scope(&headers, &tokens, "run:write", true);
+
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn parses_scoped_token_from_env_value() {
+        let token = ApiToken::parse("secret=run:read|graph:read").unwrap();
+
+        assert_eq!(token.token, "secret");
+        assert!(token.allows("run:read"));
+        assert!(token.allows("graph:read"));
+        assert!(!token.allows("admin:read"));
     }
 }
