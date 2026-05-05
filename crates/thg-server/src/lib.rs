@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{json, Value};
-use thg_core::{InMemoryThgExecutor, ThgExecutor, ThgRequest};
+use thg_core::{ThgExecutor, ThgRequest};
 
-pub type SharedExecutor = Arc<Mutex<InMemoryThgExecutor>>;
+pub type SharedExecutor = Arc<Mutex<Box<dyn ThgExecutor + Send>>>;
 
 pub fn serve(listener: TcpListener, executor: SharedExecutor) -> std::io::Result<()> {
     for stream in listener.incoming() {
@@ -35,11 +35,14 @@ pub fn handle_http_request(raw: &str, executor: SharedExecutor) -> String {
     match (parsed.method.as_str(), parsed.path.as_str()) {
         ("GET", "/health") => json_response(200, json!({ "ok": true, "status": "healthy" })),
         ("GET", "/ready") => {
-            let state_hash = executor.lock().unwrap().state_hash();
-            json_response(200, json!({ "ok": true, "status": "ready", "state_hash": state_hash }))
+            let state_hash = executor.lock().unwrap().state().hash();
+            json_response(
+                200,
+                json!({ "ok": true, "status": "ready", "state_hash": state_hash }),
+            )
         }
         ("GET", "/v1/state/hash") => {
-            let state_hash = executor.lock().unwrap().state_hash();
+            let state_hash = executor.lock().unwrap().state().hash();
             json_response(200, json!({ "ok": true, "state_hash": state_hash }))
         }
         ("GET", path) if path.starts_with("/v1/runs/") => {
@@ -58,10 +61,16 @@ fn command_response(body: &str, executor: SharedExecutor) -> String {
     let value = match serde_json::from_str::<Value>(body) {
         Ok(value) => value,
         Err(exc) => {
-            return json_response(400, json!({ "ok": false, "error": "invalid_json", "message": exc.to_string() }))
+            return json_response(
+                400,
+                json!({ "ok": false, "error": "invalid_json", "message": exc.to_string() }),
+            )
         }
     };
-    let command = value.get("command").and_then(Value::as_str).unwrap_or("THG.UNKNOWN");
+    let command = value
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("THG.UNKNOWN");
     let args = value
         .get("args")
         .or_else(|| value.get("payload"))
@@ -77,7 +86,10 @@ fn batch_response(body: &str, executor: SharedExecutor) -> String {
     let value = match serde_json::from_str::<Value>(body) {
         Ok(value) => value,
         Err(exc) => {
-            return json_response(400, json!({ "ok": false, "error": "invalid_json", "message": exc.to_string() }))
+            return json_response(
+                400,
+                json!({ "ok": false, "error": "invalid_json", "message": exc.to_string() }),
+            )
         }
     };
     let commands = value
@@ -87,7 +99,10 @@ fn batch_response(body: &str, executor: SharedExecutor) -> String {
         .unwrap_or_default();
     let mut results = Vec::new();
     for item in commands {
-        let command = item.get("command").and_then(Value::as_str).unwrap_or("THG.UNKNOWN");
+        let command = item
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("THG.UNKNOWN");
         let args = item
             .get("args")
             .or_else(|| item.get("payload"))
@@ -96,8 +111,11 @@ fn batch_response(body: &str, executor: SharedExecutor) -> String {
         let request = ThgRequest::new(command, args);
         results.push(executor.lock().unwrap().execute_request(request));
     }
-    let state_hash = executor.lock().unwrap().state_hash();
-    json_response(200, json!({ "ok": true, "results": results, "state_hash": state_hash }))
+    let state_hash = executor.lock().unwrap().state().hash();
+    json_response(
+        200,
+        json!({ "ok": true, "results": results, "state_hash": state_hash }),
+    )
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
@@ -124,7 +142,11 @@ fn request_complete(bytes: &[u8]) -> bool {
     let content_length = headers
         .lines()
         .find_map(|line| line.strip_prefix("Content-Length:"))
-        .or_else(|| headers.lines().find_map(|line| line.strip_prefix("content-length:")))
+        .or_else(|| {
+            headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+        })
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     body.as_bytes().len() >= content_length
@@ -173,7 +195,7 @@ mod tests {
 
     #[test]
     fn command_endpoint_executes_core_command() {
-        let executor: SharedExecutor = Arc::new(Mutex::new(InMemoryThgExecutor::new()));
+        let executor: SharedExecutor = Arc::new(Mutex::new(Box::new(InMemoryThgExecutor::new())));
         let body = r#"{"command":"THG.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#;
         let raw = format!(
             "POST /v1/command HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
@@ -190,7 +212,7 @@ mod tests {
 
     #[test]
     fn http_sequence_matches_direct_core_state_hash() {
-        let executor: SharedExecutor = Arc::new(Mutex::new(InMemoryThgExecutor::new()));
+        let executor: SharedExecutor = Arc::new(Mutex::new(Box::new(InMemoryThgExecutor::new())));
         let commands = [
             r#"{"command":"THG.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#,
             r#"{"command":"THG.RUN.STEP","args":{"run_id":"run:1","step_id":"step:1"}}"#,
