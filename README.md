@@ -1,6 +1,9 @@
 # theseus_native
 
-Rust + PyO3 accelerators for Theseus retrieval. Currently exports one function: `push_ppr`.
+Rust + PyO3 accelerators for Theseus retrieval and the THG V3 runtime.
+`push_ppr` remains the retrieval accelerator; `thg-core` is the shared
+Database-as-Harness command executor, and `thg-server` is the first standalone
+HTTP control server over that executor.
 
 ## Build (local development)
 
@@ -31,6 +34,16 @@ def push_ppr(
 ) -> dict[int, float]: ...
 ```
 
+THG exports:
+
+```python
+from theseus_native import ThgCoreExecutor
+
+executor = ThgCoreExecutor()
+executor.execute_json('{"command":"THG.RUN.BEGIN","args":{"task":"demo"}}')
+executor.state_hash()
+```
+
 Matches `apps/notebook/sparse_ppr.py:push_ppr` exactly. ACL local-push personalized PageRank: alpha is the restart probability (Theseus convention), epsilon is the per-node convergence threshold, max_pushes caps total iterations to prevent pathological walks.
 
 ## Fallback semantics
@@ -38,6 +51,33 @@ Matches `apps/notebook/sparse_ppr.py:push_ppr` exactly. ACL local-push personali
 `apps/notebook/sparse_ppr.py` is the dispatcher. It tries `from theseus_native import push_ppr` first; on ImportError, or when `THESEUS_DISABLE_NATIVE=1` is set in the environment at call time, it routes to the pure-Python `_python_push_ppr` defined in the same file. The fallback exists indefinitely (per ADR 0001 follow-up) so dev environments without the wheel still function.
 
 The wrapper logs once at WARNING level on the first import that finds the wheel missing: `theseus_native unavailable, using Python push_ppr`. Subsequent imports do not re-log.
+
+## THG standalone HTTP server
+
+Phase 1 standalone mode lives in `crates/thg-server`:
+
+```bash
+cd theseus_native
+cargo run -p thg-server -- --host 127.0.0.1 --port 7379
+```
+
+Endpoints:
+
+```text
+GET  /health
+GET  /ready
+GET  /v1/state/hash
+GET  /v1/runs/{id}
+POST /v1/command
+POST /v1/batch
+```
+
+Django selects embedded or remote THG with:
+
+```bash
+THG_MODE=in_process
+THG_MODE=remote_http THG_HTTP_URL=http://localhost:7379
+```
 
 ## Algorithm reference
 
