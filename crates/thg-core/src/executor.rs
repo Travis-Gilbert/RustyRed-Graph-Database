@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use crate::commands::{ThgCommand, ThgRequest, ThgResponse};
 use crate::errors::{ThgError, ThgResult};
 use crate::state::{stable_hash, ContextState, PatchState, RunState, StepState, ThgEdge, ThgNode, ThgState};
+use crate::store::ThgStore;
 
 pub trait ThgExecutor {
     fn execute(&mut self, command: ThgCommand, args: Value) -> ThgResult<ThgResponse>;
@@ -277,6 +278,48 @@ impl InMemoryThgExecutor {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StoreBackedThgExecutor<S: ThgStore> {
+    store: S,
+    inner: InMemoryThgExecutor,
+}
+
+impl<S: ThgStore> StoreBackedThgExecutor<S> {
+    pub fn new(store: S) -> Self {
+        let state = store.load();
+        Self {
+            store,
+            inner: InMemoryThgExecutor { state },
+        }
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    pub fn state_hash(&self) -> String {
+        self.inner.state_hash()
+    }
+
+    pub fn execute_json(&mut self, request_json: &str) -> String {
+        match serde_json::from_str::<ThgRequest>(request_json) {
+            Ok(request) => serde_json::to_string(&self.execute_request(request)).unwrap(),
+            Err(exc) => {
+                let response = ThgResponse::err(
+                    "THG.UNKNOWN",
+                    ThgError::invalid_json(exc.to_string()),
+                    self.state_hash(),
+                );
+                serde_json::to_string(&response).unwrap()
+            }
+        }
+    }
+
+    fn persist(&mut self) {
+        self.store.save(self.inner.state());
+    }
+}
+
 impl ThgExecutor for InMemoryThgExecutor {
     fn execute(&mut self, command: ThgCommand, args: Value) -> ThgResult<ThgResponse> {
         Ok(match command {
@@ -306,6 +349,30 @@ impl ThgExecutor for InMemoryThgExecutor {
 
     fn state(&self) -> &ThgState {
         &self.state
+    }
+}
+
+impl<S: ThgStore> ThgExecutor for StoreBackedThgExecutor<S> {
+    fn execute(&mut self, command: ThgCommand, args: Value) -> ThgResult<ThgResponse> {
+        let response = self.inner.execute(command, args)?;
+        if response.ok {
+            self.persist();
+        }
+        Ok(response)
+    }
+
+    fn execute_request(&mut self, request: ThgRequest) -> ThgResponse {
+        let command_name = request.command.clone();
+        match ThgCommand::from_name(&request.command) {
+            Ok(command) => self
+                .execute(command, request.args)
+                .unwrap_or_else(|error| ThgResponse::err(command_name, error, self.state_hash())),
+            Err(error) => ThgResponse::err(command_name, error, self.state_hash()),
+        }
+    }
+
+    fn state(&self) -> &ThgState {
+        self.inner.state()
     }
 }
 
@@ -484,5 +551,22 @@ mod tests {
         assert_eq!(parsed["command"], "THG.CONTEXT.PACK");
         assert_eq!(parsed["payload"]["artifact_id"], "artifact:1");
         assert!(parsed["state_hash"].as_str().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn store_backed_executor_persists_after_mutating_command() {
+        use super::StoreBackedThgExecutor;
+        use crate::store::{InMemoryThgStore, ThgStore};
+
+        let store = InMemoryThgStore::new();
+        let mut executor = StoreBackedThgExecutor::new(store);
+        let response = executor.execute_request(ThgRequest::new(
+            ThgCommand::RunBegin.name(),
+            json!({ "run_id": "run:persisted", "task": "durable THG" }),
+        ));
+
+        assert!(response.ok);
+        let saved = executor.store().load();
+        assert_eq!(saved.runs["run:persisted"].task, "durable THG");
     }
 }
