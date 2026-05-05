@@ -1,5 +1,7 @@
 mod auth;
 mod config;
+mod metrics;
+mod openapi;
 mod router;
 mod state;
 

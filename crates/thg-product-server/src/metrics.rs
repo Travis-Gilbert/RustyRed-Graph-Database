@@ -1,0 +1,27 @@
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
+use serde_json::{json, Value};
+
+use crate::auth::require_scope;
+use crate::state::AppState;
+
+pub async fn metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "admin:read",
+        state.config.require_auth,
+    )?;
+    Ok(Json(json!({
+        "service": "thg-product",
+        "status": "ok",
+        "auth_required": state.config.require_auth,
+        "configured_origins": state.config.allowed_origins.len()
+    })))
+}

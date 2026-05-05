@@ -49,6 +49,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/openapi.json", get(crate::openapi::openapi))
+        .route("/metrics", get(crate::metrics::metrics))
         .route("/v1/tenants/:tenant_id/command", post(command))
         .route("/v1/tenants/:tenant_id/batch", post(batch))
         .route("/v1/tenants/:tenant_id/runs/:run_id", get(run_get))
