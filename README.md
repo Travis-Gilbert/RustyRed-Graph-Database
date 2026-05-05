@@ -21,6 +21,21 @@ This builds an `abi3-py312` wheel and installs it into the active Python environ
 
 CI builds Linux x86_64 manylinux2014 wheels via `.github/workflows/build_native_wheels.yml`. macOS arm64 is built locally for now (Travis's M1); CI build for Darwin is out of scope for the first cut.
 
+Use `scripts/verify_thg_release.sh` from the repository root for the THG
+runtime/product release check. The verifier intentionally uses package-targeted
+Cargo release builds for the THG server binaries and uses `maturin` for the root
+PyO3 extension:
+
+```bash
+scripts/verify_thg_release.sh
+scripts/verify_thg_release.sh --develop  # install into the active Python env
+```
+
+Do not use `cargo build --manifest-path theseus_native/Cargo.toml --workspace
+--release` as the native release check on macOS. That command attempts to link
+the root PyO3 `cdylib` as a plain Cargo artifact and can fail with undefined
+Python symbols even when the THG binaries and `maturin` wheel path are healthy.
+
 ## Public API
 
 ```python
