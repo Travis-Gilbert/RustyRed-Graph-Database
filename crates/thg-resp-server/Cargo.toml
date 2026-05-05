@@ -1,0 +1,10 @@
+[package]
+name = "thg-resp-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redis-protocol = "5"
+serde_json = "1.0"
+thg-core = { path = "../thg-core", features = ["redis-store"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
