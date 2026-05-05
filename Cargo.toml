@@ -12,6 +12,7 @@ members = [
     ".",
     "crates/thg-core",
     "crates/thg-server",
+    "crates/thg-product-server",
 ]
 resolver = "2"
 
