@@ -5,7 +5,7 @@ edition = "2021"
 description = "Native (Rust + PyO3) accelerators for Theseus retrieval. push_ppr is the first export."
 license = "MIT"
 repository = "https://github.com/Travis-Gilbert/index-api"
-rust-version = "1.78"
+rust-version = "1.85"
 
 [workspace]
 members = [

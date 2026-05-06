@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Standalone HTTP control server for THG-Core."
 license = "MIT"
-rust-version = "1.78"
+rust-version = "1.85"
 
 [dependencies]
 serde_json = "1.0"
