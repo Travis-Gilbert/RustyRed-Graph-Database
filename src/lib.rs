@@ -17,6 +17,7 @@
 //! because Theseus PKs are arbitrary integers.
 
 mod push_ppr;
+mod graph_export;
 mod search_kernel;
 mod thg;
 
@@ -38,6 +39,8 @@ fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(search_kernel::search_cosine_topk, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_export::graph_remap_ids_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_export::graph_pack_edges_batch, m)?)?;
     m.add_function(wrap_pyfunction!(thg::thg_expand_bounded, m)?)?;
     m.add_function(wrap_pyfunction!(thg::thg_paths_shortest, m)?)?;
     m.add_class::<thg::ThgCoreExecutor>()?;
