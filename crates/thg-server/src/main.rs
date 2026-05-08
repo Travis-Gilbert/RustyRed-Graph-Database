@@ -51,7 +51,7 @@ impl Config {
             .unwrap_or(7379);
         let store = env::var("THG_STORE").unwrap_or_else(|_| "memory".to_string());
         let redis_key =
-            env::var("THG_REDIS_KEY").unwrap_or_else(|_| "theseus:thg:state:v1".to_string());
+            env::var("THG_REDIS_KEY").unwrap_or_else(|_| "theseus:thg:tenant:state:v1".to_string());
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
