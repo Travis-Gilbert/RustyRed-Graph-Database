@@ -23,9 +23,9 @@ impl Config {
                 "127.0.0.1".to_string()
             }
         });
-        let port = env::var("THG_PRODUCT_PORT")
-            .ok()
-            .or(railway_port)
+        let port = railway_port
+            .clone()
+            .or_else(|| env::var("THG_PRODUCT_PORT").ok())
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(8380);
         let redis_url = env::var("THG_REDIS_URL")
