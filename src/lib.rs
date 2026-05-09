@@ -17,6 +17,7 @@
 //! because Theseus PKs are arbitrary integers.
 
 mod push_ppr;
+mod bgi;
 mod graph_export;
 mod search_kernel;
 mod thg;
@@ -26,6 +27,11 @@ use pyo3::prelude::*;
 #[pymodule]
 fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(push_ppr::push_ppr, m)?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_stable_hash_json, m)?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_fact_pack_hash_rows_json, m)?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_egraph_receipt_summary_json, m)?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_datalog_receipt_summary_json, m)?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_compact_receipts_json, m)?)?;
     m.add_function(wrap_pyfunction!(
         search_kernel::search_normalize_urls_batch,
         m
