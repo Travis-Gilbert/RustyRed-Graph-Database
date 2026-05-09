@@ -30,7 +30,15 @@ fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bgi::bgi_stable_hash_json, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_fact_pack_hash_rows_json, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_egraph_receipt_summary_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        bgi::bgi_egraph_extract_context_pack_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_datalog_receipt_summary_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        bgi::bgi_datalog_derive_core_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_compact_receipts_json, m)?)?;
     m.add_function(wrap_pyfunction!(
         search_kernel::search_normalize_urls_batch,
