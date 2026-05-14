@@ -424,6 +424,26 @@ impl InMemoryThgExecutor {
             self.state_hash(),
         )
     }
+
+    fn graph_rebuild_indexes(&mut self) -> ThgResponse {
+        match self.graph_store.rebuild_indexes() {
+            Ok(report) => ThgResponse::ok(
+                ThgCommand::GraphRebuildIndexes.name(),
+                if report.after.ok {
+                    "ok"
+                } else {
+                    "canonical_graph_problem"
+                },
+                json!({ "report": report }),
+                self.state_hash(),
+            ),
+            Err(error) => ThgResponse::err(
+                ThgCommand::GraphRebuildIndexes.name(),
+                ThgError::new(error.code, error.message),
+                self.state_hash(),
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -488,6 +508,7 @@ impl ThgExecutor for InMemoryThgExecutor {
             ThgCommand::GraphNeighbors => self.graph_neighbors(args),
             ThgCommand::GraphStats => self.graph_stats(),
             ThgCommand::GraphVerify => self.graph_verify(),
+            ThgCommand::GraphRebuildIndexes => self.graph_rebuild_indexes(),
         })
     }
 
@@ -830,6 +851,10 @@ mod tests {
         ));
         let verify =
             executor.execute_request(ThgRequest::new(ThgCommand::GraphVerify.name(), json!({})));
+        let rebuild = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphRebuildIndexes.name(),
+            json!({}),
+        ));
 
         assert!(node_a.ok);
         assert!(node_b.ok);
@@ -840,6 +865,7 @@ mod tests {
         assert_eq!(neighbors.payload["plan"]["operation"], "adjacency_seek");
         assert_eq!(neighbors.payload["neighbors"][0]["node_id"], "node:b");
         assert_eq!(verify.payload["report"]["ok"], true);
+        assert_eq!(rebuild.payload["report"]["after"]["ok"], true);
     }
 
     #[test]

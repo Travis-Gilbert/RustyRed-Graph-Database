@@ -24,6 +24,7 @@ pub enum ThgCommand {
     GraphNeighbors,
     GraphStats,
     GraphVerify,
+    GraphRebuildIndexes,
 }
 
 impl ThgCommand {
@@ -46,6 +47,7 @@ impl ThgCommand {
             "THG.GRAPH.NEIGHBORS" => Ok(Self::GraphNeighbors),
             "THG.GRAPH.STATS" => Ok(Self::GraphStats),
             "THG.GRAPH.VERIFY" => Ok(Self::GraphVerify),
+            "THG.GRAPH.REBUILD_INDEXES" | "THG.GRAPH.REBUILD" => Ok(Self::GraphRebuildIndexes),
             _ => Err(ThgError::unsupported_command(name)),
         }
     }
@@ -69,6 +71,7 @@ impl ThgCommand {
             Self::GraphNeighbors => "THG.GRAPH.NEIGHBORS",
             Self::GraphStats => "THG.GRAPH.STATS",
             Self::GraphVerify => "THG.GRAPH.VERIFY",
+            Self::GraphRebuildIndexes => "THG.GRAPH.REBUILD_INDEXES",
         }
     }
 }

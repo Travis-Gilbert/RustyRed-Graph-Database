@@ -1,5 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,6 +22,7 @@ pub trait GraphStore {
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit>;
     fn stats(&self) -> GraphStats;
     fn verify(&self) -> VerifyReport;
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport>;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,7 +32,7 @@ pub struct GraphStoreError {
 }
 
 impl GraphStoreError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -41,6 +48,17 @@ impl GraphStoreError {
             "missing_graph_endpoint",
             format!("edge {edge_id} {endpoint} endpoint {node_id} does not exist"),
         )
+    }
+
+    fn empty_transaction() -> Self {
+        Self::new(
+            "empty_graph_transaction",
+            "graph transaction requires at least one mutation",
+        )
+    }
+
+    fn io(action: impl AsRef<str>, err: impl std::fmt::Display) -> Self {
+        Self::new("redcore_io_error", format!("{}: {err}", action.as_ref()))
     }
 
     fn tombstoned_endpoint(edge_id: &str, endpoint: &str, node_id: &str) -> Self {
@@ -230,6 +248,33 @@ pub struct GraphWriteResult {
     pub checksum: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "op", content = "record", rename_all = "snake_case")]
+pub enum GraphMutation {
+    NodeUpsert(NodeRecord),
+    EdgeUpsert(EdgeRecord),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphMutationBatch {
+    pub mutations: Vec<GraphMutation>,
+}
+
+impl GraphMutationBatch {
+    pub fn new(mutations: impl IntoIterator<Item = GraphMutation>) -> Self {
+        Self {
+            mutations: mutations.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphTransaction {
+    pub txn_id: u64,
+    pub graph_version: u64,
+    pub writes: Vec<GraphWriteResult>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GraphStats {
     pub version: u64,
@@ -239,6 +284,13 @@ pub struct GraphStats {
     pub edge_types_total: usize,
     pub property_keys_total: usize,
     pub property_indexes_total: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphSnapshot {
+    pub version: u64,
+    pub nodes: Vec<NodeRecord>,
+    pub edges: Vec<EdgeRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -253,6 +305,13 @@ pub struct VerifyReport {
     pub ok: bool,
     pub stats: GraphStats,
     pub problems: Vec<VerifyProblem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphRebuildReport {
+    pub repaired: bool,
+    pub before: VerifyReport,
+    pub after: VerifyReport,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -270,6 +329,28 @@ pub struct InMemoryGraphStore {
 impl InMemoryGraphStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn snapshot(&self) -> GraphSnapshot {
+        GraphSnapshot {
+            version: self.version,
+            nodes: self.nodes.values().cloned().collect(),
+            edges: self.edges.values().cloned().collect(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> GraphStoreResult<Self> {
+        let mut store = Self::new();
+        store.version = snapshot.version;
+        for mut node in snapshot.nodes {
+            node.labels = normalize_labels(node.labels);
+            store.apply_recovered_node(node)?;
+        }
+        for edge in snapshot.edges {
+            store.apply_recovered_edge(edge)?;
+        }
+        store.version = store.version.max(snapshot.version);
+        Ok(store)
     }
 
     pub fn upsert_node(&mut self, mut node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
@@ -298,6 +379,22 @@ impl InMemoryGraphStore {
         })
     }
 
+    fn apply_recovered_node(&mut self, mut node: NodeRecord) -> GraphStoreResult<()> {
+        if node.id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        node.labels = normalize_labels(node.labels);
+        if let Some(existing) = self.nodes.get(&node.id).cloned() {
+            self.remove_node_indexes(&existing);
+        }
+        if !node.tombstone {
+            self.add_node_indexes(&node);
+        }
+        self.version = self.version.max(node.version);
+        self.nodes.insert(node.id.clone(), node);
+        Ok(())
+    }
+
     pub fn upsert_edge(&mut self, mut edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
         validate_edge_shape(&edge)?;
         self.require_live_endpoint(&edge, "from", &edge.from_id)?;
@@ -321,6 +418,23 @@ impl InMemoryGraphStore {
             version: self.version,
             checksum,
         })
+    }
+
+    fn apply_recovered_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        validate_edge_shape(&edge)?;
+        if !edge.tombstone {
+            self.require_live_endpoint(&edge, "from", &edge.from_id)?;
+            self.require_live_endpoint(&edge, "to", &edge.to_id)?;
+        }
+        if let Some(existing) = self.edges.get(&edge.id).cloned() {
+            self.remove_edge_indexes(&existing);
+        }
+        if !edge.tombstone {
+            self.add_edge_indexes(&edge);
+        }
+        self.version = self.version.max(edge.version);
+        self.edges.insert(edge.id.clone(), edge);
+        Ok(())
     }
 
     pub fn get_node(&self, id: &str) -> Option<&NodeRecord> {
@@ -550,6 +664,37 @@ impl InMemoryGraphStore {
         }
     }
 
+    pub fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        let before = self.verify();
+        self.rebuild_indexes_from_records();
+        let after = self.verify();
+        Ok(GraphRebuildReport {
+            repaired: !before.ok && after.ok,
+            before,
+            after,
+        })
+    }
+
+    fn rebuild_indexes_from_records(&mut self) {
+        self.out_adjacency.clear();
+        self.in_adjacency.clear();
+        self.label_index.clear();
+        self.edge_type_index.clear();
+        self.property_index.clear();
+        let nodes = self.nodes.values().cloned().collect::<Vec<_>>();
+        let edges = self.edges.values().cloned().collect::<Vec<_>>();
+        for node in nodes {
+            if !node.tombstone {
+                self.add_node_indexes(&node);
+            }
+        }
+        for edge in edges {
+            if !edge.tombstone {
+                self.add_edge_indexes(&edge);
+            }
+        }
+    }
+
     fn require_live_endpoint(
         &self,
         edge: &EdgeRecord,
@@ -629,6 +774,838 @@ impl InMemoryGraphStore {
             &edge.id,
         );
     }
+}
+
+const REDCORE_AOF_MAGIC: &str = "RRGDB_AOF";
+const REDCORE_MANIFEST_VERSION: u32 = 1;
+const REDCORE_SNAPSHOT_FILE: &str = "graph.snapshot.current";
+const REDCORE_PREVIOUS_SNAPSHOT_FILE: &str = "graph.snapshot.previous";
+const REDCORE_AOF_FILE: &str = "graph.aof.current";
+const REDCORE_MANIFEST_FILE: &str = "manifest.json";
+const REDCORE_LOCK_FILE: &str = ".redcore.lock";
+const REDCORE_CURRENT_SNAPSHOT_TMP_FILE: &str = "graph.snapshot.current.tmp";
+const REDCORE_PREVIOUS_SNAPSHOT_TMP_FILE: &str = "graph.snapshot.previous.tmp";
+const REDCORE_MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
+
+static REDCORE_PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedCoreDurability {
+    None,
+    AofEverysec,
+    AofAlways,
+    SnapshotOnly,
+}
+
+impl RedCoreDurability {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "memory" => Self::None,
+            "aof_always" | "always" => Self::AofAlways,
+            "snapshot_only" | "snapshot" => Self::SnapshotOnly,
+            _ => Self::AofEverysec,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AofEverysec => "aof_everysec",
+            Self::AofAlways => "aof_always",
+            Self::SnapshotOnly => "snapshot_only",
+        }
+    }
+
+    fn uses_aof(self) -> bool {
+        matches!(self, Self::AofEverysec | Self::AofAlways)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreOptions {
+    pub durability: RedCoreDurability,
+    pub snapshot_interval_writes: u64,
+    pub strict_acid: bool,
+}
+
+impl Default for RedCoreOptions {
+    fn default() -> Self {
+        Self {
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 1_000,
+            strict_acid: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreStatus {
+    pub mode: String,
+    pub durability: String,
+    pub data_dir: Option<String>,
+    pub graph_version: u64,
+    pub last_txn_id: u64,
+    pub snapshot_txn_id: u64,
+    pub recovered_frames: u64,
+    pub last_recovery_ok: bool,
+    pub strict_acid: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RedCoreManifest {
+    version: u32,
+    graph_version: u64,
+    last_txn_id: u64,
+    snapshot_txn_id: u64,
+    durability: RedCoreDurability,
+    snapshot_file: String,
+    aof_file: String,
+    updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RedCoreSnapshotEnvelope {
+    version: u32,
+    txn_id: u64,
+    graph: GraphSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RedCoreAofFrame {
+    magic: String,
+    version: u32,
+    txn_id: u64,
+    graph_version: u64,
+    timestamp_unix_ms: u128,
+    payload_checksum: String,
+    mutation: RedCoreMutation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "op", content = "record", rename_all = "snake_case")]
+enum RedCoreMutation {
+    NodeUpsert(NodeRecord),
+    EdgeUpsert(EdgeRecord),
+    Batch(Vec<RedCoreMutation>),
+}
+
+impl From<GraphMutation> for RedCoreMutation {
+    fn from(mutation: GraphMutation) -> Self {
+        match mutation {
+            GraphMutation::NodeUpsert(node) => Self::NodeUpsert(node),
+            GraphMutation::EdgeUpsert(edge) => Self::EdgeUpsert(edge),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RedCoreGraphStore {
+    store: InMemoryGraphStore,
+    data_dir: Option<PathBuf>,
+    _directory_lock: Option<RedCoreDirectoryLock>,
+    options: RedCoreOptions,
+    last_txn_id: u64,
+    snapshot_txn_id: u64,
+    recovered_frames: u64,
+    last_recovery_ok: bool,
+    last_fsync: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct RedCoreDirectoryLock {
+    file: File,
+    process_key: PathBuf,
+}
+
+impl RedCoreGraphStore {
+    pub fn memory() -> Self {
+        Self {
+            store: InMemoryGraphStore::new(),
+            data_dir: None,
+            _directory_lock: None,
+            options: RedCoreOptions {
+                durability: RedCoreDurability::None,
+                snapshot_interval_writes: 0,
+                strict_acid: false,
+            },
+            last_txn_id: 0,
+            snapshot_txn_id: 0,
+            recovered_frames: 0,
+            last_recovery_ok: true,
+            last_fsync: None,
+        }
+    }
+
+    pub fn open(data_dir: impl Into<PathBuf>, options: RedCoreOptions) -> GraphStoreResult<Self> {
+        validate_redcore_options(&options)?;
+        let data_dir = data_dir.into();
+        fs::create_dir_all(&data_dir)
+            .map_err(|err| GraphStoreError::io("create RedCore data directory", err))?;
+        let directory_lock = acquire_redcore_directory_lock(&data_dir)?;
+        let mut engine = Self {
+            store: InMemoryGraphStore::new(),
+            data_dir: Some(data_dir),
+            _directory_lock: Some(directory_lock),
+            options,
+            last_txn_id: 0,
+            snapshot_txn_id: 0,
+            recovered_frames: 0,
+            last_recovery_ok: false,
+            last_fsync: None,
+        };
+        engine.recover()?;
+        engine.last_recovery_ok = true;
+        engine.write_manifest()?;
+        Ok(engine)
+    }
+
+    pub fn readiness_check(
+        data_dir: &Path,
+        durability: RedCoreDurability,
+        strict_acid: bool,
+    ) -> GraphStoreResult<()> {
+        validate_redcore_options(&RedCoreOptions {
+            durability,
+            snapshot_interval_writes: 1,
+            strict_acid,
+        })?;
+        fs::create_dir_all(data_dir)
+            .map_err(|err| GraphStoreError::io("create RedCore data directory", err))?;
+        if durability.uses_aof() {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(data_dir.join(REDCORE_AOF_FILE))
+                .map_err(|err| GraphStoreError::io("open RedCore AOF for readiness", err))?;
+        }
+        let probe_path = data_dir.join(".ready-probe");
+        fs::write(&probe_path, b"ok")
+            .map_err(|err| GraphStoreError::io("write RedCore readiness probe", err))?;
+        sync_file_path(&probe_path, "fsync RedCore readiness probe")?;
+        fs::remove_file(&probe_path)
+            .map_err(|err| GraphStoreError::io("remove RedCore readiness probe", err))?;
+        sync_directory(
+            data_dir,
+            "fsync RedCore data directory after readiness probe",
+        )?;
+        Ok(())
+    }
+
+    pub fn status(&self) -> RedCoreStatus {
+        RedCoreStatus {
+            mode: if self.data_dir.is_some() {
+                "embedded".to_string()
+            } else {
+                "memory".to_string()
+            },
+            durability: self.options.durability.as_str().to_string(),
+            data_dir: self
+                .data_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            graph_version: self.store.stats().version,
+            last_txn_id: self.last_txn_id,
+            snapshot_txn_id: self.snapshot_txn_id,
+            recovered_frames: self.recovered_frames,
+            last_recovery_ok: self.last_recovery_ok,
+            strict_acid: self.options.strict_acid,
+        }
+    }
+
+    pub fn graph_snapshot(&self) -> GraphSnapshot {
+        self.store.snapshot()
+    }
+
+    pub fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        self.commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]))?
+            .writes
+            .into_iter()
+            .next()
+            .ok_or_else(|| GraphStoreError::new("redcore_missing_write", "node write vanished"))
+    }
+
+    pub fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        self.commit_batch(GraphMutationBatch::new([GraphMutation::EdgeUpsert(edge)]))?
+            .writes
+            .into_iter()
+            .next()
+            .ok_or_else(|| GraphStoreError::new("redcore_missing_write", "edge write vanished"))
+    }
+
+    pub fn commit_batch(
+        &mut self,
+        batch: GraphMutationBatch,
+    ) -> GraphStoreResult<GraphTransaction> {
+        if batch.mutations.is_empty() {
+            return Err(GraphStoreError::empty_transaction());
+        }
+
+        let mut staged = self.store.clone();
+        let mut writes = Vec::with_capacity(batch.mutations.len());
+        let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
+
+        for mutation in batch.mutations {
+            match mutation {
+                GraphMutation::NodeUpsert(node) => {
+                    let write = staged.upsert_node(node)?;
+                    let record = staged.nodes.get(&write.id).cloned().ok_or_else(|| {
+                        GraphStoreError::new("redcore_missing_write", "node write vanished")
+                    })?;
+                    durable_mutations.push(RedCoreMutation::NodeUpsert(record));
+                    writes.push(write);
+                }
+                GraphMutation::EdgeUpsert(edge) => {
+                    let write = staged.upsert_edge(edge)?;
+                    let record = staged.edges.get(&write.id).cloned().ok_or_else(|| {
+                        GraphStoreError::new("redcore_missing_write", "edge write vanished")
+                    })?;
+                    durable_mutations.push(RedCoreMutation::EdgeUpsert(record));
+                    writes.push(write);
+                }
+            }
+        }
+
+        let txn_id = self.last_txn_id + 1;
+        let graph_version = staged.stats().version;
+        let durable_mutation = if durable_mutations.len() == 1 {
+            durable_mutations
+                .pop()
+                .expect("single durable mutation exists")
+        } else {
+            RedCoreMutation::Batch(durable_mutations)
+        };
+        let prepublished_snapshot_txn_id =
+            self.persist_before_publish(txn_id, graph_version, &staged, durable_mutation)?;
+
+        self.store = staged;
+        self.last_txn_id = txn_id;
+        if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
+            self.snapshot_txn_id = snapshot_txn_id;
+        }
+
+        Ok(GraphTransaction {
+            txn_id,
+            graph_version,
+            writes,
+        })
+    }
+
+    pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        Ok(self.store.get_node(id).cloned())
+    }
+
+    pub fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        Ok(self.store.get_edge(id).cloned())
+    }
+
+    pub fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        Ok(self.store.query_nodes(query))
+    }
+
+    pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        Ok(self.store.neighbors(query))
+    }
+
+    pub fn stats(&self) -> GraphStoreResult<GraphStats> {
+        Ok(self.store.stats())
+    }
+
+    pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
+        Ok(self.store.verify())
+    }
+
+    pub fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        self.store.rebuild_indexes()
+    }
+
+    pub fn labels(&self) -> GraphStoreResult<Vec<String>> {
+        Ok(self.store.labels())
+    }
+
+    pub fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+        Ok(self.store.edge_types())
+    }
+
+    pub fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        Ok(self.store.property_keys())
+    }
+
+    pub fn snapshot_now(&mut self) -> GraphStoreResult<()> {
+        self.write_snapshot()?;
+        self.write_manifest()
+    }
+
+    fn recover(&mut self) -> GraphStoreResult<()> {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return Ok(());
+        };
+        let _manifest = read_manifest(&data_dir)?;
+        if let Some(envelope) = read_latest_valid_snapshot(&data_dir)? {
+            self.snapshot_txn_id = envelope.txn_id;
+            self.last_txn_id = self.last_txn_id.max(envelope.txn_id);
+            self.store = InMemoryGraphStore::from_snapshot(envelope.graph)?;
+        }
+        self.replay_aof(&data_dir)?;
+        Ok(())
+    }
+
+    fn replay_aof(&mut self, data_dir: &Path) -> GraphStoreResult<()> {
+        let path = data_dir.join(REDCORE_AOF_FILE);
+        if !path.exists() {
+            return Ok(());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|err| GraphStoreError::io("open RedCore AOF", err))?;
+        let read_file = file
+            .try_clone()
+            .map_err(|err| GraphStoreError::io("clone RedCore AOF reader", err))?;
+        let mut reader = BufReader::new(read_file);
+        let mut frame_start = 0_u64;
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader
+                .read_line(&mut line)
+                .map_err(|err| GraphStoreError::io("read RedCore AOF", err))?;
+            if bytes_read == 0 {
+                break;
+            }
+            let frame_end = frame_start + bytes_read as u64;
+            if line.trim().is_empty() {
+                frame_start = frame_end;
+                continue;
+            }
+            if !line.ends_with('\n') {
+                truncate_aof_tail(&file, data_dir, frame_start)?;
+                break;
+            }
+            let raw = line.trim_end_matches(['\r', '\n']);
+            let frame = match decode_aof_frame(raw) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    truncate_aof_tail(&file, data_dir, frame_start)?;
+                    break;
+                }
+            };
+            if frame.txn_id <= self.snapshot_txn_id {
+                frame_start = frame_end;
+                continue;
+            }
+            self.apply_recovered_mutation(frame.mutation)?;
+            self.last_txn_id = self.last_txn_id.max(frame.txn_id);
+            self.recovered_frames += 1;
+            frame_start = frame_end;
+        }
+        Ok(())
+    }
+
+    fn apply_recovered_mutation(&mut self, mutation: RedCoreMutation) -> GraphStoreResult<()> {
+        match mutation {
+            RedCoreMutation::NodeUpsert(node) => self.store.apply_recovered_node(node),
+            RedCoreMutation::EdgeUpsert(edge) => self.store.apply_recovered_edge(edge),
+            RedCoreMutation::Batch(mutations) => {
+                for mutation in mutations {
+                    self.apply_recovered_mutation(mutation)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn persist_before_publish(
+        &mut self,
+        txn_id: u64,
+        graph_version: u64,
+        staged: &InMemoryGraphStore,
+        mutation: RedCoreMutation,
+    ) -> GraphStoreResult<Option<u64>> {
+        let mut snapshot_txn_id = None;
+        match self.options.durability {
+            RedCoreDurability::None => {}
+            RedCoreDurability::SnapshotOnly => {
+                self.write_snapshot_for(txn_id, staged)?;
+                snapshot_txn_id = Some(txn_id);
+            }
+            RedCoreDurability::AofEverysec | RedCoreDurability::AofAlways => {
+                self.append_aof(txn_id, graph_version, mutation)?;
+                if self.should_snapshot_for(txn_id) {
+                    self.write_snapshot_for(txn_id, staged)?;
+                    snapshot_txn_id = Some(txn_id);
+                }
+            }
+        }
+        self.write_manifest_for(
+            graph_version,
+            txn_id,
+            snapshot_txn_id.unwrap_or(self.snapshot_txn_id),
+        )?;
+        Ok(snapshot_txn_id)
+    }
+
+    fn append_aof(
+        &mut self,
+        txn_id: u64,
+        graph_version: u64,
+        mutation: RedCoreMutation,
+    ) -> GraphStoreResult<()> {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return Ok(());
+        };
+        fs::create_dir_all(data_dir)
+            .map_err(|err| GraphStoreError::io("create RedCore AOF directory", err))?;
+        let frame = RedCoreAofFrame {
+            magic: REDCORE_AOF_MAGIC.to_string(),
+            version: REDCORE_MANIFEST_VERSION,
+            txn_id,
+            graph_version,
+            timestamp_unix_ms: unix_ms(),
+            payload_checksum: stable_hash(&mutation),
+            mutation,
+        };
+        let raw = serde_json::to_string(&frame)
+            .map_err(|err| GraphStoreError::io("encode RedCore AOF frame", err))?;
+        let path = data_dir.join(REDCORE_AOF_FILE);
+        let created = !path.exists();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| GraphStoreError::io("open RedCore AOF for append", err))?;
+        file.write_all(raw.as_bytes())
+            .map_err(|err| GraphStoreError::io("append RedCore AOF", err))?;
+        file.write_all(b"\n")
+            .map_err(|err| GraphStoreError::io("append RedCore AOF frame delimiter", err))?;
+        match self.options.durability {
+            RedCoreDurability::AofAlways => {
+                file.sync_all()
+                    .map_err(|err| GraphStoreError::io("fsync RedCore AOF", err))?;
+                if created {
+                    sync_directory(data_dir, "fsync RedCore data directory after AOF create")?;
+                }
+                self.last_fsync = Some(SystemTime::now());
+            }
+            RedCoreDurability::AofEverysec => {
+                let should_sync = self
+                    .last_fsync
+                    .and_then(|last| last.elapsed().ok())
+                    .map(|elapsed| elapsed >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if should_sync {
+                    file.sync_data()
+                        .map_err(|err| GraphStoreError::io("fsync RedCore AOF", err))?;
+                    if created {
+                        sync_directory(data_dir, "fsync RedCore data directory after AOF create")?;
+                    }
+                    self.last_fsync = Some(SystemTime::now());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn should_snapshot_for(&self, txn_id: u64) -> bool {
+        let interval = self.options.snapshot_interval_writes;
+        interval > 0 && txn_id > self.snapshot_txn_id && txn_id % interval == 0
+    }
+
+    fn write_snapshot(&mut self) -> GraphStoreResult<()> {
+        let txn_id = self.last_txn_id;
+        self.write_snapshot_for(txn_id, &self.store)?;
+        self.snapshot_txn_id = txn_id;
+        Ok(())
+    }
+
+    fn write_snapshot_for(&self, txn_id: u64, store: &InMemoryGraphStore) -> GraphStoreResult<()> {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return Ok(());
+        };
+        fs::create_dir_all(data_dir)
+            .map_err(|err| GraphStoreError::io("create RedCore snapshot directory", err))?;
+        let envelope = RedCoreSnapshotEnvelope {
+            version: REDCORE_MANIFEST_VERSION,
+            txn_id,
+            graph: store.snapshot(),
+        };
+        let raw = serde_json::to_vec_pretty(&envelope)
+            .map_err(|err| GraphStoreError::io("encode RedCore snapshot", err))?;
+        let current = data_dir.join(REDCORE_SNAPSHOT_FILE);
+        if current.exists() {
+            preserve_previous_snapshot(data_dir, &current)?;
+        }
+        write_atomic_file(
+            data_dir,
+            REDCORE_CURRENT_SNAPSHOT_TMP_FILE,
+            REDCORE_SNAPSHOT_FILE,
+            &raw,
+            "RedCore snapshot",
+        )?;
+        Ok(())
+    }
+
+    fn write_manifest(&self) -> GraphStoreResult<()> {
+        self.write_manifest_for(
+            self.store.stats().version,
+            self.last_txn_id,
+            self.snapshot_txn_id,
+        )
+    }
+
+    fn write_manifest_for(
+        &self,
+        graph_version: u64,
+        last_txn_id: u64,
+        snapshot_txn_id: u64,
+    ) -> GraphStoreResult<()> {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return Ok(());
+        };
+        let manifest = RedCoreManifest {
+            version: REDCORE_MANIFEST_VERSION,
+            graph_version,
+            last_txn_id,
+            snapshot_txn_id,
+            durability: self.options.durability,
+            snapshot_file: REDCORE_SNAPSHOT_FILE.to_string(),
+            aof_file: REDCORE_AOF_FILE.to_string(),
+            updated_at_unix_ms: unix_ms(),
+        };
+        let raw = serde_json::to_vec_pretty(&manifest)
+            .map_err(|err| GraphStoreError::io("encode RedCore manifest", err))?;
+        write_atomic_file(
+            data_dir,
+            REDCORE_MANIFEST_TMP_FILE,
+            REDCORE_MANIFEST_FILE,
+            &raw,
+            "RedCore manifest",
+        )?;
+        Ok(())
+    }
+}
+
+impl Drop for RedCoreDirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        if let Some(locks) = REDCORE_PROCESS_LOCKS.get() {
+            if let Ok(mut locks) = locks.lock() {
+                locks.remove(&self.process_key);
+            }
+        }
+    }
+}
+
+fn validate_redcore_options(options: &RedCoreOptions) -> GraphStoreResult<()> {
+    if options.strict_acid && options.durability != RedCoreDurability::AofAlways {
+        return Err(GraphStoreError::new(
+            "redcore_strict_mode_invalid",
+            "strict ACID mode requires RUSTY_RED_DURABILITY=aof_always",
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_redcore_directory_lock(data_dir: &Path) -> GraphStoreResult<RedCoreDirectoryLock> {
+    let process_key = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let locks = REDCORE_PROCESS_LOCKS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    {
+        let mut locks = locks.lock().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_lock_poisoned",
+                "RedCore process lock registry is poisoned",
+            )
+        })?;
+        if !locks.insert(process_key.clone()) {
+            return Err(GraphStoreError::new(
+                "redcore_lock_unavailable",
+                format!(
+                    "RedCore data directory {} is already open in this process",
+                    data_dir.display()
+                ),
+            ));
+        }
+    }
+
+    let lock_path = data_dir.join(REDCORE_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            release_redcore_process_lock(&process_key);
+            GraphStoreError::io("open RedCore directory lock", err)
+        })?;
+    if let Err(err) = file.try_lock_exclusive() {
+        release_redcore_process_lock(&process_key);
+        let message = if err.kind() == ErrorKind::WouldBlock {
+            format!(
+                "RedCore data directory {} is locked by another process",
+                data_dir.display()
+            )
+        } else {
+            format!("lock RedCore data directory: {err}")
+        };
+        return Err(GraphStoreError::new("redcore_lock_unavailable", message));
+    }
+
+    Ok(RedCoreDirectoryLock { file, process_key })
+}
+
+fn release_redcore_process_lock(process_key: &Path) {
+    if let Some(locks) = REDCORE_PROCESS_LOCKS.get() {
+        if let Ok(mut locks) = locks.lock() {
+            locks.remove(process_key);
+        }
+    }
+}
+
+fn decode_aof_frame(raw: &str) -> GraphStoreResult<RedCoreAofFrame> {
+    let frame: RedCoreAofFrame = serde_json::from_str(raw)
+        .map_err(|err| GraphStoreError::io("decode RedCore AOF frame", err))?;
+    if frame.magic != REDCORE_AOF_MAGIC || frame.version != REDCORE_MANIFEST_VERSION {
+        return Err(GraphStoreError::new(
+            "redcore_aof_frame_invalid",
+            "RedCore AOF frame magic or version is invalid",
+        ));
+    }
+    let checksum = stable_hash(&frame.mutation);
+    if checksum != frame.payload_checksum {
+        return Err(GraphStoreError::new(
+            "redcore_aof_checksum_mismatch",
+            format!("AOF frame {} checksum mismatch", frame.txn_id),
+        ));
+    }
+    Ok(frame)
+}
+
+fn truncate_aof_tail(file: &File, data_dir: &Path, offset: u64) -> GraphStoreResult<()> {
+    file.set_len(offset)
+        .map_err(|err| GraphStoreError::io("truncate torn RedCore AOF tail", err))?;
+    file.sync_all()
+        .map_err(|err| GraphStoreError::io("fsync truncated RedCore AOF", err))?;
+    sync_directory(
+        data_dir,
+        "fsync RedCore data directory after AOF truncation",
+    )
+}
+
+fn preserve_previous_snapshot(data_dir: &Path, current: &Path) -> GraphStoreResult<()> {
+    let raw =
+        fs::read(current).map_err(|err| GraphStoreError::io("read previous snapshot", err))?;
+    write_atomic_file(
+        data_dir,
+        REDCORE_PREVIOUS_SNAPSHOT_TMP_FILE,
+        REDCORE_PREVIOUS_SNAPSHOT_FILE,
+        &raw,
+        "RedCore previous snapshot",
+    )
+}
+
+fn write_atomic_file(
+    data_dir: &Path,
+    tmp_name: &str,
+    final_name: &str,
+    raw: &[u8],
+    label: &str,
+) -> GraphStoreResult<()> {
+    fs::create_dir_all(data_dir)
+        .map_err(|err| GraphStoreError::io(format!("create {label} directory"), err))?;
+    let tmp_path = data_dir.join(tmp_name);
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(GraphStoreError::io(
+                format!("remove stale {label} temp file"),
+                err,
+            ))
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|err| GraphStoreError::io(format!("create {label} temp file"), err))?;
+    file.write_all(raw)
+        .map_err(|err| GraphStoreError::io(format!("write {label} temp file"), err))?;
+    file.sync_all()
+        .map_err(|err| GraphStoreError::io(format!("fsync {label} temp file"), err))?;
+    drop(file);
+    fs::rename(&tmp_path, data_dir.join(final_name))
+        .map_err(|err| GraphStoreError::io(format!("install {label}"), err))?;
+    sync_directory(
+        data_dir,
+        format!("fsync RedCore directory after {label} install"),
+    )
+}
+
+fn sync_file_path(path: &Path, action: &str) -> GraphStoreResult<()> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| GraphStoreError::io(action, err))
+}
+
+fn sync_directory(data_dir: &Path, action: impl AsRef<str>) -> GraphStoreResult<()> {
+    File::open(data_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| GraphStoreError::io(action.as_ref(), err))
+}
+
+fn read_manifest(data_dir: &Path) -> GraphStoreResult<Option<RedCoreManifest>> {
+    let path = data_dir.join(REDCORE_MANIFEST_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|err| GraphStoreError::io("read manifest", err))?;
+    serde_json::from_str::<RedCoreManifest>(&raw)
+        .map(Some)
+        .map_err(|err| GraphStoreError::io("decode manifest", err))
+}
+
+fn read_latest_valid_snapshot(
+    data_dir: &Path,
+) -> GraphStoreResult<Option<RedCoreSnapshotEnvelope>> {
+    match read_snapshot_file(&data_dir.join(REDCORE_SNAPSHOT_FILE), "current snapshot") {
+        Ok(Some(snapshot)) => Ok(Some(snapshot)),
+        Ok(None) => read_snapshot_file(
+            &data_dir.join(REDCORE_PREVIOUS_SNAPSHOT_FILE),
+            "previous snapshot",
+        ),
+        Err(current_error) => match read_snapshot_file(
+            &data_dir.join(REDCORE_PREVIOUS_SNAPSHOT_FILE),
+            "previous snapshot",
+        ) {
+            Ok(Some(snapshot)) => Ok(Some(snapshot)),
+            Ok(None) => Err(current_error),
+            Err(_) => Err(current_error),
+        },
+    }
+}
+
+fn read_snapshot_file(
+    path: &Path,
+    label: &str,
+) -> GraphStoreResult<Option<RedCoreSnapshotEnvelope>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| GraphStoreError::io(format!("read RedCore {label}"), err))?;
+    serde_json::from_str::<RedCoreSnapshotEnvelope>(&raw)
+        .map(Some)
+        .map_err(|err| GraphStoreError::io(format!("decode RedCore {label}"), err))
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "redis-store")]
@@ -1274,6 +2251,86 @@ impl RedisGraphStore {
         })
     }
 
+    pub fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        let before = self.verify()?;
+        let mut connection = self.connection()?;
+        let keyspace = self.keyspace.clone();
+        let watch_keys = vec![keyspace.version()];
+        let rebuild: GraphStoreResult<()> =
+            redis::transaction(&mut connection, &watch_keys, |connection, pipe| {
+                let live_nodes = match live_nodes_from_connection(connection, &keyspace) {
+                    Ok(nodes) => nodes,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
+                let live_edges = match live_edges_from_connection(connection, &keyspace) {
+                    Ok(edges) => edges,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
+                let actual = match redis_indexes_from_connection(connection, &keyspace) {
+                    Ok(indexes) => indexes,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
+
+                pipe.cmd("DEL")
+                    .arg(keyspace.labels())
+                    .arg(keyspace.edge_types())
+                    .arg(keyspace.property_index_entries())
+                    .arg(keyspace.out_adjacency_pairs())
+                    .arg(keyspace.in_adjacency_pairs())
+                    .ignore();
+                for label in actual.label_index.keys() {
+                    pipe.cmd("DEL").arg(keyspace.label(label)).ignore();
+                }
+                for edge_type in actual.edge_type_index.keys() {
+                    pipe.cmd("DEL").arg(keyspace.edge_type(edge_type)).ignore();
+                }
+                for (key, token) in actual.property_index.keys() {
+                    pipe.cmd("DEL")
+                        .arg(keyspace.property_value(key, token))
+                        .ignore();
+                }
+                for (node_id, edge_type) in actual.out_adjacency.keys() {
+                    pipe.cmd("DEL")
+                        .arg(keyspace.out_adjacency(node_id, edge_type))
+                        .ignore();
+                }
+                for (node_id, edge_type) in actual.in_adjacency.keys() {
+                    pipe.cmd("DEL")
+                        .arg(keyspace.in_adjacency(node_id, edge_type))
+                        .ignore();
+                }
+
+                for node in live_nodes.values() {
+                    for label in &node.labels {
+                        pipe.cmd("SADD")
+                            .arg(keyspace.labels())
+                            .arg(label)
+                            .ignore()
+                            .cmd("SADD")
+                            .arg(keyspace.label(label))
+                            .arg(&node.id)
+                            .ignore();
+                    }
+                    add_node_to_redis_property_indexes(pipe, &keyspace, node);
+                }
+                for edge in live_edges.values() {
+                    add_edge_to_redis_indexes(pipe, &keyspace, edge);
+                }
+
+                match pipe.query::<Option<()>>(connection)? {
+                    Some(()) => Ok(Some(Ok(()))),
+                    None => Ok(None),
+                }
+            })?;
+        rebuild?;
+        let after = self.verify()?;
+        Ok(GraphRebuildReport {
+            repaired: !before.ok && after.ok,
+            before,
+            after,
+        })
+    }
+
     fn connection(&self) -> GraphStoreResult<redis::Connection> {
         Ok(self.client.get_connection()?)
     }
@@ -1290,78 +2347,17 @@ impl RedisGraphStore {
 
     fn live_nodes(&self) -> GraphStoreResult<BTreeMap<String, NodeRecord>> {
         let mut connection = self.connection()?;
-        let node_ids = redis_string_set(&mut connection, self.keyspace.nodes())?;
-        let mut nodes = BTreeMap::new();
-        for node_id in node_ids {
-            if let Some(node) = self.get_node(&node_id)? {
-                nodes.insert(node_id, node);
-            }
-        }
-        Ok(nodes)
+        live_nodes_from_connection(&mut connection, &self.keyspace)
     }
 
     fn live_edges(&self) -> GraphStoreResult<BTreeMap<String, EdgeRecord>> {
         let mut connection = self.connection()?;
-        let edge_ids = redis_string_set(&mut connection, self.keyspace.edges())?;
-        let mut edges = BTreeMap::new();
-        for edge_id in edge_ids {
-            if let Some(edge) = self.get_edge(&edge_id)? {
-                edges.insert(edge_id, edge);
-            }
-        }
-        Ok(edges)
+        live_edges_from_connection(&mut connection, &self.keyspace)
     }
 
     fn redis_indexes(&self) -> GraphStoreResult<ExpectedIndexes> {
         let mut connection = self.connection()?;
-        let mut indexes = ExpectedIndexes::default();
-        for label in redis_string_set(&mut connection, self.keyspace.labels())? {
-            let node_ids = redis_string_set(&mut connection, self.keyspace.label(&label))?;
-            if !node_ids.is_empty() {
-                indexes.label_index.insert(label, node_ids);
-            }
-        }
-        for edge_type in redis_string_set(&mut connection, self.keyspace.edge_types())? {
-            let edge_ids = redis_string_set(&mut connection, self.keyspace.edge_type(&edge_type))?;
-            if !edge_ids.is_empty() {
-                indexes.edge_type_index.insert(edge_type, edge_ids);
-            }
-        }
-        for entry in redis_string_set(&mut connection, self.keyspace.property_index_entries())? {
-            let Some((key, token)) = decode_property_pair(&entry) else {
-                continue;
-            };
-            let node_ids =
-                redis_string_set(&mut connection, self.keyspace.property_value(&key, &token))?;
-            if !node_ids.is_empty() {
-                indexes.property_index.insert((key, token), node_ids);
-            }
-        }
-        for pair in redis_string_set(&mut connection, self.keyspace.out_adjacency_pairs())? {
-            let Some((node_id, edge_type)) = decode_adjacency_pair(&pair) else {
-                continue;
-            };
-            let edge_ids = redis_string_set(
-                &mut connection,
-                self.keyspace.out_adjacency(&node_id, &edge_type),
-            )?;
-            if !edge_ids.is_empty() {
-                indexes.out_adjacency.insert((node_id, edge_type), edge_ids);
-            }
-        }
-        for pair in redis_string_set(&mut connection, self.keyspace.in_adjacency_pairs())? {
-            let Some((node_id, edge_type)) = decode_adjacency_pair(&pair) else {
-                continue;
-            };
-            let edge_ids = redis_string_set(
-                &mut connection,
-                self.keyspace.in_adjacency(&node_id, &edge_type),
-            )?;
-            if !edge_ids.is_empty() {
-                indexes.in_adjacency.insert((node_id, edge_type), edge_ids);
-            }
-        }
-        Ok(indexes)
+        redis_indexes_from_connection(&mut connection, &self.keyspace)
     }
 
     fn cleanup_empty_labels(
@@ -1462,6 +2458,10 @@ impl GraphStore for InMemoryGraphStore {
 
     fn verify(&self) -> VerifyReport {
         InMemoryGraphStore::verify(self)
+    }
+
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        InMemoryGraphStore::rebuild_indexes(self)
     }
 }
 
@@ -1569,6 +2569,88 @@ fn redis_string_set(
         .arg(key)
         .query::<Vec<String>>(connection)?;
     Ok(values.into_iter().collect())
+}
+
+#[cfg(feature = "redis-store")]
+fn live_nodes_from_connection(
+    connection: &mut redis::Connection,
+    keyspace: &RedisGraphKeyspace,
+) -> GraphStoreResult<BTreeMap<String, NodeRecord>> {
+    let node_ids = redis_string_set(connection, keyspace.nodes())?;
+    let mut nodes = BTreeMap::new();
+    for node_id in node_ids {
+        if let Some(node) = load_node_raw_from_connection(connection, keyspace, &node_id)?
+            .filter(|node| !node.tombstone)
+        {
+            nodes.insert(node_id, node);
+        }
+    }
+    Ok(nodes)
+}
+
+#[cfg(feature = "redis-store")]
+fn live_edges_from_connection(
+    connection: &mut redis::Connection,
+    keyspace: &RedisGraphKeyspace,
+) -> GraphStoreResult<BTreeMap<String, EdgeRecord>> {
+    let edge_ids = redis_string_set(connection, keyspace.edges())?;
+    let mut edges = BTreeMap::new();
+    for edge_id in edge_ids {
+        if let Some(edge) = load_edge_raw_from_connection(connection, keyspace, &edge_id)?
+            .filter(|edge| !edge.tombstone)
+        {
+            edges.insert(edge_id, edge);
+        }
+    }
+    Ok(edges)
+}
+
+#[cfg(feature = "redis-store")]
+fn redis_indexes_from_connection(
+    connection: &mut redis::Connection,
+    keyspace: &RedisGraphKeyspace,
+) -> GraphStoreResult<ExpectedIndexes> {
+    let mut indexes = ExpectedIndexes::default();
+    for label in redis_string_set(connection, keyspace.labels())? {
+        let node_ids = redis_string_set(connection, keyspace.label(&label))?;
+        if !node_ids.is_empty() {
+            indexes.label_index.insert(label, node_ids);
+        }
+    }
+    for edge_type in redis_string_set(connection, keyspace.edge_types())? {
+        let edge_ids = redis_string_set(connection, keyspace.edge_type(&edge_type))?;
+        if !edge_ids.is_empty() {
+            indexes.edge_type_index.insert(edge_type, edge_ids);
+        }
+    }
+    for entry in redis_string_set(connection, keyspace.property_index_entries())? {
+        let Some((key, token)) = decode_property_pair(&entry) else {
+            continue;
+        };
+        let node_ids = redis_string_set(connection, keyspace.property_value(&key, &token))?;
+        if !node_ids.is_empty() {
+            indexes.property_index.insert((key, token), node_ids);
+        }
+    }
+    for pair in redis_string_set(connection, keyspace.out_adjacency_pairs())? {
+        let Some((node_id, edge_type)) = decode_adjacency_pair(&pair) else {
+            continue;
+        };
+        let edge_ids = redis_string_set(connection, keyspace.out_adjacency(&node_id, &edge_type))?;
+        if !edge_ids.is_empty() {
+            indexes.out_adjacency.insert((node_id, edge_type), edge_ids);
+        }
+    }
+    for pair in redis_string_set(connection, keyspace.in_adjacency_pairs())? {
+        let Some((node_id, edge_type)) = decode_adjacency_pair(&pair) else {
+            continue;
+        };
+        let edge_ids = redis_string_set(connection, keyspace.in_adjacency(&node_id, &edge_type))?;
+        if !edge_ids.is_empty() {
+            indexes.in_adjacency.insert((node_id, edge_type), edge_ids);
+        }
+    }
+    Ok(indexes)
 }
 
 #[cfg(feature = "redis-store")]
@@ -1805,10 +2887,13 @@ fn hex_digit(value: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use serde_json::json;
 
     use super::{
-        Direction, EdgeRecord, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
+        Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, InMemoryGraphStore,
+        NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
     };
 
     #[test]
@@ -2067,6 +3152,92 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_indexes_repairs_derived_index_drift() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["Person"],
+                json!({ "name": "Ada" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:b",
+                ["Person"],
+                json!({ "name": "Grace" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "KNOWS",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+
+        store.label_index.clear();
+        store
+            .out_adjacency
+            .get_mut(&("node:a".to_string(), "KNOWS".to_string()))
+            .unwrap()
+            .remove("edge:ab");
+        store
+            .property_index
+            .entry(("name".to_string(), "\"Wrong\"".to_string()))
+            .or_default()
+            .insert("node:a".to_string());
+
+        assert!(store.query_nodes(NodeQuery::label("Person")).is_empty());
+        let report = store.rebuild_indexes().unwrap();
+
+        assert_eq!(report.repaired, true);
+        assert_eq!(report.before.ok, false);
+        assert_eq!(report.after.ok, true);
+        assert_eq!(store.query_nodes(NodeQuery::label("Person")).len(), 2);
+        assert_eq!(
+            store.neighbors(NeighborQuery::out("node:a"))[0].node_id,
+            "node:b"
+        );
+        assert_eq!(
+            store.node_ids_for_property("name", &json!("Ada")),
+            vec!["node:a".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebuild_indexes_does_not_hide_canonical_edge_corruption() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new("node:a", ["Person"], json!({})))
+            .unwrap();
+        store.edges.insert(
+            "edge:missing".to_string(),
+            EdgeRecord {
+                id: "edge:missing".to_string(),
+                from_id: "node:a".to_string(),
+                to_id: "node:missing".to_string(),
+                edge_type: "KNOWS".to_string(),
+                properties: json!({}),
+                version: 9,
+                tombstone: false,
+            },
+        );
+
+        let report = store.rebuild_indexes().unwrap();
+
+        assert_eq!(report.repaired, false);
+        assert_eq!(report.after.ok, false);
+        assert!(report
+            .after
+            .problems
+            .iter()
+            .any(|problem| problem.kind == "missing_to_endpoint"));
+    }
+
+    #[test]
     fn graph_store_trait_covers_memory_oracle_contract() {
         fn write_fixture(store: &mut dyn GraphStore) {
             store
@@ -2095,6 +3266,394 @@ mod tests {
             store.neighbors(NeighborQuery::out("node:a"))[0].node_id,
             "node:b"
         );
+    }
+
+    #[test]
+    fn redcore_embedded_store_recovers_nodes_edges_and_indexes_from_aof() {
+        let data_dir = unique_test_dir("redcore-aof-recovery");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["File"],
+                    json!({ "path": "src/lib.rs", "repo": "rusty-red" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["File"],
+                    json!({ "path": "src/main.rs", "repo": "rusty-red" }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "IMPORTS",
+                    "node:b",
+                    json!({ "rank": 1 }),
+                ))
+                .unwrap();
+            assert_eq!(store.verify().unwrap().ok, true);
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let hits = store
+            .query_nodes(
+                NodeQuery::label("File")
+                    .with_property("repo", json!("rusty-red"))
+                    .with_property("path", json!("src/lib.rs")),
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "node:a");
+        assert_eq!(
+            store.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
+            "node:b"
+        );
+        assert_eq!(store.status().recovered_frames, 3);
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_batch_commit_is_all_or_nothing() {
+        let mut store = RedCoreGraphStore::memory();
+        let error = store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(NodeRecord::new("node:a", ["File"], json!({}))),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:missing",
+                    "node:a",
+                    "IMPORTS",
+                    "node:missing",
+                    json!({}),
+                )),
+            ]))
+            .unwrap_err();
+
+        assert_eq!(error.code, "missing_graph_endpoint");
+        assert!(store.get_node("node:a").unwrap().is_none());
+        assert_eq!(store.status().graph_version, 0);
+        assert_eq!(store.status().last_txn_id, 0);
+
+        let transaction = store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(NodeRecord::new("node:a", ["File"], json!({}))),
+                GraphMutation::NodeUpsert(NodeRecord::new("node:b", ["File"], json!({}))),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "IMPORTS",
+                    "node:b",
+                    json!({}),
+                )),
+            ]))
+            .unwrap();
+
+        assert_eq!(transaction.txn_id, 1);
+        assert_eq!(transaction.graph_version, 3);
+        assert_eq!(transaction.writes.len(), 3);
+        assert_eq!(store.status().last_txn_id, 1);
+        assert_eq!(store.verify().unwrap().ok, true);
+    }
+
+    #[test]
+    fn redcore_recovers_batch_commit_from_aof_as_one_transaction() {
+        let data_dir = unique_test_dir("redcore-batch-aof-recovery");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            let transaction = store
+                .commit_batch(GraphMutationBatch::new([
+                    GraphMutation::NodeUpsert(NodeRecord::new(
+                        "node:a",
+                        ["File"],
+                        json!({ "path": "src/lib.rs" }),
+                    )),
+                    GraphMutation::NodeUpsert(NodeRecord::new(
+                        "node:b",
+                        ["File"],
+                        json!({ "path": "src/main.rs" }),
+                    )),
+                    GraphMutation::EdgeUpsert(EdgeRecord::new(
+                        "edge:ab",
+                        "node:a",
+                        "IMPORTS",
+                        "node:b",
+                        json!({}),
+                    )),
+                ]))
+                .unwrap();
+
+            assert_eq!(transaction.txn_id, 1);
+            assert_eq!(transaction.graph_version, 3);
+            assert_eq!(store.status().last_txn_id, 1);
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+
+        assert_eq!(store.status().recovered_frames, 1);
+        assert_eq!(store.status().last_txn_id, 1);
+        assert_eq!(store.status().graph_version, 3);
+        assert_eq!(
+            store.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
+            "node:b"
+        );
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_failed_aof_append_does_not_publish_staged_mutation() {
+        let data_dir = unique_test_dir("redcore-aof-publish-gate");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        let mut store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        std::fs::create_dir(data_dir.join(super::REDCORE_AOF_FILE)).unwrap();
+
+        let error = store
+            .upsert_node(NodeRecord::new(
+                "node:blocked",
+                ["File"],
+                json!({ "path": "blocked.rs" }),
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.code, "redcore_io_error");
+        assert!(store.get_node("node:blocked").unwrap().is_none());
+        assert_eq!(store.status().graph_version, 0);
+        assert_eq!(store.status().last_txn_id, 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_failed_snapshot_write_does_not_publish_staged_mutation() {
+        let data_dir = unique_test_dir("redcore-snapshot-publish-gate");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        let mut store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        std::fs::create_dir(data_dir.join("graph.snapshot.current.tmp")).unwrap();
+
+        let error = store
+            .upsert_node(NodeRecord::new(
+                "node:blocked",
+                ["File"],
+                json!({ "path": "blocked.rs" }),
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.code, "redcore_io_error");
+        assert!(store.get_node("node:blocked").unwrap().is_none());
+        assert_eq!(store.status().graph_version, 0);
+        assert_eq!(store.status().last_txn_id, 0);
+        assert_eq!(store.status().snapshot_txn_id, 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_failed_manifest_write_does_not_publish_staged_mutation() {
+        let data_dir = unique_test_dir("redcore-manifest-publish-gate");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        let mut store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        std::fs::create_dir(data_dir.join("manifest.json.tmp")).unwrap();
+
+        let error = store
+            .upsert_node(NodeRecord::new(
+                "node:blocked",
+                ["File"],
+                json!({ "path": "blocked.rs" }),
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.code, "redcore_io_error");
+        assert!(store.get_node("node:blocked").unwrap().is_none());
+        assert_eq!(store.status().graph_version, 0);
+        assert_eq!(store.status().last_txn_id, 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_snapshot_only_recovers_without_redis_or_aof() {
+        let data_dir = unique_test_dir("redcore-snapshot-recovery");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:snapshot",
+                    ["Snapshot"],
+                    json!({ "mode": "snapshot_only" }),
+                ))
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert_eq!(
+            store.get_node("node:snapshot").unwrap().unwrap().labels,
+            vec!["Snapshot".to_string()]
+        );
+        assert_eq!(store.status().snapshot_txn_id, 1);
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_strict_acid_requires_aof_always() {
+        let data_dir = unique_test_dir("redcore-strict-requires-aof-always");
+        let error = RedCoreGraphStore::open(
+            &data_dir,
+            RedCoreOptions {
+                durability: RedCoreDurability::AofEverysec,
+                snapshot_interval_writes: 100,
+                strict_acid: true,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "redcore_strict_mode_invalid");
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_open_holds_exclusive_data_directory_lock() {
+        let data_dir = unique_test_dir("redcore-file-lock");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: true,
+        };
+        let _store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+        let error = RedCoreGraphStore::open(&data_dir, options).unwrap_err();
+
+        assert_eq!(error.code, "redcore_lock_unavailable");
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_recovery_truncates_torn_aof_tail() {
+        let data_dir = unique_test_dir("redcore-torn-aof-tail");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: true,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:stable",
+                    ["File"],
+                    json!({ "path": "stable.rs" }),
+                ))
+                .unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(data_dir.join(super::REDCORE_AOF_FILE))
+            .unwrap()
+            .write_all(br#"{"magic":"RRGDB_AOF","txn_id":2"#)
+            .unwrap();
+
+        let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+        assert!(store.get_node("node:stable").unwrap().is_some());
+        assert_eq!(store.status().recovered_frames, 1);
+        let aof = std::fs::read_to_string(data_dir.join(super::REDCORE_AOF_FILE)).unwrap();
+        assert!(!aof.contains(r#""txn_id":2"#));
+
+        store
+            .upsert_node(NodeRecord::new(
+                "node:after-recovery",
+                ["File"],
+                json!({ "path": "after.rs" }),
+            ))
+            .unwrap();
+        drop(store);
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(store.get_node("node:after-recovery").unwrap().is_some());
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_falls_back_to_previous_snapshot_and_replays_aof() {
+        let data_dir = unique_test_dir("redcore-previous-snapshot-fallback");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 1,
+            strict_acid: true,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:first",
+                    ["Snapshot"],
+                    json!({ "step": 1 }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:second",
+                    ["Snapshot"],
+                    json!({ "step": 2 }),
+                ))
+                .unwrap();
+        }
+        std::fs::write(
+            data_dir.join(super::REDCORE_SNAPSHOT_FILE),
+            b"{corrupt snapshot",
+        )
+        .unwrap();
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(store.get_node("node:first").unwrap().is_some());
+        assert!(store.get_node("node:second").unwrap().is_some());
+        assert_eq!(store.status().last_txn_id, 2);
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{label}-{unique}"))
     }
 
     #[cfg(feature = "redis-store")]

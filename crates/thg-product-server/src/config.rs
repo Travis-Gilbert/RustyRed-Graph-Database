@@ -1,11 +1,44 @@
 use std::env;
 
 use crate::auth::ApiToken;
+use thg_core::RedCoreDurability;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageMode {
+    Embedded,
+    Memory,
+    Redis,
+}
+
+impl StorageMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "redis" | "legacy_redis" => Self::Redis,
+            "memory" | "ram" => Self::Memory,
+            _ => Self::Embedded,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Memory => "memory",
+            Self::Redis => "redis",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
     pub port: u16,
+    pub storage_mode: StorageMode,
+    pub data_dir: String,
+    pub durability: RedCoreDurability,
+    pub snapshot_interval_writes: u64,
+    pub strict_acid: bool,
+    pub concurrency: String,
+    pub txn_isolation: String,
     pub redis_url: String,
     pub redis_key_prefix: String,
     pub require_auth: bool,
@@ -35,6 +68,39 @@ impl Config {
             .or_else(|| env_first(&["RUSTY_RED_PORT", "THG_PRODUCT_PORT"]).ok())
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(8380);
+        let storage_mode = env_first(&["RUSTY_RED_MODE", "THG_PRODUCT_STORE"])
+            .map(|value| StorageMode::parse(&value))
+            .unwrap_or(StorageMode::Embedded);
+        let data_dir = env_first(&["RUSTY_RED_DATA_DIR", "THG_PRODUCT_DATA_DIR"])
+            .or_else(|_| env::var("RAILWAY_VOLUME_MOUNT_PATH"))
+            .unwrap_or_else(|_| {
+                if railway_port.is_some() {
+                    "/app/data/rusty-red".to_string()
+                } else {
+                    "data/rusty-red".to_string()
+                }
+            });
+        let durability = env_first(&["RUSTY_RED_DURABILITY", "THG_PRODUCT_DURABILITY"])
+            .map(|value| RedCoreDurability::parse(&value))
+            .unwrap_or(RedCoreDurability::AofEverysec);
+        let snapshot_interval_writes = env_first(&[
+            "RUSTY_RED_SNAPSHOT_INTERVAL_WRITES",
+            "THG_PRODUCT_SNAPSHOT_INTERVAL_WRITES",
+        ])
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000);
+        let strict_acid = env_bool(&["RUSTY_RED_STRICT_ACID", "THG_PRODUCT_STRICT_ACID"], false);
+        let concurrency = env_first(&["RUSTY_RED_CONCURRENCY", "THG_PRODUCT_CONCURRENCY"])
+            .unwrap_or_else(|_| "single_writer".to_string());
+        let txn_isolation = env_first(&["RUSTY_RED_TXN_ISOLATION", "THG_PRODUCT_TXN_ISOLATION"])
+            .unwrap_or_else(|_| {
+                if strict_acid {
+                    "serializable".to_string()
+                } else {
+                    "snapshot".to_string()
+                }
+            });
         let redis_url = env_first(&["RUSTY_RED_REDIS_URL", "THG_REDIS_URL"])
             .or_else(|_| env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -71,6 +137,13 @@ impl Config {
         Self {
             host,
             port,
+            storage_mode,
+            data_dir,
+            durability,
+            snapshot_interval_writes,
+            strict_acid,
+            concurrency,
+            txn_isolation,
             redis_url,
             redis_key_prefix,
             require_auth,
@@ -88,6 +161,37 @@ impl Config {
 
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.strict_acid {
+            return Ok(());
+        }
+        if self.storage_mode != StorageMode::Embedded {
+            return Err(format!(
+                "RUSTY_RED_STRICT_ACID=true requires RUSTY_RED_MODE=embedded, got {}",
+                self.storage_mode.as_str()
+            ));
+        }
+        if self.durability != RedCoreDurability::AofAlways {
+            return Err(format!(
+                "RUSTY_RED_STRICT_ACID=true requires RUSTY_RED_DURABILITY=aof_always, got {}",
+                self.durability.as_str()
+            ));
+        }
+        if self.concurrency.trim() != "single_writer" {
+            return Err(format!(
+                "RUSTY_RED_STRICT_ACID=true requires RUSTY_RED_CONCURRENCY=single_writer, got {}",
+                self.concurrency
+            ));
+        }
+        if self.txn_isolation.trim() != "serializable" {
+            return Err(format!(
+                "RUSTY_RED_STRICT_ACID=true requires RUSTY_RED_TXN_ISOLATION=serializable, got {}",
+                self.txn_isolation
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -112,4 +216,48 @@ fn env_first(keys: &[&str]) -> Result<String, env::VarError> {
         }
     }
     Err(env::VarError::NotPresent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, RedCoreDurability, StorageMode};
+
+    fn base_config() -> Config {
+        Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Embedded,
+            data_dir: "data/rusty-red".to_string(),
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 1_000,
+            strict_acid: true,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "serializable".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn strict_acid_config_requires_aof_always() {
+        let mut config = base_config();
+        config.durability = RedCoreDurability::AofEverysec;
+
+        assert!(config.validate().unwrap_err().contains("aof_always"));
+    }
+
+    #[test]
+    fn strict_acid_config_accepts_single_writer_serializable_embedded() {
+        assert_eq!(base_config().validate(), Ok(()));
+    }
 }

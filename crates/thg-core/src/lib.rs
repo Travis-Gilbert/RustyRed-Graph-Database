@@ -17,9 +17,11 @@ pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
 pub use graph::{expand_bounded, paths_shortest, EdgeTuple};
 pub use graph_store::{
-    sanitize_tenant_segment, Direction, EdgeRecord, GraphStats, GraphStore, GraphStoreError,
-    GraphStoreResult, GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery,
-    NodeRecord, VerifyProblem, VerifyReport,
+    sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
+    GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery,
+    NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreStatus, VerifyProblem,
+    VerifyReport,
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};

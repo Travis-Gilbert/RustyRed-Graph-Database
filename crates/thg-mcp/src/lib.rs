@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thg_core::{
     Direction, EdgeRecord, GraphStats, GraphStoreError, GraphStoreResult, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, VerifyReport,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, VerifyReport,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -897,6 +897,44 @@ impl McpGraphBackend for InMemoryGraphStore {
 
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         Ok(InMemoryGraphStore::property_keys(self))
+    }
+}
+
+impl McpGraphBackend for RedCoreGraphStore {
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        RedCoreGraphStore::get_node(self, id)
+    }
+
+    fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        RedCoreGraphStore::get_edge(self, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        RedCoreGraphStore::query_nodes(self, query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        RedCoreGraphStore::neighbors(self, query)
+    }
+
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        RedCoreGraphStore::stats(self)
+    }
+
+    fn verify(&self) -> GraphStoreResult<VerifyReport> {
+        RedCoreGraphStore::verify(self)
+    }
+
+    fn labels(&self) -> GraphStoreResult<Vec<String>> {
+        RedCoreGraphStore::labels(self)
+    }
+
+    fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+        RedCoreGraphStore::edge_types(self)
+    }
+
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        RedCoreGraphStore::property_keys(self)
     }
 }
 

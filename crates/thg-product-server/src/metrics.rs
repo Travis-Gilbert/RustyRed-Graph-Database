@@ -22,6 +22,9 @@ pub async fn metrics(
         "service": state.config.service_name.as_str(),
         "status": "ok",
         "auth_required": state.config.require_auth,
-        "configured_origins": state.config.allowed_origins.len()
+        "configured_origins": state.config.allowed_origins.len(),
+        "storage_mode": state.config.storage_mode.as_str(),
+        "durability": state.config.durability.as_str(),
+        "strict_acid": state.config.strict_acid
     })))
 }

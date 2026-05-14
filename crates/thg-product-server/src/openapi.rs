@@ -73,7 +73,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "security": [],
                     "responses": {
                         "200": {
-                            "description": "Redis-compatible backing store is reachable.",
+                            "description": "Configured graph store is ready. In embedded mode this proves the RedCore data directory is writable and journalable; in redis mode it proves Redis is reachable.",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ReadyResponse" }
@@ -385,7 +385,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                 "get": {
                     "tags": ["graph"],
                     "summary": "Verify graph indexes",
-                    "description": "Checks stored graph records against adjacency, label, edge-type, and exact scalar property indexes. This route reports drift; rebuild/repair is planned as a separate admin slice.",
+                    "description": "Checks stored graph records against adjacency, label, edge-type, and exact scalar property indexes. This route reports drift without mutating indexes.",
                     "parameters": [tenant_parameter.clone()],
                     "responses": {
                         "200": {
@@ -393,6 +393,27 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/VerifyResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/rebuild-indexes": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Rebuild graph indexes",
+                    "description": "Repairs derived adjacency, label, edge-type, and exact scalar property indexes from canonical graph records. It does not repair corrupted canonical nodes or edges.",
+                    "parameters": [tenant_parameter.clone()],
+                    "responses": {
+                        "200": {
+                            "description": "Graph rebuild report.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/RebuildIndexesResponse" }
                                 }
                             }
                         },
@@ -484,7 +505,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "description": "Bearer token lacks the required scope or the request origin is not allowed."
                 },
                 "StoreUnavailable": {
-                    "description": "Redis-compatible backing store is unavailable.",
+                    "description": "Configured graph store is unavailable or not writable.",
                     "content": {
                         "application/json": {
                             "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -501,10 +522,14 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                 },
                 "ReadyResponse": {
                     "type": "object",
-                    "required": ["status", "store"],
+                    "required": ["status", "store", "mode", "durability", "strict_acid"],
                     "properties": {
                         "status": { "const": "ready" },
-                        "store": { "const": "ready" }
+                        "store": { "const": "ready" },
+                        "mode": { "enum": ["embedded", "memory", "redis"] },
+                        "durability": { "type": "string" },
+                        "strict_acid": { "type": "boolean" },
+                        "data_dir": { "type": ["string", "null"] }
                     },
                     "additionalProperties": false
                 },
@@ -513,6 +538,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "required": ["error", "message"],
                     "properties": {
                         "error": { "type": "string" },
+                        "code": { "type": "string" },
                         "message": { "type": "string" }
                     },
                     "additionalProperties": false
@@ -815,8 +841,78 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "verify": { "$ref": "#/components/schemas/VerifyReport" }
                     },
                     "additionalProperties": false
+                },
+                "RebuildIndexesReport": {
+                    "type": "object",
+                    "required": ["repaired", "before", "after"],
+                    "properties": {
+                        "repaired": { "type": "boolean" },
+                        "before": { "$ref": "#/components/schemas/VerifyReport" },
+                        "after": { "$ref": "#/components/schemas/VerifyReport" }
+                    },
+                    "additionalProperties": false
+                },
+                "RebuildIndexesResponse": {
+                    "type": "object",
+                    "required": ["ok", "rebuild"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "rebuild": { "$ref": "#/components/schemas/RebuildIndexesReport" }
+                    },
+                    "additionalProperties": false
                 }
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{extract::State, Json};
+    use thg_core::RedCoreDurability;
+
+    use super::openapi;
+    use crate::{
+        config::{Config, StorageMode},
+        state::AppState,
+    };
+
+    #[tokio::test]
+    async fn openapi_lists_rebuild_indexes_route_and_schema() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+
+        let Json(document) = openapi(State(state)).await;
+
+        assert!(document
+            .pointer("/paths/~1v1~1tenants~1{tenant_id}~1graph~1rebuild-indexes/post")
+            .is_some());
+        assert_eq!(
+            document.pointer("/components/schemas/RebuildIndexesResponse/properties/rebuild/$ref"),
+            Some(&serde_json::Value::String(
+                "#/components/schemas/RebuildIndexesReport".to_string()
+            ))
+        );
+    }
 }

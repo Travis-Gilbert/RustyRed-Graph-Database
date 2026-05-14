@@ -15,13 +15,12 @@ use thg_core::errors::ThgError;
 use thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use thg_core::{
     stable_hash, EdgeRecord, GraphStats, GraphStoreError, NeighborQuery, NodeQuery, NodeRecord,
-    RedisGraphStore,
 };
 use thg_mcp::{agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_scope;
-use crate::state::AppState;
+use crate::state::{AppState, StoreAccessError, TenantGraphStore};
 
 #[derive(Debug, Deserialize)]
 pub struct CommandBody {
@@ -138,6 +137,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
         .route("/v1/tenants/:tenant_id/graph/verify", get(graph_verify))
+        .route(
+            "/v1/tenants/:tenant_id/graph/rebuild-indexes",
+            post(graph_rebuild_indexes),
+        )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .layer(cors)
         .with_state(state)
@@ -196,22 +199,28 @@ async fn mcp_post(
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    if state.store_ready().is_ok() {
-        return Json(json!({
+    match state.store_ready() {
+        Ok(report) => Json(json!({
             "status": "ready",
-            "store": "ready"
+            "store": report.store,
+            "mode": report.mode,
+            "durability": report.durability,
+            "strict_acid": report.strict_acid,
+            "data_dir": report.data_dir
         }))
-        .into_response();
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "store": "unavailable",
+                "mode": state.config.storage_mode.as_str(),
+                "error": error.code,
+                "message": error.message
+            })),
+        )
+            .into_response(),
     }
-
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "status": "not_ready",
-            "store": "unavailable"
-        })),
-    )
-        .into_response()
 }
 
 async fn command(
@@ -250,15 +259,23 @@ async fn batch(
         }
     }
 
-    if state.store_ready().is_err() {
-        return store_unavailable_response();
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
     }
-    let store = match state.tenant_store(&tenant_id) {
-        Ok(store) => store,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let needs_state_store = body
+        .commands
+        .iter()
+        .any(|item| !is_graph_command(&item.command));
+    let mut executor = if needs_state_store {
+        let store = match state.tenant_store(&tenant_id) {
+            Ok(store) => store,
+            Err(error) => return store_unavailable_response(error),
+        };
+        Some(StoreBackedThgExecutor::new(store))
+    } else {
+        None
     };
-    let mut executor = StoreBackedThgExecutor::new(store);
-    let mut graph_store: Option<RedisGraphStore> = None;
+    let mut graph_store: Option<TenantGraphStore> = None;
     let mut results = Vec::with_capacity(body.commands.len());
     for item in body.commands {
         let command = item.command;
@@ -270,7 +287,7 @@ async fn batch(
                     Err(error) => {
                         results.push(ThgResponse::err(
                             command,
-                            ThgError::new("redis_graph_store_error", error.to_string()),
+                            ThgError::new(error.code, error.message),
                             "graph:unavailable",
                         ));
                         continue;
@@ -283,11 +300,22 @@ async fn batch(
                 args,
             )
         } else {
-            executor.execute_request(ThgRequest::new(command, args))
+            executor
+                .as_mut()
+                .expect("state executor initialized for non-graph command")
+                .execute_request(ThgRequest::new(command, args))
         };
         results.push(response);
     }
-    let state_hash = executor.state().hash();
+    let state_hash = executor
+        .as_ref()
+        .map(|executor| executor.state().hash())
+        .unwrap_or_else(|| {
+            graph_store
+                .as_ref()
+                .map(graph_response_hash)
+                .unwrap_or_else(|| "graph:empty_batch".to_string())
+        });
     Json(json!({ "ok": true, "results": results, "state_hash": state_hash })).into_response()
 }
 
@@ -368,7 +396,7 @@ async fn graph_node_upsert(
 
     let mut store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.upsert_node(body.into_record()) {
         Ok(result) => Json(json!({ "ok": true, "node": result })).into_response(),
@@ -392,7 +420,7 @@ async fn graph_node_get(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.get_node(&node_id) {
         Ok(Some(node)) => Json(json!({ "ok": true, "node": node })).into_response(),
@@ -418,7 +446,7 @@ async fn graph_node_query(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.query_nodes(query) {
         Ok(nodes) => Json(json!({ "ok": true, "nodes": nodes })).into_response(),
@@ -443,7 +471,7 @@ async fn graph_edge_upsert(
 
     let mut store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.upsert_edge(body.into_record()) {
         Ok(result) => Json(json!({ "ok": true, "edge": result })).into_response(),
@@ -467,7 +495,7 @@ async fn graph_edge_get(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.get_edge(&edge_id) {
         Ok(Some(edge)) => Json(json!({ "ok": true, "edge": edge })).into_response(),
@@ -493,7 +521,7 @@ async fn graph_neighbors(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.neighbors(query) {
         Ok(neighbors) => Json(json!({ "ok": true, "neighbors": neighbors })).into_response(),
@@ -517,7 +545,7 @@ async fn graph_stats(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.stats() {
         Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
@@ -541,10 +569,38 @@ async fn graph_verify(
 
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
-        Err(error) => return graph_store_error_response(error.into()),
+        Err(error) => return store_unavailable_response(error),
     };
     match store.verify() {
         Ok(report) => Json(json!({ "ok": report.ok, "verify": report })).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_rebuild_indexes(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.rebuild_indexes() {
+        Ok(report) => Json(json!({
+            "ok": report.after.ok,
+            "rebuild": report
+        }))
+        .into_response(),
         Err(error) => graph_store_error_response(error),
     }
 }
@@ -555,8 +611,8 @@ fn execute_tenant_command(
     command: &str,
     args: Value,
 ) -> axum::response::Response {
-    if state.store_ready().is_err() {
-        return store_unavailable_response();
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
     }
     if is_graph_command(command) {
         return Json(execute_tenant_graph_command(
@@ -566,7 +622,7 @@ fn execute_tenant_command(
     }
     let store = match state.tenant_store(tenant_id) {
         Ok(store) => store,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => return store_unavailable_response(error),
     };
     let mut executor = StoreBackedThgExecutor::new(store);
     let response = executor.execute_request(ThgRequest::new(command, args));
@@ -579,13 +635,10 @@ fn execute_tenant_graph_command(
     command_name: &str,
     args: Value,
 ) -> ThgResponse {
-    if state.store_ready().is_err() {
+    if let Err(error) = state.store_ready() {
         return ThgResponse::err(
             command_name,
-            ThgError::new(
-                "store_unavailable",
-                "Redis-compatible backing store is unavailable",
-            ),
+            ThgError::new(error.code, error.message),
             "graph:unavailable",
         );
     }
@@ -594,7 +647,7 @@ fn execute_tenant_graph_command(
         Err(error) => {
             return ThgResponse::err(
                 command_name,
-                ThgError::new("redis_graph_store_error", error.to_string()),
+                ThgError::new(error.code, error.message),
                 "graph:unavailable",
             )
         }
@@ -603,7 +656,7 @@ fn execute_tenant_graph_command(
 }
 
 fn execute_graph_store_command(
-    store: &mut RedisGraphStore,
+    store: &mut TenantGraphStore,
     command_name: &str,
     args: Value,
 ) -> ThgResponse {
@@ -742,6 +795,19 @@ fn execute_graph_store_command(
             ),
             Err(error) => graph_command_error(command.name(), error, store),
         },
+        ThgCommand::GraphRebuildIndexes => match store.rebuild_indexes() {
+            Ok(report) => ThgResponse::ok(
+                command.name(),
+                if report.after.ok {
+                    "ok"
+                } else {
+                    "canonical_graph_problem"
+                },
+                json!({ "report": report }),
+                graph_response_hash(store),
+            ),
+            Err(error) => graph_command_error(command.name(), error, store),
+        },
         _ => ThgResponse::err(
             command.name(),
             ThgError::unsupported_command(command.name()),
@@ -759,13 +825,15 @@ fn is_graph_command(command: &str) -> bool {
             | "THG.GRAPH.NEIGHBORS"
             | "THG.GRAPH.STATS"
             | "THG.GRAPH.VERIFY"
+            | "THG.GRAPH.REBUILD_INDEXES"
+            | "THG.GRAPH.REBUILD"
     )
 }
 
 fn graph_command_invalid_params(
     command: &str,
     message: String,
-    store: &RedisGraphStore,
+    store: &TenantGraphStore,
 ) -> ThgResponse {
     ThgResponse::err(
         command,
@@ -777,7 +845,7 @@ fn graph_command_invalid_params(
 fn graph_command_error(
     command: &str,
     error: GraphStoreError,
-    store: &RedisGraphStore,
+    store: &TenantGraphStore,
 ) -> ThgResponse {
     ThgResponse::err(
         command,
@@ -786,7 +854,7 @@ fn graph_command_error(
     )
 }
 
-fn graph_response_hash(store: &RedisGraphStore) -> String {
+fn graph_response_hash(store: &TenantGraphStore) -> String {
     store
         .stats()
         .map(|stats| graph_stats_hash(&stats))
@@ -797,15 +865,8 @@ fn graph_stats_hash(stats: &GraphStats) -> String {
     stable_hash(stats)
 }
 
-fn store_unavailable_response() -> axum::response::Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "store_unavailable",
-            "message": "Redis-compatible backing store is unavailable; check THG_REDIS_URL or REDIS_URL."
-        })),
-    )
-        .into_response()
+fn store_unavailable_response(error: StoreAccessError) -> axum::response::Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(error.as_payload())).into_response()
 }
 
 fn graph_store_error_response(error: GraphStoreError) -> axum::response::Response {
@@ -822,10 +883,19 @@ fn graph_store_error_response(error: GraphStoreError) -> axum::response::Respons
 fn graph_error_status(code: &str) -> StatusCode {
     match code {
         "empty_graph_field"
+        | "empty_graph_transaction"
         | "missing_graph_endpoint"
         | "tombstoned_graph_endpoint"
         | "invalid_graph_record" => StatusCode::BAD_REQUEST,
-        "redis_graph_store_error" => StatusCode::SERVICE_UNAVAILABLE,
+        "redis_graph_store_error"
+        | "redcore_io_error"
+        | "redcore_aof_frame_invalid"
+        | "redcore_aof_checksum_mismatch"
+        | "redcore_lock_poisoned"
+        | "redcore_lock_unavailable"
+        | "redcore_strict_mode_invalid"
+        | "redcore_writer_lock_poisoned"
+        | "redcore_snapshot_lock_poisoned" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -844,6 +914,7 @@ fn required_scope_for_command(command: &str) -> &'static str {
         | "THG.GRAPH.NEIGHBORS"
         | "THG.GRAPH.STATS"
         | "THG.GRAPH.VERIFY" => "graph:read",
+        "THG.GRAPH.REBUILD_INDEXES" | "THG.GRAPH.REBUILD" => "graph:write",
         _ => "run:write",
     }
 }
@@ -888,10 +959,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        execute_tenant_command, graph_error_status, is_graph_command, mcp_origin_allowed,
-        required_scope_for_command,
+        execute_graph_store_command, execute_tenant_command, graph_error_status, is_graph_command,
+        mcp_origin_allowed, required_scope_for_command,
     };
-    use crate::{config::Config, state::AppState};
+    use crate::{
+        config::{Config, StorageMode},
+        state::AppState,
+    };
+    use thg_core::RedCoreDurability;
 
     #[test]
     fn maps_core_commands_to_product_scopes() {
@@ -916,6 +991,10 @@ mod tests {
         );
         assert_eq!(required_scope_for_command("THG.GRAPH.STATS"), "graph:read");
         assert_eq!(required_scope_for_command("THG.GRAPH.VERIFY"), "graph:read");
+        assert_eq!(
+            required_scope_for_command("THG.GRAPH.REBUILD_INDEXES"),
+            "graph:write"
+        );
     }
 
     #[test]
@@ -923,6 +1002,7 @@ mod tests {
         assert!(is_graph_command("thg.graph.node.upsert"));
         assert!(is_graph_command(" THG.GRAPH.NEIGHBORS "));
         assert!(is_graph_command("THG.GRAPH.VERIFY"));
+        assert!(is_graph_command("thg.graph.rebuild_indexes"));
         assert!(!is_graph_command("THG.RUN.BEGIN"));
     }
 
@@ -931,6 +1011,13 @@ mod tests {
         let state = AppState::new(Config {
             host: "127.0.0.1".to_string(),
             port: 8380,
+            storage_mode: StorageMode::Redis,
+            data_dir: "data/rusty-red".to_string(),
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 1_000,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -948,6 +1035,52 @@ mod tests {
         let response = execute_tenant_command(&state, "tenant-a", "THG.GRAPH.STATS", json!({}));
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn graph_rebuild_command_returns_before_and_after_reports() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+        let mut store = state.tenant_graph_store("tenant-a").unwrap();
+
+        let write = execute_graph_store_command(
+            &mut store,
+            "THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:a",
+                "labels": ["File"],
+                "properties": { "path": "src/lib.rs" }
+            }),
+        );
+        let rebuild =
+            execute_graph_store_command(&mut store, "THG.GRAPH.REBUILD_INDEXES", json!({}));
+
+        assert!(write.ok);
+        assert!(rebuild.ok);
+        assert_eq!(rebuild.status, "ok");
+        assert_eq!(rebuild.payload["report"]["before"]["ok"], true);
+        assert_eq!(rebuild.payload["report"]["after"]["ok"], true);
     }
 
     #[test]

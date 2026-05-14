@@ -16,6 +16,9 @@ use state::AppState;
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let config = Config::from_env();
+    config
+        .validate()
+        .map_err(|exc| std::io::Error::new(std::io::ErrorKind::InvalidInput, exc))?;
     let addr: SocketAddr = config
         .bind_addr()
         .parse()

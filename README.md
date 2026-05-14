@@ -32,20 +32,42 @@ This builds an `abi3-py312` wheel and installs it into the active Python environ
 
 Rusty Red is the productized THG runtime profile: it keeps the THG command model
 for existing harness flows while adding first-class graph node, edge, adjacency,
-exact scalar property index, stats, verify, and MCP routes. The code should stay
-shared through `thg-core` rather than being copied into a second implementation:
-Context Theorem can use the same graph-store components internally, while Rusty
-Red packages them as a standalone database service. It is not a raw Redis
-protocol, RedisGraph compatibility layer, FalkorDB replacement, or complete
-OpenCypher/GQL engine yet. Redis-compatible storage is the current durable
-backing store; Rusty Red owns the graph API and index semantics above that
-store.
+exact scalar property index, stats, verify, and MCP routes. By default, it runs
+in `RUSTY_RED_MODE=embedded` with RedCore RAM-first storage and local AOF/snapshot
+persistence.
+
+It is not a raw Redis protocol, RedisGraph compatibility layer, FalkorDB
+replacement, or complete OpenCypher/GQL engine yet. `RUSTY_RED_MODE=redis` keeps
+legacy run/context THG state commands.
+
+It is also not release-ready as a full database yet. The current embedded
+RedCore path has AOF/snapshot recovery tests, staged `GraphMutationBatch` /
+`GraphTransaction` commits, pre-publish durability guards for AOF, snapshot, and
+manifest write failures, per-tenant single-writer execution, committed read
+snapshots, an internal read barrier, strict ACID config enforcement,
+per-directory `.redcore.lock` locking, fsynced temp/rename/dir snapshot and
+manifest writes, torn AOF tail truncation, previous-snapshot fallback with
+AOF replay, and rebuild-indexes admin tooling over canonical graph records.
+Railway restart/no-public-port evidence and the broader query/cache/search gates
+remain follow-up release gates.
 
 Run the product server locally:
 
 ```bash
 cd theseus_native
-RUSTY_RED_REDIS_URL=redis://127.0.0.1:6379 cargo run -p thg-product-server
+RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p thg-product-server
+```
+
+Strict local durability mode is explicit:
+
+```bash
+RUSTY_RED_MODE=embedded \
+RUSTY_RED_CONCURRENCY=single_writer \
+RUSTY_RED_TXN_ISOLATION=serializable \
+RUSTY_RED_STRICT_ACID=true \
+RUSTY_RED_DURABILITY=aof_always \
+RUSTY_RED_DATA_DIR=data/rusty-red \
+cargo run -p thg-product-server
 ```
 
 Core routes:
@@ -67,16 +89,18 @@ GET  /v1/tenants/{tenant_id}/graph/edges/{edge_id}
 POST /v1/tenants/{tenant_id}/graph/neighbors
 GET  /v1/tenants/{tenant_id}/graph/stats
 GET  /v1/tenants/{tenant_id}/graph/verify
+POST /v1/tenants/{tenant_id}/graph/rebuild-indexes
 POST /v1/tenants/{tenant_id}/context/pack
 ```
 
 The shared THG command API also exposes the Rusty Red graph-store core through
 `THG.GRAPH.NODE.UPSERT`, `THG.GRAPH.EDGE.UPSERT`,
-`THG.GRAPH.NODES.QUERY`, `THG.GRAPH.NEIGHBORS`, `THG.GRAPH.STATS`, and
-`THG.GRAPH.VERIFY`. This lets Context Theorem adopt Rusty Red-grade graph
+`THG.GRAPH.NODES.QUERY`, `THG.GRAPH.NEIGHBORS`, `THG.GRAPH.STATS`,
+`THG.GRAPH.VERIFY`, and `THG.GRAPH.REBUILD_INDEXES`. This lets Context
+Theorem adopt Rusty Red-grade graph
 records, exact scalar property indexes, adjacency traversal, and verification
 through the existing THG command surface instead of depending on a separate
-runtime name.
+runtime name. In this slice, run/context state commands remain Redis-mode.
 
 The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
 is exposed through HTTP and MCP even though the underlying storage engine is a
@@ -86,10 +110,10 @@ well-known manifests.
 
 Railway template readiness follows the public template guidance: use a GitHub
 source repo, keep the service root minimal, set `/ready` as the health check,
-wire Redis through private networking/reference variables, attach persistent
-storage to stateful dependencies, generate any public-ingress tokens with
-Railway template variable functions, and replace the badge placeholder above
-once Railway assigns the final template URL.
+wire Redis only for explicit `RUSTY_RED_MODE=redis` deployments through private
+networking/reference variables, attach persistent storage to stateful dependencies,
+generate any public-ingress tokens with Railway template variable functions, and
+replace the badge placeholder above once Railway assigns the final template URL.
 
 Railway can deploy this directory directly:
 
