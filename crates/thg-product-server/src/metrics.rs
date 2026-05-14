@@ -19,7 +19,7 @@ pub async fn metrics(
         state.config.require_auth,
     )?;
     Ok(Json(json!({
-        "service": "thg-product",
+        "service": state.config.service_name.as_str(),
         "status": "ok",
         "auth_required": state.config.require_auth,
         "configured_origins": state.config.allowed_origins.len()

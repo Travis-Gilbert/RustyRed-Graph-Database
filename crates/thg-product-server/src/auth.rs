@@ -1,12 +1,21 @@
 use axum::http::{HeaderMap, StatusCode};
 
-const ALL_SCOPES: [&str; 6] = [
+const ALL_SCOPES: [&str; 15] = [
     "run:write",
     "run:read",
     "context:write",
     "context:read",
     "graph:read",
+    "graph:write",
     "admin:read",
+    "thg:graph:read",
+    "thg:graph:query",
+    "thg:graph:context",
+    "thg:graph:write:propose",
+    "thg:graph:write:apply",
+    "thg:graph:index:read",
+    "thg:graph:admin:verify",
+    "thg:events:read",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,9 +52,9 @@ impl ApiToken {
     }
 
     fn allows(&self, required_scope: &str) -> bool {
-        self.scopes
-            .iter()
-            .any(|scope| scope == "*" || scope == required_scope)
+        self.scopes.iter().any(|scope| {
+            scope == "*" || scope == required_scope || scope_alias(scope) == required_scope
+        })
     }
 }
 
@@ -64,7 +73,10 @@ pub fn require_scope(
     if !require_auth {
         return Ok(AuthContext {
             token: "dev".to_string(),
-            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_string()).collect(),
+            scopes: ALL_SCOPES
+                .iter()
+                .map(|scope| (*scope).to_string())
+                .collect(),
         });
     }
 
@@ -89,6 +101,16 @@ pub fn require_scope(
         token,
         scopes: matched.scopes.clone(),
     })
+}
+
+fn scope_alias(scope: &str) -> &str {
+    match scope {
+        "thg:graph:read" | "thg:graph:query" | "thg:graph:index:read" => "graph:read",
+        "thg:graph:write:propose" | "thg:graph:write:apply" => "graph:write",
+        "thg:graph:context" => "context:read",
+        "thg:graph:admin:verify" => "admin:read",
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +168,14 @@ mod tests {
         assert!(token.allows("run:read"));
         assert!(token.allows("graph:read"));
         assert!(!token.allows("admin:read"));
+    }
+
+    #[test]
+    fn accepts_thg_scope_aliases_for_mcp_tokens() {
+        let token = ApiToken::parse("secret=thg:graph:read|thg:graph:admin:verify").unwrap();
+
+        assert!(token.allows("graph:read"));
+        assert!(token.allows("admin:read"));
+        assert!(!token.allows("graph:write"));
     }
 }

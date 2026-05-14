@@ -105,11 +105,7 @@ impl ThgResponse {
         }
     }
 
-    pub fn err(
-        command: impl Into<String>,
-        error: ThgError,
-        state_hash: impl Into<String>,
-    ) -> Self {
+    pub fn err(command: impl Into<String>, error: ThgError, state_hash: impl Into<String>) -> Self {
         Self {
             ok: false,
             command: command.into(),

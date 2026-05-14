@@ -11,6 +11,7 @@ rust-version = "1.85"
 members = [
     ".",
     "crates/thg-core",
+    "crates/thg-mcp",
     "crates/thg-server",
     "crates/thg-product-server",
     "crates/thg-resp-server",

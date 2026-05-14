@@ -2,7 +2,9 @@ use serde_json::{json, Value};
 
 use crate::commands::{ThgCommand, ThgRequest, ThgResponse};
 use crate::errors::{ThgError, ThgResult};
-use crate::state::{stable_hash, ContextState, PatchState, RunState, StepState, ThgEdge, ThgNode, ThgState};
+use crate::state::{
+    stable_hash, ContextState, PatchState, RunState, StepState, ThgEdge, ThgNode, ThgState,
+};
 use crate::store::ThgStore;
 
 pub trait ThgExecutor {
@@ -41,7 +43,8 @@ impl InMemoryThgExecutor {
 
     fn run_begin(&mut self, args: Value) -> ThgResponse {
         self.state.next_seq();
-        let run_id = string_arg(&args, "run_id").unwrap_or_else(|| generated_id("run", self.state.seq));
+        let run_id =
+            string_arg(&args, "run_id").unwrap_or_else(|| generated_id("run", self.state.seq));
         let run = RunState {
             run_id: run_id.clone(),
             task: string_arg(&args, "task").unwrap_or_default(),
@@ -59,14 +62,17 @@ impl InMemoryThgExecutor {
             self.state_hash(),
         );
         response.nodes.push(node);
-        response.events.push(json!({ "event": "run_begin", "run_id": run_id }));
+        response
+            .events
+            .push(json!({ "event": "run_begin", "run_id": run_id }));
         response
     }
 
     fn run_step(&mut self, args: Value) -> ThgResponse {
         self.state.next_seq();
         let run_id = string_arg(&args, "run_id").unwrap_or_default();
-        let step_id = string_arg(&args, "step_id").unwrap_or_else(|| generated_id("step", self.state.seq));
+        let step_id =
+            string_arg(&args, "step_id").unwrap_or_else(|| generated_id("step", self.state.seq));
         let index = int_arg(&args, "index").unwrap_or_else(|| {
             self.state
                 .runs
@@ -98,7 +104,9 @@ impl InMemoryThgExecutor {
         );
         response.nodes.push(node);
         response.edges.push(edge);
-        response.events.push(json!({ "event": "run_step", "run_id": run_id, "step_id": step_id }));
+        response
+            .events
+            .push(json!({ "event": "run_step", "run_id": run_id, "step_id": step_id }));
         response
     }
 
@@ -151,13 +159,16 @@ impl InMemoryThgExecutor {
 
     fn context_pack(&mut self, args: Value) -> ThgResponse {
         self.state.next_seq();
-        let artifact_id =
-            string_arg(&args, "artifact_id").unwrap_or_else(|| generated_id("artifact", self.state.seq));
+        let artifact_id = string_arg(&args, "artifact_id")
+            .unwrap_or_else(|| generated_id("artifact", self.state.seq));
         let context = ContextState {
             artifact_id: artifact_id.clone(),
             status: "packed".to_string(),
             sections: args.get("sections").cloned().unwrap_or_else(|| json!([])),
-            token_ledger: args.get("token_ledger").cloned().unwrap_or_else(|| json!({})),
+            token_ledger: args
+                .get("token_ledger")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         };
         let node = context.node();
         self.state.contexts.insert(artifact_id.clone(), context);
@@ -550,7 +561,10 @@ mod tests {
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["command"], "THG.CONTEXT.PACK");
         assert_eq!(parsed["payload"]["artifact_id"], "artifact:1");
-        assert!(parsed["state_hash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(parsed["state_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
     }
 
     #[test]

@@ -1191,6 +1191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thg-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thg-core",
+]
+
+[[package]]
 name = "thg-product-server"
 version = "0.1.0"
 dependencies = [
@@ -1200,6 +1209,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thg-core",
+ "thg-mcp",
  "tokio",
  "tower-http",
  "tracing",

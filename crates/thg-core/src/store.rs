@@ -41,6 +41,12 @@ impl RedisThgStore {
             key: key.into(),
         })
     }
+
+    pub fn ping(&self) -> redis::RedisResult<()> {
+        let mut connection = self.client.get_connection()?;
+        redis::cmd("PING").query::<String>(&mut connection)?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "redis-store")]
@@ -50,7 +56,8 @@ impl ThgStore for RedisThgStore {
             Ok(connection) => connection,
             Err(_) => return ThgState::default(),
         };
-        let raw: redis::RedisResult<String> = redis::cmd("GET").arg(&self.key).query(&mut connection);
+        let raw: redis::RedisResult<String> =
+            redis::cmd("GET").arg(&self.key).query(&mut connection);
         raw.ok()
             .and_then(|value| serde_json::from_str::<ThgState>(&value).ok())
             .unwrap_or_default()
