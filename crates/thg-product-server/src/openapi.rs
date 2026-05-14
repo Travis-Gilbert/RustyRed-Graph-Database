@@ -35,6 +35,9 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/tenants/{tenant_id}/graph/nodes/{node_id}": {
                 "get": { "responses": { "200": { "description": "Get graph node" } } }
             },
+            "/v1/tenants/{tenant_id}/graph/nodes/query": {
+                "post": { "responses": { "200": { "description": "Query graph nodes by label and exact scalar property indexes" } } }
+            },
             "/v1/tenants/{tenant_id}/graph/edges": {
                 "post": { "responses": { "200": { "description": "Upsert graph edge" } } }
             },

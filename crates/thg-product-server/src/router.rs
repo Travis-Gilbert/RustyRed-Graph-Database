@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thg_core::commands::ThgRequest;
 use thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
-use thg_core::{EdgeRecord, GraphStoreError, NeighborQuery, NodeRecord};
+use thg_core::{EdgeRecord, GraphStoreError, NeighborQuery, NodeQuery, NodeRecord};
 use thg_mcp::{agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -111,6 +111,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/nodes",
             post(graph_node_upsert),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/nodes/query",
+            post(graph_node_query),
         )
         .route(
             "/v1/tenants/:tenant_id/graph/nodes/:node_id",
@@ -365,6 +369,31 @@ async fn graph_node_get(
     match store.get_node(&node_id) {
         Ok(Some(node)) => Json(json!({ "ok": true, "node": node })).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_node_query(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(query): Json<NodeQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return graph_store_error_response(error.into()),
+    };
+    match store.query_nodes(query) {
+        Ok(nodes) => Json(json!({ "ok": true, "nodes": nodes })).into_response(),
         Err(error) => graph_store_error_response(error),
     }
 }

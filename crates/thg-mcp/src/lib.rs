@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thg_core::{
     Direction, EdgeRecord, GraphStats, GraphStoreError, GraphStoreResult, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeRecord, VerifyReport,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, VerifyReport,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -11,11 +11,13 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub trait McpGraphBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>>;
     fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>>;
     fn stats(&self) -> GraphStoreResult<GraphStats>;
     fn verify(&self) -> GraphStoreResult<VerifyReport>;
     fn labels(&self) -> GraphStoreResult<Vec<String>>;
     fn edge_types(&self) -> GraphStoreResult<Vec<String>>;
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>>;
 }
 
 pub trait McpGraphProvider {
@@ -394,11 +396,12 @@ fn schema_payload(tenant: &str, backend: &impl McpGraphBackend) -> Result<Value,
         "tenant": tenant,
         "labels": backend.labels()?,
         "edgeTypes": backend.edge_types()?,
+        "propertyKeys": backend.property_keys()?,
         "stats": backend.stats()?,
-        "propertyIndexes": [],
+        "propertyIndexes": "exact_scalar",
         "notes": [
-            "This slice exposes label and edge-type catalogs plus adjacency-backed neighbor reads.",
-            "Property indexes and full query planning are still explicit follow-up work."
+            "This slice exposes label, edge-type, adjacency, and exact scalar property indexes.",
+            "Full OpenCypher/GQL parsing and full-text indexes are still explicit follow-up work."
         ]
     }))
 }
@@ -413,7 +416,7 @@ fn index_status_payload(tenant: &str, backend: &impl McpGraphBackend) -> Result<
             "inAdjacency": "active",
             "labels": "active",
             "edgeTypes": "active",
-            "properties": "planned"
+            "properties": "active_exact_scalar"
         },
         "stats": verify.stats,
         "problems": verify.problems
@@ -426,6 +429,20 @@ fn explain_payload(tenant: &str, arguments: &Value) -> Value {
         .or_else(|| arguments.get("op"))
         .and_then(Value::as_str)
         .unwrap_or("neighbors");
+    let query_step = match operation {
+        "node_match" | "node_index_seek" => json!({
+            "op": "node_index_seek",
+            "cost": "O(label_set intersect property_set + returned_nodes)",
+            "index": "label_index plus property_index",
+            "bounded": true
+        }),
+        _ => json!({
+            "op": "adjacency_lookup",
+            "cost": "O(edge_types_for_node + returned_edges)",
+            "index": "out_adjacency or in_adjacency",
+            "bounded": true
+        }),
+    };
     json!({
         "tenant": tenant,
         "operation": operation,
@@ -433,16 +450,11 @@ fn explain_payload(tenant: &str, arguments: &Value) -> Value {
             "op": "resolve_tenant_graph_store",
             "cost": "O(1)",
             "usesRawRedis": false
-        }, {
-            "op": "adjacency_lookup",
-            "cost": "O(edge_types_for_node + returned_edges)",
-            "index": "out_adjacency or in_adjacency",
-            "bounded": true
-        }],
-        "warnings": if operation == "neighbors" {
+        }, query_step],
+        "warnings": if matches!(operation, "neighbors" | "node_match" | "node_index_seek") {
             json!([])
         } else {
-            json!(["Only neighbors-style query execution is implemented in this first MCP slice."])
+            json!(["Only neighbors and exact scalar node_match query execution are implemented in this slice."])
         }
     })
 }
@@ -457,11 +469,28 @@ fn query_payload(
         .or_else(|| arguments.get("op"))
         .and_then(Value::as_str)
         .unwrap_or("neighbors");
+    if matches!(operation, "node_match" | "node_index_seek") {
+        let mut query = node_query_from_value(arguments)?;
+        let budget = Budget::from_args(arguments);
+        query.limit = Some(budget.max_nodes_returned.saturating_add(1));
+        let mut nodes = backend.query_nodes(query)?;
+        let truncated = nodes.len() > budget.max_nodes_returned;
+        if truncated {
+            nodes.truncate(budget.max_nodes_returned);
+        }
+        return Ok(json!({
+            "tenant": tenant,
+            "operation": "node_match",
+            "nodes": nodes,
+            "stats": { "returned": nodes.len(), "truncated": truncated },
+            "explain": explain_payload(tenant, arguments)
+        }));
+    }
     if operation != "neighbors" {
         return Ok(json!({
             "tenant": tenant,
             "unsupported": operation,
-            "supportedOperations": ["neighbors"],
+            "supportedOperations": ["neighbors", "node_match"],
             "explain": explain_payload(tenant, arguments)
         }));
     }
@@ -506,6 +535,25 @@ fn apply_neighbor_budget(neighbors: &mut Vec<NeighborHit>, budget: Budget) -> bo
         neighbors.truncate(budget.max_nodes_returned);
     }
     truncated
+}
+
+fn node_query_from_value(value: &Value) -> Result<NodeQuery, McpError> {
+    let label = value
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let properties = value
+        .get("properties")
+        .or_else(|| value.get("props"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let properties = serde_json::from_value(properties)
+        .map_err(|err| McpError::invalid_params(format!("properties must be an object: {err}")))?;
+    Ok(NodeQuery {
+        label,
+        properties,
+        limit: Some(Budget::from_args(value).max_nodes_returned),
+    })
 }
 
 fn neighbor_query_from_value(value: &Value) -> Result<NeighborQuery, McpError> {
@@ -671,18 +719,19 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "thg.graph.query",
-            "Run a bounded graph query. First slice supports operation=neighbors.",
+            "Run a bounded graph query. Supports adjacency neighbors and exact scalar node_match.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant": { "type": "string" },
-                    "operation": { "type": "string", "enum": ["neighbors"] },
+                    "operation": { "type": "string", "enum": ["neighbors", "node_match"] },
                     "node_id": { "type": "string" },
                     "direction": { "type": "string", "enum": ["out", "in"] },
                     "edge_type": { "type": "string" },
+                    "label": { "type": "string" },
+                    "properties": { "type": "object" },
                     "budget": { "type": "object" }
-                },
-                "required": ["node_id"]
+                }
             }),
         ),
         tool(
@@ -696,6 +745,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "node_id": { "type": "string" },
                     "direction": { "type": "string" },
                     "edge_type": { "type": "string" },
+                    "label": { "type": "string" },
+                    "properties": { "type": "object" },
                     "budget": { "type": "object" }
                 }
             }),
@@ -820,6 +871,10 @@ impl McpGraphBackend for InMemoryGraphStore {
         Ok(InMemoryGraphStore::get_edge(self, id).cloned())
     }
 
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        Ok(InMemoryGraphStore::query_nodes(self, query))
+    }
+
     fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         Ok(InMemoryGraphStore::neighbors(self, query))
     }
@@ -839,6 +894,10 @@ impl McpGraphBackend for InMemoryGraphStore {
     fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
         Ok(InMemoryGraphStore::edge_types(self))
     }
+
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        Ok(InMemoryGraphStore::property_keys(self))
+    }
 }
 
 #[cfg(feature = "redis-store")]
@@ -849,6 +908,10 @@ impl McpGraphBackend for thg_core::RedisGraphStore {
 
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
         thg_core::RedisGraphStore::get_edge(self, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        thg_core::RedisGraphStore::query_nodes(self, query)
     }
 
     fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
@@ -869,6 +932,10 @@ impl McpGraphBackend for thg_core::RedisGraphStore {
 
     fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
         thg_core::RedisGraphStore::edge_types(self)
+    }
+
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        thg_core::RedisGraphStore::property_keys(self)
     }
 }
 
@@ -1031,6 +1098,39 @@ mod tests {
         assert_eq!(
             response["result"]["structuredContent"]["stats"]["truncated"],
             true
+        );
+    }
+
+    #[test]
+    fn graph_query_supports_property_indexed_node_match() {
+        let (provider, config) = fixture();
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "node-match",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.graph.query",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "operation": "node_match",
+                        "label": "Person",
+                        "properties": { "name": "Grace" },
+                        "budget": { "max_nodes_returned": 5 }
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            response["result"]["structuredContent"]["nodes"][0]["id"],
+            "node:b"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["explain"]["plan"][1]["op"],
+            "node_index_seek"
         );
     }
 

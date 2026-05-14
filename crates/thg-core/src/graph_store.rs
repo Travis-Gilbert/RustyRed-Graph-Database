@@ -12,6 +12,7 @@ pub trait GraphStore {
     fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult>;
     fn get_node(&self, id: &str) -> Option<&NodeRecord>;
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord>;
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord>;
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit>;
     fn stats(&self) -> GraphStats;
     fn verify(&self) -> VerifyReport;
@@ -179,6 +180,49 @@ pub struct NeighborHit {
     pub edge_type: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl NodeQuery {
+    pub fn label(label: impl Into<String>) -> Self {
+        Self {
+            label: Some(label.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_property(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.properties.insert(key.into(), value);
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        if limit > 0 {
+            self.limit = Some(limit);
+        }
+        self
+    }
+
+    fn normalized_label(&self) -> Option<String> {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+    }
+
+    fn bounded_limit(&self) -> usize {
+        self.limit.filter(|limit| *limit > 0).unwrap_or(100)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GraphWriteResult {
     pub id: String,
@@ -193,6 +237,8 @@ pub struct GraphStats {
     pub edges_total: usize,
     pub labels_total: usize,
     pub edge_types_total: usize,
+    pub property_keys_total: usize,
+    pub property_indexes_total: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +264,7 @@ pub struct InMemoryGraphStore {
     in_adjacency: BTreeMap<(String, String), BTreeSet<String>>,
     label_index: BTreeMap<String, BTreeSet<String>>,
     edge_type_index: BTreeMap<String, BTreeSet<String>>,
+    property_index: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 impl InMemoryGraphStore {
@@ -292,12 +339,60 @@ impl InMemoryGraphStore {
         sorted_values(self.edge_type_index.get(edge_type))
     }
 
+    pub fn node_ids_for_property(&self, key: &str, value: &Value) -> Vec<String> {
+        let Some(token) = property_index_token(value) else {
+            return Vec::new();
+        };
+        sorted_values(self.property_index.get(&(key.to_string(), token)))
+    }
+
     pub fn labels(&self) -> Vec<String> {
         self.label_index.keys().cloned().collect()
     }
 
     pub fn edge_types(&self) -> Vec<String> {
         self.edge_type_index.keys().cloned().collect()
+    }
+
+    pub fn property_keys(&self) -> Vec<String> {
+        self.property_index
+            .keys()
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        let mut candidate_ids: Option<BTreeSet<String>> = None;
+        if let Some(label) = query.normalized_label() {
+            merge_candidates(&mut candidate_ids, self.label_index.get(&label).cloned());
+        }
+        for (key, value) in &query.properties {
+            let key = key.trim();
+            if key.is_empty() {
+                return Vec::new();
+            }
+            let Some(token) = property_index_token(value) else {
+                return Vec::new();
+            };
+            merge_candidates(
+                &mut candidate_ids,
+                self.property_index.get(&(key.to_string(), token)).cloned(),
+            );
+        }
+
+        let ids = candidate_ids.unwrap_or_else(|| {
+            self.nodes
+                .values()
+                .filter(|node| !node.tombstone)
+                .map(|node| node.id.clone())
+                .collect()
+        });
+        ids.into_iter()
+            .filter_map(|id| self.get_node(&id).cloned())
+            .take(query.bounded_limit())
+            .collect()
     }
 
     pub fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
@@ -354,6 +449,8 @@ impl InMemoryGraphStore {
             edges_total: self.edges.values().filter(|edge| !edge.tombstone).count(),
             labels_total: self.label_index.len(),
             edge_types_total: self.edge_type_index.len(),
+            property_keys_total: self.property_keys().len(),
+            property_indexes_total: self.property_index.len(),
         }
     }
 
@@ -366,6 +463,13 @@ impl InMemoryGraphStore {
                 expected
                     .label_index
                     .entry(label.clone())
+                    .or_default()
+                    .insert(node.id.clone());
+            }
+            for (key, token) in indexed_properties(&node.properties) {
+                expected
+                    .property_index
+                    .entry((key, token))
                     .or_default()
                     .insert(node.id.clone());
             }
@@ -417,6 +521,13 @@ impl InMemoryGraphStore {
                 detail: "edge type index does not match live edge types".to_string(),
             });
         }
+        if self.property_index != expected.property_index {
+            problems.push(VerifyProblem {
+                kind: "property_index_drift".to_string(),
+                id: "property_index".to_string(),
+                detail: "property index does not match live scalar node properties".to_string(),
+            });
+        }
         if self.out_adjacency != expected.out_adjacency {
             problems.push(VerifyProblem {
                 kind: "out_adjacency_drift".to_string(),
@@ -465,11 +576,28 @@ impl InMemoryGraphStore {
                 .or_default()
                 .insert(node.id.clone());
         }
+        for (key, token) in indexed_properties(&node.properties) {
+            self.property_index
+                .entry((key, token))
+                .or_default()
+                .insert(node.id.clone());
+        }
     }
 
     fn remove_node_indexes(&mut self, node: &NodeRecord) {
         for label in &node.labels {
             remove_index_value(&mut self.label_index, label, &node.id);
+        }
+        for key in indexed_properties(&node.properties).into_keys() {
+            let entries = self
+                .property_index
+                .keys()
+                .filter(|(property_key, _)| property_key == &key)
+                .cloned()
+                .collect::<Vec<_>>();
+            for entry in entries {
+                remove_index_value(&mut self.property_index, &entry, &node.id);
+            }
         }
     }
 
@@ -556,6 +684,10 @@ impl RedisGraphKeyspace {
         self.key("edge_types")
     }
 
+    pub fn property_index_entries(&self) -> String {
+        self.key("property_index_entries")
+    }
+
     pub fn out_adjacency_pairs(&self) -> String {
         self.key("out_adjacency_pairs")
     }
@@ -582,6 +714,14 @@ impl RedisGraphKeyspace {
 
     pub fn edge_type(&self, edge_type: &str) -> String {
         self.key(&format!("edge_type:{}", encode_key_segment(edge_type)))
+    }
+
+    pub fn property_value(&self, key: &str, token: &str) -> String {
+        self.key(&format!(
+            "property:{}:{}",
+            encode_key_segment(key),
+            encode_key_segment(token)
+        ))
     }
 
     pub fn out_adjacency(&self, node_id: &str, edge_type: &str) -> String {
@@ -676,6 +816,7 @@ impl RedisGraphStore {
                     .arg(&existing.id)
                     .ignore();
             }
+            remove_node_from_redis_property_indexes(&mut pipe, &self.keyspace, existing);
         }
         if !node.tombstone {
             for label in &node.labels {
@@ -688,11 +829,16 @@ impl RedisGraphStore {
                     .arg(&node.id)
                     .ignore();
             }
+            add_node_to_redis_property_indexes(&mut pipe, &self.keyspace, &node);
         }
         pipe.query::<()>(&mut connection)?;
 
         if let Some(existing) = existing {
             self.cleanup_empty_labels(&mut connection, &existing.labels)?;
+            self.cleanup_empty_properties(
+                &mut connection,
+                &indexed_properties(&existing.properties),
+            )?;
         }
 
         Ok(GraphWriteResult {
@@ -789,6 +935,18 @@ impl RedisGraphStore {
         )
     }
 
+    pub fn node_ids_for_property(&self, key: &str, value: &Value) -> GraphStoreResult<Vec<String>> {
+        let Some(token) = property_index_token(value) else {
+            return Ok(Vec::new());
+        };
+        let mut connection = self.connection()?;
+        Ok(
+            redis_string_set(&mut connection, self.keyspace.property_value(key, &token))?
+                .into_iter()
+                .collect(),
+        )
+    }
+
     pub fn labels(&self) -> GraphStoreResult<Vec<String>> {
         let mut connection = self.connection()?;
         Ok(redis_string_set(&mut connection, self.keyspace.labels())?
@@ -813,6 +971,62 @@ impl RedisGraphStore {
                 })
                 .collect(),
         )
+    }
+
+    pub fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        let mut connection = self.connection()?;
+        let mut keys = BTreeSet::new();
+        for entry in redis_string_set(&mut connection, self.keyspace.property_index_entries())? {
+            let Some((key, token)) = decode_property_pair(&entry) else {
+                continue;
+            };
+            if !redis_string_set(&mut connection, self.keyspace.property_value(&key, &token))?
+                .is_empty()
+            {
+                keys.insert(key);
+            }
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    pub fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        let mut candidate_ids: Option<BTreeSet<String>> = None;
+        if let Some(label) = query.normalized_label() {
+            merge_candidates(
+                &mut candidate_ids,
+                Some(self.node_ids_for_label(&label)?.into_iter().collect()),
+            );
+        }
+        for (key, value) in &query.properties {
+            let key = key.trim();
+            if key.is_empty() {
+                return Ok(Vec::new());
+            }
+            let Some(token) = property_index_token(value) else {
+                return Ok(Vec::new());
+            };
+            let mut connection = self.connection()?;
+            merge_candidates(
+                &mut candidate_ids,
+                Some(
+                    redis_string_set(&mut connection, self.keyspace.property_value(key, &token))?
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+        }
+
+        let ids = match candidate_ids {
+            Some(ids) => ids,
+            None => self.live_nodes()?.into_keys().collect(),
+        };
+        let mut nodes = Vec::new();
+        for id in ids.into_iter().take(query.bounded_limit()) {
+            if let Some(node) = self.get_node(&id)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
     }
 
     pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
@@ -873,6 +1087,8 @@ impl RedisGraphStore {
             edges_total: live_edges.len(),
             labels_total: self.labels()?.len(),
             edge_types_total: self.edge_types()?.len(),
+            property_keys_total: self.property_keys()?.len(),
+            property_indexes_total: self.redis_indexes()?.property_index.len(),
         })
     }
 
@@ -887,6 +1103,13 @@ impl RedisGraphStore {
                 expected
                     .label_index
                     .entry(label.clone())
+                    .or_default()
+                    .insert(node.id.clone());
+            }
+            for (key, token) in indexed_properties(&node.properties) {
+                expected
+                    .property_index
+                    .entry((key, token))
                     .or_default()
                     .insert(node.id.clone());
             }
@@ -937,6 +1160,14 @@ impl RedisGraphStore {
                 kind: "edge_type_index_drift".to_string(),
                 id: "edge_type_index".to_string(),
                 detail: "Redis edge type index does not match live edge types".to_string(),
+            });
+        }
+        if actual.property_index != expected.property_index {
+            problems.push(VerifyProblem {
+                kind: "property_index_drift".to_string(),
+                id: "property_index".to_string(),
+                detail: "Redis property index does not match live scalar node properties"
+                    .to_string(),
             });
         }
         if actual.out_adjacency != expected.out_adjacency {
@@ -1047,6 +1278,16 @@ impl RedisGraphStore {
                 indexes.edge_type_index.insert(edge_type, edge_ids);
             }
         }
+        for entry in redis_string_set(&mut connection, self.keyspace.property_index_entries())? {
+            let Some((key, token)) = decode_property_pair(&entry) else {
+                continue;
+            };
+            let node_ids =
+                redis_string_set(&mut connection, self.keyspace.property_value(&key, &token))?;
+            if !node_ids.is_empty() {
+                indexes.property_index.insert((key, token), node_ids);
+            }
+        }
         for pair in redis_string_set(&mut connection, self.keyspace.out_adjacency_pairs())? {
             let Some((node_id, edge_type)) = decode_adjacency_pair(&pair) else {
                 continue;
@@ -1085,6 +1326,22 @@ impl RedisGraphStore {
                 self.keyspace.label(label),
                 self.keyspace.labels(),
                 label,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_empty_properties(
+        &self,
+        connection: &mut redis::Connection,
+        properties: &BTreeMap<String, String>,
+    ) -> GraphStoreResult<()> {
+        for (key, token) in properties {
+            cleanup_empty_redis_set(
+                connection,
+                self.keyspace.property_value(key, token),
+                self.keyspace.property_index_entries(),
+                &property_pair(key, token),
             )?;
         }
         Ok(())
@@ -1142,6 +1399,10 @@ impl GraphStore for InMemoryGraphStore {
         InMemoryGraphStore::get_edge(self, id)
     }
 
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        InMemoryGraphStore::query_nodes(self, query)
+    }
+
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
         InMemoryGraphStore::neighbors(self, query)
     }
@@ -1161,6 +1422,7 @@ struct ExpectedIndexes {
     in_adjacency: BTreeMap<(String, String), BTreeSet<String>>,
     label_index: BTreeMap<String, BTreeSet<String>>,
     edge_type_index: BTreeMap<String, BTreeSet<String>>,
+    property_index: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 fn validate_edge_shape(edge: &EdgeRecord) -> GraphStoreResult<()> {
@@ -1212,6 +1474,41 @@ fn sorted_values(values: Option<&BTreeSet<String>>) -> Vec<String> {
     values
         .map(|values| values.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+fn merge_candidates(candidates: &mut Option<BTreeSet<String>>, next: Option<BTreeSet<String>>) {
+    let next = next.unwrap_or_default();
+    match candidates {
+        Some(existing) => {
+            *existing = existing.intersection(&next).cloned().collect();
+        }
+        None => *candidates = Some(next),
+    }
+}
+
+fn indexed_properties(properties: &Value) -> BTreeMap<String, String> {
+    let Some(properties) = properties.as_object() else {
+        return BTreeMap::new();
+    };
+    properties
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            property_index_token(value).map(|token| (key.to_string(), token))
+        })
+        .collect()
+}
+
+fn property_index_token(value: &Value) -> Option<String> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).ok()
+        }
+        Value::Array(_) | Value::Object(_) => None,
+    }
 }
 
 #[cfg(feature = "redis-store")]
@@ -1280,6 +1577,38 @@ fn remove_edge_from_redis_indexes(
 }
 
 #[cfg(feature = "redis-store")]
+fn add_node_to_redis_property_indexes(
+    pipe: &mut redis::Pipeline,
+    keyspace: &RedisGraphKeyspace,
+    node: &NodeRecord,
+) {
+    for (key, token) in indexed_properties(&node.properties) {
+        pipe.cmd("SADD")
+            .arg(keyspace.property_index_entries())
+            .arg(property_pair(&key, &token))
+            .ignore()
+            .cmd("SADD")
+            .arg(keyspace.property_value(&key, &token))
+            .arg(&node.id)
+            .ignore();
+    }
+}
+
+#[cfg(feature = "redis-store")]
+fn remove_node_from_redis_property_indexes(
+    pipe: &mut redis::Pipeline,
+    keyspace: &RedisGraphKeyspace,
+    node: &NodeRecord,
+) {
+    for (key, token) in indexed_properties(&node.properties) {
+        pipe.cmd("SREM")
+            .arg(keyspace.property_value(&key, &token))
+            .arg(&node.id)
+            .ignore();
+    }
+}
+
+#[cfg(feature = "redis-store")]
 fn cleanup_empty_redis_set(
     connection: &mut redis::Connection,
     set_key: String,
@@ -1331,6 +1660,16 @@ fn decode_adjacency_pair(raw: &str) -> Option<(String, String)> {
     serde_json::from_str::<(String, String)>(raw).ok()
 }
 
+#[cfg(feature = "redis-store")]
+fn property_pair(key: &str, token: &str) -> String {
+    serde_json::to_string(&(key, token)).unwrap_or_else(|_| format!("{key}\t{token}"))
+}
+
+#[cfg(feature = "redis-store")]
+fn decode_property_pair(raw: &str) -> Option<(String, String)> {
+    serde_json::from_str::<(String, String)>(raw).ok()
+}
+
 pub fn sanitize_tenant_segment(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -1367,7 +1706,9 @@ fn hex_digit(value: u8) -> char {
 mod tests {
     use serde_json::json;
 
-    use super::{Direction, EdgeRecord, GraphStore, InMemoryGraphStore, NeighborQuery, NodeRecord};
+    use super::{
+        Direction, EdgeRecord, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
+    };
 
     #[test]
     fn records_have_stable_hashes_and_metadata() {
@@ -1446,10 +1787,18 @@ mod tests {
     fn label_and_edge_type_indexes_track_updates() {
         let mut store = InMemoryGraphStore::new();
         store
-            .upsert_node(NodeRecord::new("node:a", ["Person"], json!({})))
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["Person"],
+                json!({"name": "Ada", "kind": "scientist"}),
+            ))
             .unwrap();
         store
-            .upsert_node(NodeRecord::new("node:b", ["Person"], json!({})))
+            .upsert_node(NodeRecord::new(
+                "node:b",
+                ["Person"],
+                json!({"name": "Grace", "kind": "engineer"}),
+            ))
             .unwrap();
         store
             .upsert_edge(EdgeRecord::new(
@@ -1462,7 +1811,11 @@ mod tests {
             .unwrap();
 
         store
-            .upsert_node(NodeRecord::new("node:a", ["System"], json!({})))
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["System"],
+                json!({"name": "Ada", "kind": "engine"}),
+            ))
             .unwrap();
         store
             .upsert_edge(EdgeRecord::new(
@@ -1497,6 +1850,54 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            store.node_ids_for_property("kind", &json!("engine")),
+            vec!["node:a".to_string()]
+        );
+        assert!(store
+            .node_ids_for_property("kind", &json!("scientist"))
+            .is_empty());
+        assert_eq!(store.verify().ok, true);
+    }
+
+    #[test]
+    fn property_indexes_support_exact_node_seek() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["File"],
+                json!({"path": "src/lib.rs", "repo": "rusty-red", "rank": 1}),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:b",
+                ["File"],
+                json!({"path": "src/main.rs", "repo": "rusty-red", "rank": 2}),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:c",
+                ["Symbol"],
+                json!({"path": "src/lib.rs", "repo": "rusty-red"}),
+            ))
+            .unwrap();
+
+        let hits = store.query_nodes(
+            NodeQuery::label("File")
+                .with_property("repo", json!("rusty-red"))
+                .with_property("path", json!("src/lib.rs")),
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "node:a");
+        assert_eq!(
+            store.property_keys(),
+            vec!["path".to_string(), "rank".to_string(), "repo".to_string()]
+        );
+        assert_eq!(store.stats().property_indexes_total, 5);
         assert_eq!(store.verify().ok, true);
     }
 
@@ -1545,6 +1946,11 @@ mod tests {
             .get_mut(&("node:a".to_string(), "KNOWS".to_string()))
             .unwrap()
             .remove("edge:ab");
+        store
+            .property_index
+            .entry(("name".to_string(), "\"Ada\"".to_string()))
+            .or_default()
+            .insert("node:a".to_string());
 
         let report = store.verify();
 
@@ -1553,6 +1959,10 @@ mod tests {
             .problems
             .iter()
             .any(|problem| problem.kind == "out_adjacency_drift"));
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.kind == "property_index_drift"));
     }
 
     #[test]
@@ -1600,6 +2010,10 @@ mod tests {
         assert_eq!(
             keyspace.out_adjacency("node:a", "LINKS"),
             "rrgdb:{tenant:TenantOne}:graph:v1:adj:out:h6e6f64653a61:h4c494e4b53"
+        );
+        assert_eq!(
+            keyspace.property_value("path", "\"src/lib.rs\""),
+            "rrgdb:{tenant:TenantOne}:graph:v1:property:h70617468:h227372632f6c69622e727322"
         );
         assert_eq!(
             keyspace.events(),
