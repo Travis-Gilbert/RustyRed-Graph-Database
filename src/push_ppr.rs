@@ -69,10 +69,7 @@ fn extract_seeds(seeds: &Bound<'_, PyDict>) -> PyResult<(HashMap<i64, f64>, Vec<
 /// This is the load-bearing performance optimization: the algorithm
 /// only converts the small subset of nodes it actually touches, not
 /// the entire adjacency dict.
-fn fetch_neighbors(
-    adjacency: &Bound<'_, PyDict>,
-    u: i64,
-) -> PyResult<Option<Vec<(i64, f64)>>> {
+fn fetch_neighbors(adjacency: &Bound<'_, PyDict>, u: i64) -> PyResult<Option<Vec<(i64, f64)>>> {
     let val = match adjacency.get_item(u)? {
         Some(v) => v,
         None => return Ok(None),

@@ -2,6 +2,9 @@ use serde_json::{json, Value};
 
 use crate::commands::{ThgCommand, ThgRequest, ThgResponse};
 use crate::errors::{ThgError, ThgResult};
+use crate::graph_store::{
+    EdgeRecord, GraphStoreError, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
+};
 use crate::state::{
     stable_hash, ContextState, PatchState, RunState, StepState, ThgEdge, ThgNode, ThgState,
 };
@@ -16,11 +19,19 @@ pub trait ThgExecutor {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryThgExecutor {
     state: ThgState,
+    graph_store: InMemoryGraphStore,
 }
 
 impl InMemoryThgExecutor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_state(state: ThgState) -> Self {
+        Self {
+            state,
+            graph_store: InMemoryGraphStore::new(),
+        }
     }
 
     pub fn state_hash(&self) -> String {
@@ -287,6 +298,132 @@ impl InMemoryThgExecutor {
             self.state_hash(),
         )
     }
+
+    fn graph_node_upsert(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::GraphNodeUpsert.name();
+        self.state.next_seq();
+        let node = match node_record_from_args(args) {
+            Ok(node) => node,
+            Err(error) => return ThgResponse::err(command, error, self.state_hash()),
+        };
+        let response_node = thg_node_from_record(&node);
+        match self.graph_store.upsert_node(node) {
+            Ok(write) => {
+                let mut response = ThgResponse::ok(
+                    command,
+                    "ok",
+                    json!({ "write": write, "node": response_node }),
+                    self.state_hash(),
+                );
+                response.nodes.push(response_node);
+                response
+            }
+            Err(error) => graph_store_response_error(command, error, self.state_hash()),
+        }
+    }
+
+    fn graph_edge_upsert(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::GraphEdgeUpsert.name();
+        self.state.next_seq();
+        let edge = match edge_record_from_args(args) {
+            Ok(edge) => edge,
+            Err(error) => return ThgResponse::err(command, error, self.state_hash()),
+        };
+        let response_edge = thg_edge_from_record(&edge);
+        match self.graph_store.upsert_edge(edge) {
+            Ok(write) => {
+                let mut response = ThgResponse::ok(
+                    command,
+                    "ok",
+                    json!({ "write": write, "edge": response_edge }),
+                    self.state_hash(),
+                );
+                response.edges.push(response_edge);
+                response
+            }
+            Err(error) => graph_store_response_error(command, error, self.state_hash()),
+        }
+    }
+
+    fn graph_nodes_query(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::GraphNodesQuery.name();
+        let query = match serde_json::from_value::<NodeQuery>(args) {
+            Ok(query) => query,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new("invalid_graph_query", error.to_string()),
+                    self.state_hash(),
+                )
+            }
+        };
+        let operation = if query.label.is_some() || !query.properties.is_empty() {
+            "node_index_seek"
+        } else {
+            "node_scan"
+        };
+        let hits = self.graph_store.query_nodes(query);
+        let nodes = hits
+            .iter()
+            .map(thg_node_from_record)
+            .collect::<Vec<ThgNode>>();
+        let mut response = ThgResponse::ok(
+            command,
+            "ok",
+            json!({
+                "nodes": hits,
+                "plan": { "operation": operation },
+                "stats": { "returned": nodes.len() },
+            }),
+            self.state_hash(),
+        );
+        response.nodes = nodes;
+        response
+    }
+
+    fn graph_neighbors(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::GraphNeighbors.name();
+        let query = match serde_json::from_value::<NeighborQuery>(args) {
+            Ok(query) => query,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new("invalid_graph_query", error.to_string()),
+                    self.state_hash(),
+                )
+            }
+        };
+        let hits = self.graph_store.neighbors(query);
+        ThgResponse::ok(
+            command,
+            "ok",
+            json!({
+                "neighbors": hits,
+                "plan": { "operation": "adjacency_seek" },
+                "stats": { "returned": hits.len() },
+            }),
+            self.state_hash(),
+        )
+    }
+
+    fn graph_stats(&mut self) -> ThgResponse {
+        ThgResponse::ok(
+            ThgCommand::GraphStats.name(),
+            "ok",
+            json!({ "stats": self.graph_store.stats() }),
+            self.state_hash(),
+        )
+    }
+
+    fn graph_verify(&mut self) -> ThgResponse {
+        let report = self.graph_store.verify();
+        ThgResponse::ok(
+            ThgCommand::GraphVerify.name(),
+            if report.ok { "ok" } else { "drift_detected" },
+            json!({ "report": report }),
+            self.state_hash(),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -300,7 +437,7 @@ impl<S: ThgStore> StoreBackedThgExecutor<S> {
         let state = store.load();
         Self {
             store,
-            inner: InMemoryThgExecutor { state },
+            inner: InMemoryThgExecutor::from_state(state),
         }
     }
 
@@ -345,6 +482,12 @@ impl ThgExecutor for InMemoryThgExecutor {
             ThgCommand::PatchCommit => self.patch_commit(args),
             ThgCommand::StateHash => self.state_hash_command(args),
             ThgCommand::CypherDebug => self.cypher_debug(args),
+            ThgCommand::GraphNodeUpsert => self.graph_node_upsert(args),
+            ThgCommand::GraphEdgeUpsert => self.graph_edge_upsert(args),
+            ThgCommand::GraphNodesQuery => self.graph_nodes_query(args),
+            ThgCommand::GraphNeighbors => self.graph_neighbors(args),
+            ThgCommand::GraphStats => self.graph_stats(),
+            ThgCommand::GraphVerify => self.graph_verify(),
         })
     }
 
@@ -397,6 +540,10 @@ fn generated_id(prefix: &str, seq: u64) -> String {
 
 fn string_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn bool_arg(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(Value::as_bool)
 }
 
 fn int_arg(args: &Value, key: &str) -> Option<i64> {
@@ -524,6 +671,63 @@ fn debug_cypher_rows(query: &str, graph: &Value) -> Value {
     json!([])
 }
 
+fn node_record_from_args(args: Value) -> Result<NodeRecord, ThgError> {
+    let id = string_arg(&args, "id")
+        .or_else(|| string_arg(&args, "node_id"))
+        .ok_or_else(|| ThgError::new("empty_graph_field", "node.id is required"))?;
+    let labels = string_vec_arg(&args, "labels");
+    let properties = args.get("properties").cloned().unwrap_or_else(|| json!({}));
+    let mut node = NodeRecord::new(id, labels, properties);
+    node.tombstone = bool_arg(&args, "tombstone").unwrap_or(false);
+    Ok(node)
+}
+
+fn edge_record_from_args(args: Value) -> Result<EdgeRecord, ThgError> {
+    let id = string_arg(&args, "id")
+        .or_else(|| string_arg(&args, "edge_id"))
+        .ok_or_else(|| ThgError::new("empty_graph_field", "edge.id is required"))?;
+    let from_id = string_arg(&args, "from_id")
+        .ok_or_else(|| ThgError::new("empty_graph_field", "edge.from_id is required"))?;
+    let to_id = string_arg(&args, "to_id")
+        .ok_or_else(|| ThgError::new("empty_graph_field", "edge.to_id is required"))?;
+    let edge_type = string_arg(&args, "type")
+        .or_else(|| string_arg(&args, "edge_type"))
+        .ok_or_else(|| ThgError::new("empty_graph_field", "edge.type is required"))?;
+    let properties = args.get("properties").cloned().unwrap_or_else(|| json!({}));
+    let mut edge = EdgeRecord::new(id, from_id, edge_type, to_id, properties);
+    edge.tombstone = bool_arg(&args, "tombstone").unwrap_or(false);
+    Ok(edge)
+}
+
+fn thg_node_from_record(node: &NodeRecord) -> ThgNode {
+    ThgNode {
+        id: node.id.clone(),
+        labels: node.labels.clone(),
+        properties: node.properties.clone(),
+    }
+}
+
+fn thg_edge_from_record(edge: &EdgeRecord) -> ThgEdge {
+    ThgEdge {
+        from_id: edge.from_id.clone(),
+        edge_type: edge.edge_type.clone(),
+        to_id: edge.to_id.clone(),
+        properties: edge.properties.clone(),
+    }
+}
+
+fn graph_store_response_error(
+    command: impl Into<String>,
+    error: GraphStoreError,
+    state_hash: String,
+) -> ThgResponse {
+    ThgResponse::err(
+        command,
+        ThgError::new(error.code, error.message),
+        state_hash,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -582,5 +786,84 @@ mod tests {
         assert!(response.ok);
         let saved = executor.store().load();
         assert_eq!(saved.runs["run:persisted"].task, "durable THG");
+    }
+
+    #[test]
+    fn graph_commands_upsert_query_and_verify_graph_store() {
+        let mut executor = InMemoryThgExecutor::new();
+        let node_a = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphNodeUpsert.name(),
+            json!({
+                "id": "node:a",
+                "labels": ["File"],
+                "properties": { "path": "src/lib.rs", "repo": "rusty-red" }
+            }),
+        ));
+        let node_b = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphNodeUpsert.name(),
+            json!({
+                "id": "node:b",
+                "labels": ["File"],
+                "properties": { "path": "src/main.rs", "repo": "rusty-red" }
+            }),
+        ));
+        let edge = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphEdgeUpsert.name(),
+            json!({
+                "id": "edge:ab",
+                "from_id": "node:a",
+                "type": "IMPORTS",
+                "to_id": "node:b",
+                "properties": { "weight": 1 }
+            }),
+        ));
+        let query = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphNodesQuery.name(),
+            json!({
+                "label": "File",
+                "properties": { "path": "src/lib.rs" }
+            }),
+        ));
+        let neighbors = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphNeighbors.name(),
+            json!({ "node_id": "node:a", "direction": "out" }),
+        ));
+        let verify =
+            executor.execute_request(ThgRequest::new(ThgCommand::GraphVerify.name(), json!({})));
+
+        assert!(node_a.ok);
+        assert!(node_b.ok);
+        assert!(edge.ok);
+        assert_eq!(query.payload["plan"]["operation"], "node_index_seek");
+        assert_eq!(query.payload["stats"]["returned"], 1);
+        assert_eq!(query.nodes[0].id, "node:a");
+        assert_eq!(neighbors.payload["plan"]["operation"], "adjacency_seek");
+        assert_eq!(neighbors.payload["neighbors"][0]["node_id"], "node:b");
+        assert_eq!(verify.payload["report"]["ok"], true);
+    }
+
+    #[test]
+    fn graph_edge_command_requires_live_endpoints() {
+        let mut executor = InMemoryThgExecutor::new();
+        executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphNodeUpsert.name(),
+            json!({ "id": "node:a", "labels": ["File"] }),
+        ));
+
+        let response = executor.execute_request(ThgRequest::new(
+            ThgCommand::GraphEdgeUpsert.name(),
+            json!({
+                "id": "edge:missing",
+                "from_id": "node:a",
+                "type": "IMPORTS",
+                "to_id": "node:missing"
+            }),
+        ));
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("missing_graph_endpoint")
+        );
     }
 }

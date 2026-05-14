@@ -18,7 +18,9 @@ pub fn search_score_frontier_batch<'py>(
     for item in rows.iter()? {
         let item = item?;
         let dict = item.downcast::<PyDict>()?;
-        let url = get_string(dict, "url")?.or_else(|| get_string(dict, "normalized_url").ok().flatten()).unwrap_or_default();
+        let url = get_string(dict, "url")?
+            .or_else(|| get_string(dict, "normalized_url").ok().flatten())
+            .unwrap_or_default();
         let title = get_string(dict, "title")?.unwrap_or_default();
         let snippet = get_string(dict, "snippet")?.unwrap_or_default();
         let source_type = get_string(dict, "source_type")?.unwrap_or_default();
@@ -27,7 +29,11 @@ pub fn search_score_frontier_batch<'py>(
             .iter()
             .filter(|token| haystack.contains(&token.to_lowercase()))
             .count() as f64;
-        let token_score = if query_tokens.is_empty() { 0.0 } else { overlap / query_tokens.len() as f64 };
+        let token_score = if query_tokens.is_empty() {
+            0.0
+        } else {
+            overlap / query_tokens.len() as f64
+        };
         let domain_health = get_f64(dict, "domain_health")?
             .or_else(|| get_f64(dict, "domain_health_score").ok().flatten())
             .unwrap_or(0.0);
@@ -112,7 +118,9 @@ fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
     let without_fragment = trimmed.split('#').next().unwrap_or("");
     let (scheme, rest) = match without_fragment.split_once("://") {
-        Some((s, r)) if s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https") => (s.to_lowercase(), r),
+        Some((s, r)) if s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https") => {
+            (s.to_lowercase(), r)
+        }
         _ => return String::new(),
     };
     let (host_and_path, query) = match rest.split_once('?') {

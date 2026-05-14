@@ -18,6 +18,12 @@ pub enum ThgCommand {
     PatchCommit,
     StateHash,
     CypherDebug,
+    GraphNodeUpsert,
+    GraphEdgeUpsert,
+    GraphNodesQuery,
+    GraphNeighbors,
+    GraphStats,
+    GraphVerify,
 }
 
 impl ThgCommand {
@@ -34,6 +40,12 @@ impl ThgCommand {
             "THG.PATCH.COMMIT" => Ok(Self::PatchCommit),
             "THG.STATE.HASH" => Ok(Self::StateHash),
             "THG.DEBUG.CYPHER" | "THG.CYPHER" => Ok(Self::CypherDebug),
+            "THG.GRAPH.NODE.UPSERT" => Ok(Self::GraphNodeUpsert),
+            "THG.GRAPH.EDGE.UPSERT" => Ok(Self::GraphEdgeUpsert),
+            "THG.GRAPH.NODES.QUERY" => Ok(Self::GraphNodesQuery),
+            "THG.GRAPH.NEIGHBORS" => Ok(Self::GraphNeighbors),
+            "THG.GRAPH.STATS" => Ok(Self::GraphStats),
+            "THG.GRAPH.VERIFY" => Ok(Self::GraphVerify),
             _ => Err(ThgError::unsupported_command(name)),
         }
     }
@@ -51,6 +63,12 @@ impl ThgCommand {
             Self::PatchCommit => "THG.PATCH.COMMIT",
             Self::StateHash => "THG.STATE.HASH",
             Self::CypherDebug => "THG.DEBUG.CYPHER",
+            Self::GraphNodeUpsert => "THG.GRAPH.NODE.UPSERT",
+            Self::GraphEdgeUpsert => "THG.GRAPH.EDGE.UPSERT",
+            Self::GraphNodesQuery => "THG.GRAPH.NODES.QUERY",
+            Self::GraphNeighbors => "THG.GRAPH.NEIGHBORS",
+            Self::GraphStats => "THG.GRAPH.STATS",
+            Self::GraphVerify => "THG.GRAPH.VERIFY",
         }
     }
 }

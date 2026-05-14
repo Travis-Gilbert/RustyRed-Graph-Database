@@ -5,15 +5,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn parse_json(text: &str, surface: &str) -> PyResult<Value> {
-    serde_json::from_str(text).map_err(|err| {
-        PyValueError::new_err(format!("{surface} expected valid JSON: {err}"))
-    })
+    serde_json::from_str(text)
+        .map_err(|err| PyValueError::new_err(format!("{surface} expected valid JSON: {err}")))
 }
 
 fn canonical_json(value: &Value, surface: &str) -> PyResult<String> {
-    serde_json::to_string(value).map_err(|err| {
-        PyValueError::new_err(format!("{surface} could not serialize JSON: {err}"))
-    })
+    serde_json::to_string(value)
+        .map_err(|err| PyValueError::new_err(format!("{surface} could not serialize JSON: {err}")))
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -91,22 +89,29 @@ fn item_cost(value: &Value, item_weight: f64) -> f64 {
     tokens + item_weight
 }
 
-fn expression_hash(expression_id: &str, domain: &str, items: &[Value], metadata: &Value) -> PyResult<String> {
+fn expression_hash(
+    expression_id: &str,
+    domain: &str,
+    items: &[Value],
+    metadata: &Value,
+) -> PyResult<String> {
     let payload = json!({
         "expression_id": expression_id,
         "domain": domain,
         "items": items,
         "metadata": metadata,
     });
-    Ok(sha256_hex(&canonical_json(&payload, "bgi_expression_hash")?))
+    Ok(sha256_hex(&canonical_json(
+        &payload,
+        "bgi_expression_hash",
+    )?))
 }
 
 fn egg_probe() -> Value {
     let expression: Result<egg::RecExpr<egg::SymbolLang>, _> = "(+ context 0)".parse();
     if let Ok(expr) = expression {
-        let rules: Vec<egg::Rewrite<egg::SymbolLang, ()>> = vec![
-            egg::rewrite!("bgi-add-zero"; "(+ ?a 0)" => "?a"),
-        ];
+        let rules: Vec<egg::Rewrite<egg::SymbolLang, ()>> =
+            vec![egg::rewrite!("bgi-add-zero"; "(+ ?a 0)" => "?a")];
         let runner = egg::Runner::default().with_expr(&expr).run(&rules);
         if let Some(root) = runner.roots.first() {
             let extractor = egg::Extractor::new(&runner.egraph, egg::AstSize);
@@ -177,7 +182,9 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
         .and_then(|object| object.get("items"))
         .and_then(Value::as_array)
         .cloned()
-        .ok_or_else(|| PyValueError::new_err("bgi_egraph_extract_context_pack_json expected items array"))?;
+        .ok_or_else(|| {
+            PyValueError::new_err("bgi_egraph_extract_context_pack_json expected items array")
+        })?;
     let cost_config = payload
         .as_object()
         .and_then(|object| object.get("cost_config"))
@@ -196,7 +203,10 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
 
     let mut current = items.clone();
     let before_drop_hash = expression_hash(expression_id, "context_pack", &current, &json!({}))?;
-    let before_drop_cost: f64 = current.iter().map(|item| item_cost(item, item_weight)).sum();
+    let before_drop_cost: f64 = current
+        .iter()
+        .map(|item| item_cost(item, item_weight))
+        .sum();
     current = current
         .into_iter()
         .filter(|item| {
@@ -209,7 +219,10 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
         .collect();
     if current.len() != items.len() {
         let after_hash = expression_hash(expression_id, "context_pack", &current, &json!({}))?;
-        let after_cost: f64 = current.iter().map(|item| item_cost(item, item_weight)).sum();
+        let after_cost: f64 = current
+            .iter()
+            .map(|item| item_cost(item, item_weight))
+            .sum();
         trace.push(json!({
             "rule_id": "drop_empty_optional",
             "before_hash": before_drop_hash,
@@ -221,8 +234,12 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
     }
 
     let before_dedupe = current.clone();
-    let before_dedupe_hash = expression_hash(expression_id, "context_pack", &before_dedupe, &json!({}))?;
-    let before_dedupe_cost: f64 = before_dedupe.iter().map(|item| item_cost(item, item_weight)).sum();
+    let before_dedupe_hash =
+        expression_hash(expression_id, "context_pack", &before_dedupe, &json!({}))?;
+    let before_dedupe_cost: f64 = before_dedupe
+        .iter()
+        .map(|item| item_cost(item, item_weight))
+        .sum();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut deduped: Vec<Value> = Vec::new();
     let mut removed_count = 0usize;
@@ -243,7 +260,10 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
     current = deduped;
     if removed_count > 0 {
         let after_hash = expression_hash(expression_id, "context_pack", &current, &json!({}))?;
-        let after_cost: f64 = current.iter().map(|item| item_cost(item, item_weight)).sum();
+        let after_cost: f64 = current
+            .iter()
+            .map(|item| item_cost(item, item_weight))
+            .sum();
         trace.push(json!({
             "rule_id": "dedupe_same_obligation",
             "before_hash": before_dedupe_hash,
@@ -255,7 +275,10 @@ pub fn bgi_egraph_extract_context_pack_json(payload_json: &str) -> PyResult<Stri
     }
 
     let output_hash = expression_hash(expression_id, "context_pack", &current, &metadata)?;
-    let extracted_cost: f64 = current.iter().map(|item| item_cost(item, item_weight)).sum();
+    let extracted_cost: f64 = current
+        .iter()
+        .map(|item| item_cost(item, item_weight))
+        .sum();
     let receipt = json!({
         "engine": "egraph-theorem",
         "native_backend": "rust-egg-context-pack",
@@ -316,7 +339,10 @@ pub fn bgi_datalog_derive_core_json(facts_json: &str) -> PyResult<String> {
                 .to_lowercase()
                 .replace('-', " ");
             if !title.trim().is_empty() {
-                objects_by_title.entry(title).or_default().push(fact.clone());
+                objects_by_title
+                    .entry(title)
+                    .or_default()
+                    .push(fact.clone());
             }
         }
     }
@@ -364,7 +390,10 @@ pub fn bgi_datalog_derive_core_json(facts_json: &str) -> PyResult<String> {
         }
     }
 
-    let fact_pack_hash = sha256_hex(&canonical_json(&Value::Array(facts), "bgi_datalog_derive_core_json")?);
+    let fact_pack_hash = sha256_hex(&canonical_json(
+        &Value::Array(facts),
+        "bgi_datalog_derive_core_json",
+    )?);
     canonical_json(
         &json!({
             "engine": "rust-datafrog-core",
@@ -382,9 +411,10 @@ pub fn bgi_datalog_derive_core_json(facts_json: &str) -> PyResult<String> {
 #[pyfunction]
 pub fn bgi_compact_receipts_json(receipts_json: &str) -> PyResult<String> {
     let payload = parse_json(receipts_json, "bgi_compact_receipts_json")?;
-    let receipts = payload.as_array().cloned().ok_or_else(|| {
-        PyValueError::new_err("bgi_compact_receipts_json expected a JSON array")
-    })?;
+    let receipts = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| PyValueError::new_err("bgi_compact_receipts_json expected a JSON array"))?;
     let mut status_counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut receipt_hashes: Vec<String> = Vec::new();
 
@@ -411,10 +441,8 @@ pub fn bgi_compact_receipts_json(receipts_json: &str) -> PyResult<String> {
     receipt_hashes.sort();
     receipt_hashes.dedup();
 
-    let canonical_payload = canonical_json(
-        &Value::Array(receipts),
-        "bgi_compact_receipts_json payload",
-    )?;
+    let canonical_payload =
+        canonical_json(&Value::Array(receipts), "bgi_compact_receipts_json payload")?;
     let status_value: Map<String, Value> = status_counts
         .into_iter()
         .map(|(key, value)| (key, Value::from(value)))

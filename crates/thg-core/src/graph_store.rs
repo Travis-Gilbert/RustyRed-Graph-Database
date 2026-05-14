@@ -784,54 +784,88 @@ impl RedisGraphStore {
         }
 
         node.labels = normalize_labels(node.labels);
-        let existing = self.load_node_raw(&node.id)?;
         let mut connection = self.connection()?;
-        let version = redis::cmd("INCR")
-            .arg(self.keyspace.version())
-            .query::<u64>(&mut connection)?;
-        node.version = version;
-        let checksum = node.checksum();
-        let raw = serde_json::to_string(&node)
-            .map_err(|err| GraphStoreError::invalid_record("node", &node.id, err))?;
-        let event = graph_event("node.upsert", &node.id, version, &checksum)?;
+        let keyspace = self.keyspace.clone();
+        let watch_keys = vec![keyspace.version(), keyspace.node(&node.id)];
+        let mutation: GraphStoreResult<(GraphWriteResult, Option<NodeRecord>)> =
+            redis::transaction(&mut connection, &watch_keys, |connection, pipe| {
+                let existing = match load_node_raw_from_connection(connection, &keyspace, &node.id)
+                {
+                    Ok(existing) => existing,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
+                let current_version = redis::cmd("GET")
+                    .arg(keyspace.version())
+                    .query::<Option<u64>>(connection)?
+                    .unwrap_or_default();
+                let version = current_version + 1;
+                let mut next_node = node.clone();
+                next_node.version = version;
+                let checksum = next_node.checksum();
+                let raw = match serde_json::to_string(&next_node) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        return Ok(Some(Err(GraphStoreError::invalid_record(
+                            "node",
+                            &next_node.id,
+                            error,
+                        ))))
+                    }
+                };
+                let event = match graph_event("node.upsert", &next_node.id, version, &checksum) {
+                    Ok(event) => event,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
 
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("SET")
-            .arg(self.keyspace.node(&node.id))
-            .arg(raw)
-            .ignore()
-            .cmd("SADD")
-            .arg(self.keyspace.nodes())
-            .arg(&node.id)
-            .ignore()
-            .cmd("RPUSH")
-            .arg(self.keyspace.events())
-            .arg(event)
-            .ignore();
-        if let Some(existing) = existing.as_ref() {
-            for label in &existing.labels {
-                pipe.cmd("SREM")
-                    .arg(self.keyspace.label(label))
-                    .arg(&existing.id)
-                    .ignore();
-            }
-            remove_node_from_redis_property_indexes(&mut pipe, &self.keyspace, existing);
-        }
-        if !node.tombstone {
-            for label in &node.labels {
-                pipe.cmd("SADD")
-                    .arg(self.keyspace.labels())
-                    .arg(label)
+                pipe.cmd("SET")
+                    .arg(keyspace.version())
+                    .arg(version)
+                    .ignore()
+                    .cmd("SET")
+                    .arg(keyspace.node(&next_node.id))
+                    .arg(raw)
                     .ignore()
                     .cmd("SADD")
-                    .arg(self.keyspace.label(label))
-                    .arg(&node.id)
+                    .arg(keyspace.nodes())
+                    .arg(&next_node.id)
+                    .ignore()
+                    .cmd("RPUSH")
+                    .arg(keyspace.events())
+                    .arg(event)
                     .ignore();
-            }
-            add_node_to_redis_property_indexes(&mut pipe, &self.keyspace, &node);
-        }
-        pipe.query::<()>(&mut connection)?;
+                if let Some(existing) = existing.as_ref() {
+                    for label in &existing.labels {
+                        pipe.cmd("SREM")
+                            .arg(keyspace.label(label))
+                            .arg(&existing.id)
+                            .ignore();
+                    }
+                    remove_node_from_redis_property_indexes(pipe, &keyspace, existing);
+                }
+                if !next_node.tombstone {
+                    for label in &next_node.labels {
+                        pipe.cmd("SADD")
+                            .arg(keyspace.labels())
+                            .arg(label)
+                            .ignore()
+                            .cmd("SADD")
+                            .arg(keyspace.label(label))
+                            .arg(&next_node.id)
+                            .ignore();
+                    }
+                    add_node_to_redis_property_indexes(pipe, &keyspace, &next_node);
+                }
+                let write = GraphWriteResult {
+                    id: next_node.id.clone(),
+                    version,
+                    checksum,
+                };
+                match pipe.query::<Option<()>>(connection)? {
+                    Some(()) => Ok(Some(Ok((write, existing)))),
+                    None => Ok(None),
+                }
+            })?;
+        let (write, existing) = mutation?;
 
         if let Some(existing) = existing {
             self.cleanup_empty_labels(&mut connection, &existing.labels)?;
@@ -841,50 +875,102 @@ impl RedisGraphStore {
             )?;
         }
 
-        Ok(GraphWriteResult {
-            id: node.id,
-            version,
-            checksum,
-        })
+        Ok(write)
     }
 
-    pub fn upsert_edge(&mut self, mut edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+    pub fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
         validate_edge_shape(&edge)?;
-        self.require_live_endpoint(&edge, "from", &edge.from_id)?;
-        self.require_live_endpoint(&edge, "to", &edge.to_id)?;
-
-        let existing = self.load_edge_raw(&edge.id)?;
         let mut connection = self.connection()?;
-        let version = redis::cmd("INCR")
-            .arg(self.keyspace.version())
-            .query::<u64>(&mut connection)?;
-        edge.version = version;
-        let checksum = edge.checksum();
-        let raw = serde_json::to_string(&edge)
-            .map_err(|err| GraphStoreError::invalid_record("edge", &edge.id, err))?;
-        let event = graph_event("edge.upsert", &edge.id, version, &checksum)?;
+        let keyspace = self.keyspace.clone();
+        let watch_keys = vec![
+            keyspace.version(),
+            keyspace.edge(&edge.id),
+            keyspace.node(&edge.from_id),
+            keyspace.node(&edge.to_id),
+        ];
+        let mutation: GraphStoreResult<(GraphWriteResult, Option<EdgeRecord>)> =
+            redis::transaction(&mut connection, &watch_keys, |connection, pipe| {
+                let from_node =
+                    match load_node_raw_from_connection(connection, &keyspace, &edge.from_id) {
+                        Ok(node) => node,
+                        Err(error) => return Ok(Some(Err(error))),
+                    };
+                if let Err(error) =
+                    require_live_endpoint_record(&edge, "from", &edge.from_id, from_node.as_ref())
+                {
+                    return Ok(Some(Err(error)));
+                }
+                let to_node =
+                    match load_node_raw_from_connection(connection, &keyspace, &edge.to_id) {
+                        Ok(node) => node,
+                        Err(error) => return Ok(Some(Err(error))),
+                    };
+                if let Err(error) =
+                    require_live_endpoint_record(&edge, "to", &edge.to_id, to_node.as_ref())
+                {
+                    return Ok(Some(Err(error)));
+                }
+                let existing = match load_edge_raw_from_connection(connection, &keyspace, &edge.id)
+                {
+                    Ok(existing) => existing,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
+                let current_version = redis::cmd("GET")
+                    .arg(keyspace.version())
+                    .query::<Option<u64>>(connection)?
+                    .unwrap_or_default();
+                let version = current_version + 1;
+                let mut next_edge = edge.clone();
+                next_edge.version = version;
+                let checksum = next_edge.checksum();
+                let raw = match serde_json::to_string(&next_edge) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        return Ok(Some(Err(GraphStoreError::invalid_record(
+                            "edge",
+                            &next_edge.id,
+                            error,
+                        ))))
+                    }
+                };
+                let event = match graph_event("edge.upsert", &next_edge.id, version, &checksum) {
+                    Ok(event) => event,
+                    Err(error) => return Ok(Some(Err(error))),
+                };
 
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("SET")
-            .arg(self.keyspace.edge(&edge.id))
-            .arg(raw)
-            .ignore()
-            .cmd("SADD")
-            .arg(self.keyspace.edges())
-            .arg(&edge.id)
-            .ignore()
-            .cmd("RPUSH")
-            .arg(self.keyspace.events())
-            .arg(event)
-            .ignore();
-        if let Some(existing) = existing.as_ref() {
-            remove_edge_from_redis_indexes(&mut pipe, &self.keyspace, existing);
-        }
-        if !edge.tombstone {
-            add_edge_to_redis_indexes(&mut pipe, &self.keyspace, &edge);
-        }
-        pipe.query::<()>(&mut connection)?;
+                pipe.cmd("SET")
+                    .arg(keyspace.version())
+                    .arg(version)
+                    .ignore()
+                    .cmd("SET")
+                    .arg(keyspace.edge(&next_edge.id))
+                    .arg(raw)
+                    .ignore()
+                    .cmd("SADD")
+                    .arg(keyspace.edges())
+                    .arg(&next_edge.id)
+                    .ignore()
+                    .cmd("RPUSH")
+                    .arg(keyspace.events())
+                    .arg(event)
+                    .ignore();
+                if let Some(existing) = existing.as_ref() {
+                    remove_edge_from_redis_indexes(pipe, &keyspace, existing);
+                }
+                if !next_edge.tombstone {
+                    add_edge_to_redis_indexes(pipe, &keyspace, &next_edge);
+                }
+                let write = GraphWriteResult {
+                    id: next_edge.id.clone(),
+                    version,
+                    checksum,
+                };
+                match pipe.query::<Option<()>>(connection)? {
+                    Some(()) => Ok(Some(Ok((write, existing)))),
+                    None => Ok(None),
+                }
+            })?;
+        let (write, existing) = mutation?;
 
         if let Some(existing) = existing {
             self.cleanup_empty_edge_type(&mut connection, &existing.edge_type)?;
@@ -902,11 +988,7 @@ impl RedisGraphStore {
             )?;
         }
 
-        Ok(GraphWriteResult {
-            id: edge.id,
-            version,
-            checksum,
-        })
+        Ok(write)
     }
 
     pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
@@ -1198,45 +1280,12 @@ impl RedisGraphStore {
 
     fn load_node_raw(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
         let mut connection = self.connection()?;
-        let raw = redis::cmd("GET")
-            .arg(self.keyspace.node(id))
-            .query::<Option<String>>(&mut connection)?;
-        raw.map(|value| {
-            serde_json::from_str::<NodeRecord>(&value)
-                .map_err(|err| GraphStoreError::invalid_record("node", id, err))
-        })
-        .transpose()
+        load_node_raw_from_connection(&mut connection, &self.keyspace, id)
     }
 
     fn load_edge_raw(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
         let mut connection = self.connection()?;
-        let raw = redis::cmd("GET")
-            .arg(self.keyspace.edge(id))
-            .query::<Option<String>>(&mut connection)?;
-        raw.map(|value| {
-            serde_json::from_str::<EdgeRecord>(&value)
-                .map_err(|err| GraphStoreError::invalid_record("edge", id, err))
-        })
-        .transpose()
-    }
-
-    fn require_live_endpoint(
-        &self,
-        edge: &EdgeRecord,
-        endpoint: &str,
-        node_id: &str,
-    ) -> GraphStoreResult<()> {
-        let Some(node) = self.load_node_raw(node_id)? else {
-            return Err(GraphStoreError::missing_endpoint(
-                &edge.id, endpoint, node_id,
-            ));
-        };
-        if node.tombstone {
-            return Err(GraphStoreError::tombstoned_endpoint(
-                &edge.id, endpoint, node_id,
-            ));
-        }
-        Ok(())
+        load_edge_raw_from_connection(&mut connection, &self.keyspace, id)
     }
 
     fn live_nodes(&self) -> GraphStoreResult<BTreeMap<String, NodeRecord>> {
@@ -1520,6 +1569,58 @@ fn redis_string_set(
         .arg(key)
         .query::<Vec<String>>(connection)?;
     Ok(values.into_iter().collect())
+}
+
+#[cfg(feature = "redis-store")]
+fn load_node_raw_from_connection(
+    connection: &mut redis::Connection,
+    keyspace: &RedisGraphKeyspace,
+    id: &str,
+) -> GraphStoreResult<Option<NodeRecord>> {
+    let raw = redis::cmd("GET")
+        .arg(keyspace.node(id))
+        .query::<Option<String>>(connection)?;
+    raw.map(|value| {
+        serde_json::from_str::<NodeRecord>(&value)
+            .map_err(|err| GraphStoreError::invalid_record("node", id, err))
+    })
+    .transpose()
+}
+
+#[cfg(feature = "redis-store")]
+fn load_edge_raw_from_connection(
+    connection: &mut redis::Connection,
+    keyspace: &RedisGraphKeyspace,
+    id: &str,
+) -> GraphStoreResult<Option<EdgeRecord>> {
+    let raw = redis::cmd("GET")
+        .arg(keyspace.edge(id))
+        .query::<Option<String>>(connection)?;
+    raw.map(|value| {
+        serde_json::from_str::<EdgeRecord>(&value)
+            .map_err(|err| GraphStoreError::invalid_record("edge", id, err))
+    })
+    .transpose()
+}
+
+#[cfg(feature = "redis-store")]
+fn require_live_endpoint_record(
+    edge: &EdgeRecord,
+    endpoint: &str,
+    node_id: &str,
+    node: Option<&NodeRecord>,
+) -> GraphStoreResult<()> {
+    let Some(node) = node else {
+        return Err(GraphStoreError::missing_endpoint(
+            &edge.id, endpoint, node_id,
+        ));
+    };
+    if node.tombstone {
+        return Err(GraphStoreError::tombstoned_endpoint(
+            &edge.id, endpoint, node_id,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "redis-store")]

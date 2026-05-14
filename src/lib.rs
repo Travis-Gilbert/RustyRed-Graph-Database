@@ -16,9 +16,9 @@
 //! `adjacency` keys and node IDs are Python `int` (not contiguous indices)
 //! because Theseus PKs are arbitrary integers.
 
-mod push_ppr;
 mod bgi;
 mod graph_export;
+mod push_ppr;
 mod search_kernel;
 mod thg;
 
@@ -35,10 +35,7 @@ fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_datalog_receipt_summary_json, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        bgi::bgi_datalog_derive_core_json,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(bgi::bgi_datalog_derive_core_json, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_compact_receipts_json, m)?)?;
     m.add_function(wrap_pyfunction!(
         search_kernel::search_normalize_urls_batch,

@@ -1,5 +1,9 @@
 # theseus_native / Rusty Red Graph Database
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
+
+Template ID pending: after creating or publishing the Railway template, replace `RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID` in the badge URL with the Railway template code.
+
 Rust + PyO3 accelerators for Theseus retrieval, plus the Rusty Red Graph
 Database runtime. `push_ppr` remains the retrieval accelerator; `thg-core` is
 the shared Database-as-Harness command executor and graph-store core;
@@ -66,11 +70,26 @@ GET  /v1/tenants/{tenant_id}/graph/verify
 POST /v1/tenants/{tenant_id}/context/pack
 ```
 
+The shared THG command API also exposes the Rusty Red graph-store core through
+`THG.GRAPH.NODE.UPSERT`, `THG.GRAPH.EDGE.UPSERT`,
+`THG.GRAPH.NODES.QUERY`, `THG.GRAPH.NEIGHBORS`, `THG.GRAPH.STATS`, and
+`THG.GRAPH.VERIFY`. This lets Context Theorem adopt Rusty Red-grade graph
+records, exact scalar property indexes, adjacency traversal, and verification
+through the existing THG command surface instead of depending on a separate
+runtime name.
+
 The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
 is exposed through HTTP and MCP even though the underlying storage engine is a
 database-style service. The OpenAPI contract is for the HTTP API; MCP tool,
 resource, and prompt metadata are discovered through the MCP endpoint and
 well-known manifests.
+
+Railway template readiness follows the public template guidance: use a GitHub
+source repo, keep the service root minimal, set `/ready` as the health check,
+wire Redis through private networking/reference variables, attach persistent
+storage to stateful dependencies, generate any public-ingress tokens with
+Railway template variable functions, and replace the badge placeholder above
+once Railway assigns the final template URL.
 
 Railway can deploy this directory directly:
 
