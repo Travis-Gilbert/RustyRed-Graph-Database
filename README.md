@@ -1,9 +1,16 @@
-# theseus_native
+# theseus_native / Rusty Red Graph Database
 
-Rust + PyO3 accelerators for Theseus retrieval and the THG V3 runtime.
-`push_ppr` remains the retrieval accelerator; `thg-core` is the shared
-Database-as-Harness command executor, and `thg-server` is the first standalone
-HTTP control server over that executor.
+Rust + PyO3 accelerators for Theseus retrieval, plus the Rusty Red Graph
+Database runtime. `push_ppr` remains the retrieval accelerator; `thg-core` is
+the shared Database-as-Harness command executor and graph-store core;
+`thg-product-server` is the Railway/product HTTP server for Rusty Red; and
+`thg-mcp` is the first-class MCP agent port over the graph APIs.
+
+The Rusty Red repository at
+`https://github.com/Travis-Gilbert/rusty-red-graph-database` is maintained as a
+`theseus_native` subtree export from the Theseus repository. The source of truth
+for edits remains this directory unless the extraction strategy changes
+deliberately.
 
 ## Build (local development)
 
@@ -16,6 +23,66 @@ maturin develop --release
 ```
 
 This builds an `abi3-py312` wheel and installs it into the active Python environment. After this, `from theseus_native import push_ppr` works in any Python 3.12+ interpreter that shares the venv.
+
+## Rusty Red Graph Database product server
+
+Rusty Red is the productized THG runtime profile: it keeps the THG command model
+for existing harness flows while adding first-class graph node, edge, adjacency,
+exact scalar property index, stats, verify, and MCP routes. The code should stay
+shared through `thg-core` rather than being copied into a second implementation:
+Context Theorem can use the same graph-store components internally, while Rusty
+Red packages them as a standalone database service. It is not a raw Redis
+protocol, RedisGraph compatibility layer, FalkorDB replacement, or complete
+OpenCypher/GQL engine yet. Redis-compatible storage is the current durable
+backing store; Rusty Red owns the graph API and index semantics above that
+store.
+
+Run the product server locally:
+
+```bash
+cd theseus_native
+RUSTY_RED_REDIS_URL=redis://127.0.0.1:6379 cargo run -p thg-product-server
+```
+
+Core routes:
+
+```text
+GET  /health
+GET  /ready
+GET  /openapi.json
+GET  /.well-known/mcp/thg.json
+POST /mcp
+POST /v1/tenants/{tenant_id}/command
+POST /v1/tenants/{tenant_id}/batch
+GET  /v1/tenants/{tenant_id}/runs/{run_id}
+POST /v1/tenants/{tenant_id}/graph/nodes
+POST /v1/tenants/{tenant_id}/graph/nodes/query
+GET  /v1/tenants/{tenant_id}/graph/nodes/{node_id}
+POST /v1/tenants/{tenant_id}/graph/edges
+GET  /v1/tenants/{tenant_id}/graph/edges/{edge_id}
+POST /v1/tenants/{tenant_id}/graph/neighbors
+GET  /v1/tenants/{tenant_id}/graph/stats
+GET  /v1/tenants/{tenant_id}/graph/verify
+POST /v1/tenants/{tenant_id}/context/pack
+```
+
+The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
+is exposed through HTTP and MCP even though the underlying storage engine is a
+database-style service. The OpenAPI contract is for the HTTP API; MCP tool,
+resource, and prompt metadata are discovered through the MCP endpoint and
+well-known manifests.
+
+Railway can deploy this directory directly:
+
+```bash
+cd theseus_native
+railway up
+```
+
+The included `Dockerfile`, `railway.toml`, and `.railwayignore` are for the
+standalone Rusty Red subtree repository. The monorepo Railway template under
+`railway-templates/rusty-red-graph-database/` remains useful when deploying
+from the full Theseus repository.
 
 ## Build (release wheels)
 
