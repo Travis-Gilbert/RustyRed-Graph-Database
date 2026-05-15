@@ -32,9 +32,9 @@ This builds an `abi3-py312` wheel and installs it into the active Python environ
 
 Rusty Red is the productized THG runtime profile: it keeps the THG command model
 for existing harness flows while adding first-class graph node, edge, adjacency,
-exact scalar property index, stats, verify, and MCP routes. By default, it runs
-in `RUSTY_RED_MODE=embedded` with RedCore RAM-first storage and local AOF/snapshot
-persistence.
+exact scalar property index, GraphCache, stats, verify, and MCP routes. By
+default, it runs in `RUSTY_RED_MODE=embedded` with RedCore RAM-first storage and
+local AOF/snapshot persistence.
 
 It is not a raw Redis protocol, RedisGraph compatibility layer, FalkorDB
 replacement, or complete OpenCypher/GQL engine yet. `RUSTY_RED_MODE=redis` keeps
@@ -78,9 +78,21 @@ GET  /ready
 GET  /openapi.json
 GET  /.well-known/mcp/thg.json
 POST /mcp
+POST /v1/command
+POST /v1/batch
+POST /v1/query
+POST /v1/cypher
+POST /v1/cypher/explain
+POST /v1/cache/put
+POST /v1/cache/get
+POST /v1/cache/check
+POST /v1/cache/explain
+POST /v1/cache/invalidate
+POST /v1/cache/stats
 POST /v1/tenants/{tenant_id}/command
 POST /v1/tenants/{tenant_id}/batch
 GET  /v1/tenants/{tenant_id}/runs/{run_id}
+POST /v1/tenants/{tenant_id}/graph/query
 POST /v1/tenants/{tenant_id}/graph/nodes
 POST /v1/tenants/{tenant_id}/graph/nodes/query
 GET  /v1/tenants/{tenant_id}/graph/nodes/{node_id}
@@ -102,6 +114,12 @@ records, exact scalar property indexes, adjacency traversal, and verification
 through the existing THG command surface instead of depending on a separate
 runtime name. In this slice, run/context state commands remain Redis-mode.
 
+The public query surface is now split cleanly:
+
+- `/v1/query` is the product-facing native subset for `node_match` and `neighbors`.
+- `/v1/cypher` and `/v1/cypher/explain` are the first read-only OpenCypher-compatible subset.
+- `/v1/tenants/{tenant_id}/graph/query` remains the older debug bridge and should not be treated as the product route.
+
 The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
 is exposed through HTTP and MCP even though the underlying storage engine is a
 database-style service. The OpenAPI contract is for the HTTP API; MCP tool,
@@ -112,8 +130,10 @@ Railway template readiness follows the public template guidance: use a GitHub
 source repo, keep the service root minimal, set `/ready` as the health check,
 wire Redis only for explicit `RUSTY_RED_MODE=redis` deployments through private
 networking/reference variables, attach persistent storage to stateful dependencies,
-generate any public-ingress tokens with Railway template variable functions, and
-replace the badge placeholder above once Railway assigns the final template URL.
+set `RUSTY_RED_REQUIRE_VOLUME=true` for embedded Railway deployments so `/ready`
+fails when the mounted volume is absent, generate any public-ingress tokens with
+Railway template variable functions, and replace the badge placeholder above once
+Railway assigns the final template URL.
 
 Railway can deploy this directory directly:
 

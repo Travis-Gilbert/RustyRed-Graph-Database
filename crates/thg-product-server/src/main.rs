@@ -2,8 +2,10 @@
 
 mod auth;
 mod config;
+mod graph_cache;
 mod metrics;
 mod openapi;
+mod query_surface;
 mod router;
 mod state;
 

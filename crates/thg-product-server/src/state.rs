@@ -13,11 +13,13 @@ use thg_core::{
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
 use crate::config::{Config, StorageMode};
+use crate::graph_cache::GraphCacheTenant;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     redcore_stores: Arc<Mutex<BTreeMap<String, Arc<RedCoreTenantExecutor>>>>,
+    graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
 }
 
 impl AppState {
@@ -25,6 +27,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
+            graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -80,6 +83,7 @@ impl AppState {
                     store: "ready".to_string(),
                     durability: self.config.durability.as_str().to_string(),
                     strict_acid: self.config.strict_acid,
+                    require_volume: self.config.require_volume,
                     data_dir: Some(data_dir.display().to_string()),
                 })
             }
@@ -88,6 +92,7 @@ impl AppState {
                 store: "ready".to_string(),
                 durability: "none".to_string(),
                 strict_acid: false,
+                require_volume: false,
                 data_dir: None,
             }),
             StorageMode::Redis => {
@@ -100,6 +105,7 @@ impl AppState {
                     store: "ready".to_string(),
                     durability: "redis".to_string(),
                     strict_acid: false,
+                    require_volume: false,
                     data_dir: None,
                 })
             }
@@ -114,6 +120,23 @@ impl AppState {
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
         }
+    }
+
+    pub fn tenant_graph_cache(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Arc<GraphCacheTenant>, StoreAccessError> {
+        let safe_tenant = sanitize_tenant_segment(tenant_id);
+        let mut caches = self
+            .graph_caches
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph cache tenant map lock poisoned"))?;
+        if let Some(cache) = caches.get(&safe_tenant) {
+            return Ok(cache.clone());
+        }
+        let cache = Arc::new(GraphCacheTenant::default());
+        caches.insert(safe_tenant, cache.clone());
+        Ok(cache)
     }
 
     fn redcore_store_for_tenant(
@@ -167,6 +190,7 @@ pub struct ReadyReport {
     pub store: String,
     pub durability: String,
     pub strict_acid: bool,
+    pub require_volume: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
 }
@@ -495,6 +519,8 @@ mod tests {
             port: 8380,
             storage_mode: StorageMode::Redis,
             data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::AofEverysec,
             snapshot_interval_writes: 1_000,
             strict_acid: false,
@@ -528,6 +554,8 @@ mod tests {
             port: 8380,
             storage_mode: StorageMode::Embedded,
             data_dir: data_dir.display().to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::AofAlways,
             snapshot_interval_writes: 100,
             strict_acid: true,
@@ -567,6 +595,75 @@ mod tests {
         );
 
         std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn embedded_readiness_rejects_missing_required_volume() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Embedded,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: true,
+            volume_available: false,
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 1_000,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+
+        let error = state.store_ready().unwrap_err();
+
+        assert_eq!(error.code, "store_internal_error");
+        assert!(error.message.contains("REQUIRE_VOLUME"));
+    }
+
+    #[test]
+    fn memory_readiness_ignores_volume_requirement_and_reports_no_durability() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: true,
+            volume_available: false,
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 1_000,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+
+        let report = state.store_ready().unwrap();
+
+        assert_eq!(report.mode, "memory");
+        assert_eq!(report.durability, "none");
+        assert!(!report.require_volume);
     }
 
     #[test]

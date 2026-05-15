@@ -141,6 +141,306 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/command": {
+                "post": {
+                    "tags": ["runs"],
+                    "summary": "Execute a THG-compatible command using explicit or default tenant policy",
+                    "description": "Product-facing alias for command execution. When tenant_id is omitted, the configured default tenant is used.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/PublicCommandRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/CommandResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/batch": {
+                "post": {
+                    "tags": ["runs"],
+                    "summary": "Execute multiple THG-compatible commands using explicit or default tenant policy",
+                    "description": "Product-facing alias for batch execution. When tenant_id is omitted, the configured default tenant is used.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/PublicBatchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/CommandResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/query": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run the first native Rusty Red query subset",
+                    "description": "Supports the product-facing native query subset for `node_match` and `neighbors`. When tenant_id is omitted, the configured default tenant is used.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/PublicQueryRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Bounded native-query response.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/PublicQueryResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cypher": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run the first read-only OpenCypher-compatible subset",
+                    "description": "Supports the first bounded `/v1/cypher` subset: MATCH, RETURN, simple equality WHERE, LIMIT, and single-hop outgoing relationship expansion. When tenant_id is omitted, the configured default tenant is used.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CypherRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Cypher subset query result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CypherQueryResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cypher/explain": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Explain the first read-only OpenCypher-compatible subset",
+                    "description": "Parses the same bounded `/v1/cypher` subset and returns plan plus compatibility-matrix details without executing writes or unsupported operators.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CypherRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Cypher subset explain result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CypherExplainResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/put": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Store a graph-version-guarded cache entry",
+                    "description": "Stores a first-pass GraphCache entry for query results, plans, bounded subgraphs, neighbor expansions, context packs, retrieval plans, semantic answer candidates, or modal parse results. When tenant_id is omitted, the configured default tenant is used.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCachePutRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache entry stored.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCachePutResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/get": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Read a graph-version-guarded cache entry",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCacheLookupRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache lookup result with cached value when accepted.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCacheLookupResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/check": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Check whether a graph-version-guarded cache entry is usable",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCacheLookupRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache check result with hit, stale, and guard information.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCacheLookupResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/explain": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Explain a graph-version-guarded cache decision",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCacheLookupRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache explain result with guard decisions.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCacheLookupResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/invalidate": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Invalidate graph cache entries by scope or stale state",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCacheInvalidateRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache invalidation result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCacheInvalidateResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/cache/stats": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Read GraphCache counters and stale-entry totals",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphCacheStatsRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph cache stats.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphCacheStatsResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/command": {
                 "post": {
                     "tags": ["runs"],
@@ -199,8 +499,8 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/tenants/{tenant_id}/graph/query": {
                 "post": {
                     "tags": ["graph"],
-                    "summary": "Run the current bounded graph query command",
-                    "description": "Executes the THG.DEBUG.CYPHER compatibility command. This is intentionally a small debug/query bridge, not a full OpenCypher, GQL, RedisGraph, or FalkorDB compatibility layer.",
+                    "summary": "Run the legacy debug query bridge",
+                    "description": "Executes the older THG.DEBUG.CYPHER compatibility command. Prefer the product-facing `/v1/query`, `/v1/cypher`, and `/v1/cypher/explain` routes for the current public query surface.",
                     "parameters": [tenant_parameter.clone()],
                     "requestBody": {
                         "required": true,
@@ -522,13 +822,14 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                 },
                 "ReadyResponse": {
                     "type": "object",
-                    "required": ["status", "store", "mode", "durability", "strict_acid"],
+                    "required": ["status", "store", "mode", "durability", "strict_acid", "require_volume"],
                     "properties": {
                         "status": { "const": "ready" },
                         "store": { "const": "ready" },
                         "mode": { "enum": ["embedded", "memory", "redis"] },
                         "durability": { "type": "string" },
                         "strict_acid": { "type": "boolean" },
+                        "require_volume": { "type": "boolean" },
                         "data_dir": { "type": ["string", "null"] }
                     },
                     "additionalProperties": false
@@ -537,6 +838,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "type": "object",
                     "required": ["error", "message"],
                     "properties": {
+                        "ok": { "type": "boolean" },
                         "error": { "type": "string" },
                         "code": { "type": "string" },
                         "message": { "type": "string" }
@@ -581,9 +883,38 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     },
                     "additionalProperties": false
                 },
+                "PublicCommandRequest": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "command": {
+                            "type": "string",
+                            "examples": ["THG.RUN.BEGIN", "THG.RUN.GET", "THG.CONTEXT.PACK", "THG.GRAPH.STATS"]
+                        },
+                        "args": {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "default": {}
+                        }
+                    },
+                    "additionalProperties": false
+                },
                 "BatchRequest": {
                     "type": "object",
                     "properties": {
+                        "commands": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/CommandRequest" },
+                            "default": []
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "PublicBatchRequest": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": { "type": "string" },
                         "commands": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/CommandRequest" },
@@ -599,6 +930,140 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "query": { "type": "string" },
                         "graph": { "type": "object", "additionalProperties": true, "default": {} },
                         "params": { "type": "object", "additionalProperties": true, "default": {} }
+                    },
+                    "additionalProperties": false
+                },
+                "PublicQueryRequest": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["node_match", "neighbors"]
+                        },
+                        "label": { "type": "string" },
+                        "properties": {
+                            "type": "object",
+                            "additionalProperties": { "$ref": "#/components/schemas/ScalarPropertyValue" },
+                            "default": {}
+                        },
+                        "node_id": { "type": "string" },
+                        "direction": { "type": "string", "enum": ["out", "in"] },
+                        "edge_type": { "type": "string" },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 100
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "CypherRequest": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "query": { "type": "string" },
+                        "params": {
+                            "type": "object",
+                            "additionalProperties": { "$ref": "#/components/schemas/ScalarPropertyValue" },
+                            "default": {}
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheLookupRequest": {
+                    "type": "object",
+                    "required": ["kind", "key"],
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "query_result",
+                                "query_plan",
+                                "bounded_subgraph",
+                                "neighbor_expansion",
+                                "context_pack",
+                                "retrieval_plan",
+                                "semantic_answer_candidate",
+                                "modal_parse_result"
+                            ]
+                        },
+                        "key": {},
+                        "index_manifest_hash": { "type": "string" },
+                        "auth_scope_hash": { "type": "string" },
+                        "retrieval_policy_hash": { "type": "string" },
+                        "model_version": { "type": "string" },
+                        "source_hashes": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "default": []
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCachePutRequest": {
+                    "type": "object",
+                    "required": ["kind", "key", "value"],
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "query_result",
+                                "query_plan",
+                                "bounded_subgraph",
+                                "neighbor_expansion",
+                                "context_pack",
+                                "retrieval_plan",
+                                "semantic_answer_candidate",
+                                "modal_parse_result"
+                            ]
+                        },
+                        "key": {},
+                        "value": {},
+                        "metadata": {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "default": {}
+                        },
+                        "index_manifest_hash": { "type": "string" },
+                        "auth_scope_hash": { "type": "string" },
+                        "retrieval_policy_hash": { "type": "string" },
+                        "model_version": { "type": "string" },
+                        "source_hashes": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "default": []
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheInvalidateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": { "type": "string" },
+                        "all": { "type": "boolean", "default": false },
+                        "stale_only": { "type": "boolean", "default": false },
+                        "kind": { "type": "string" },
+                        "key": {},
+                        "index_manifest_hash": { "type": "string" },
+                        "auth_scope_hash": { "type": "string" },
+                        "retrieval_policy_hash": { "type": "string" },
+                        "model_version": { "type": "string" },
+                        "source_hashes": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "default": []
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheStatsRequest": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": { "type": "string" }
                     },
                     "additionalProperties": false
                 },
@@ -779,6 +1244,46 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     },
                     "additionalProperties": false
                 },
+                "CompatibilityMatrix": {
+                    "type": "object",
+                    "required": ["version", "supported", "rejected", "pending"],
+                    "properties": {
+                        "version": { "type": "string" },
+                        "supported": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "rejected": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "pending": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "PublicQueryResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "operation", "stats", "explain"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "operation": { "type": "string" },
+                        "nodes": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/NodeRecord" }
+                        },
+                        "neighbors": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/NeighborHit" }
+                        },
+                        "stats": { "type": "object", "additionalProperties": true },
+                        "explain": { "type": "object", "additionalProperties": true }
+                    },
+                    "additionalProperties": false
+                },
                 "GraphStats": {
                     "type": "object",
                     "required": [
@@ -860,6 +1365,153 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "rebuild": { "$ref": "#/components/schemas/RebuildIndexesReport" }
                     },
                     "additionalProperties": false
+                },
+                "GraphCachePutResult": {
+                    "type": "object",
+                    "required": ["stored", "kind", "fingerprint", "cache_key", "graph_version", "stored_at_ms"],
+                    "properties": {
+                        "stored": { "type": "boolean" },
+                        "kind": { "type": "string" },
+                        "fingerprint": { "type": "string" },
+                        "cache_key": { "type": "string" },
+                        "graph_version": { "type": "integer", "minimum": 0 },
+                        "stored_at_ms": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheLookupResult": {
+                    "type": "object",
+                    "required": ["hit", "accepted", "stale", "kind", "fingerprint", "cache_key", "reason", "graph_version", "guards"],
+                    "properties": {
+                        "hit": { "type": "boolean" },
+                        "accepted": { "type": "boolean" },
+                        "stale": { "type": "boolean" },
+                        "kind": { "type": "string" },
+                        "fingerprint": { "type": "string" },
+                        "cache_key": { "type": "string" },
+                        "reason": { "type": "string" },
+                        "graph_version": { "type": "integer", "minimum": 0 },
+                        "entry_graph_version": { "type": "integer", "minimum": 0 },
+                        "entry_cache_key": { "type": "string" },
+                        "stored_at_ms": { "type": "integer", "minimum": 0 },
+                        "value": {},
+                        "metadata": {},
+                        "guards": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheInvalidateResult": {
+                    "type": "object",
+                    "required": ["removed", "remaining", "stale_only"],
+                    "properties": {
+                        "removed": { "type": "integer", "minimum": 0 },
+                        "remaining": { "type": "integer", "minimum": 0 },
+                        "stale_only": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheStats": {
+                    "type": "object",
+                    "required": ["graph_version", "entries_total", "stale_entries", "puts", "hits", "misses", "stale_hits", "invalidations", "entries_by_kind"],
+                    "properties": {
+                        "graph_version": { "type": "integer", "minimum": 0 },
+                        "entries_total": { "type": "integer", "minimum": 0 },
+                        "stale_entries": { "type": "integer", "minimum": 0 },
+                        "puts": { "type": "integer", "minimum": 0 },
+                        "hits": { "type": "integer", "minimum": 0 },
+                        "misses": { "type": "integer", "minimum": 0 },
+                        "stale_hits": { "type": "integer", "minimum": 0 },
+                        "invalidations": { "type": "integer", "minimum": 0 },
+                        "entries_by_kind": {
+                            "type": "object",
+                            "additionalProperties": { "type": "integer", "minimum": 0 }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCachePutResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "cache"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "cache": { "$ref": "#/components/schemas/GraphCachePutResult" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheLookupResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "cache"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "cache": { "$ref": "#/components/schemas/GraphCacheLookupResult" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheInvalidateResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "cache"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "cache": { "$ref": "#/components/schemas/GraphCacheInvalidateResult" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphCacheStatsResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "cache"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "cache": { "$ref": "#/components/schemas/GraphCacheStats" }
+                    },
+                    "additionalProperties": false
+                },
+                "CypherQueryResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "query", "subset", "rows", "row_count", "stats", "explain"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "query": { "type": "string" },
+                        "subset": { "type": "string" },
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "row_count": { "type": "integer", "minimum": 0 },
+                        "stats": { "type": "object", "additionalProperties": true },
+                        "explain": { "$ref": "#/components/schemas/CypherExplainResponse" }
+                    },
+                    "additionalProperties": false
+                },
+                "CypherExplainResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "query", "subset", "plan", "compatibility"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "query": { "type": "string" },
+                        "subset": { "type": "string" },
+                        "pattern": { "type": "string" },
+                        "plan": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "compatibility": { "$ref": "#/components/schemas/CompatibilityMatrix" }
+                    },
+                    "additionalProperties": false
                 }
             }
         }
@@ -878,12 +1530,14 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn openapi_lists_rebuild_indexes_route_and_schema() {
+    async fn openapi_lists_rebuild_indexes_and_product_query_routes() {
         let state = AppState::new(Config {
             host: "127.0.0.1".to_string(),
             port: 8380,
             storage_mode: StorageMode::Memory,
             data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::None,
             snapshot_interval_writes: 0,
             strict_acid: false,
@@ -908,10 +1562,30 @@ mod tests {
         assert!(document
             .pointer("/paths/~1v1~1tenants~1{tenant_id}~1graph~1rebuild-indexes/post")
             .is_some());
+        assert!(document.pointer("/paths/~1v1~1query/post").is_some());
+        assert!(document.pointer("/paths/~1v1~1cypher/post").is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1cypher~1explain/post")
+            .is_some());
+        assert!(document.pointer("/paths/~1v1~1cache~1check/post").is_some());
+        assert!(document.pointer("/paths/~1v1~1cache~1put/post").is_some());
         assert_eq!(
             document.pointer("/components/schemas/RebuildIndexesResponse/properties/rebuild/$ref"),
             Some(&serde_json::Value::String(
                 "#/components/schemas/RebuildIndexesReport".to_string()
+            ))
+        );
+        assert_eq!(
+            document
+                .pointer("/components/schemas/CypherExplainResponse/properties/compatibility/$ref"),
+            Some(&serde_json::Value::String(
+                "#/components/schemas/CompatibilityMatrix".to_string()
+            ))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/GraphCacheLookupResponse/properties/cache/$ref"),
+            Some(&serde_json::Value::String(
+                "#/components/schemas/GraphCacheLookupResult".to_string()
             ))
         );
     }

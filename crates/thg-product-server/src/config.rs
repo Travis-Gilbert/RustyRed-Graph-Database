@@ -34,6 +34,8 @@ pub struct Config {
     pub port: u16,
     pub storage_mode: StorageMode,
     pub data_dir: String,
+    pub require_volume: bool,
+    pub volume_available: bool,
     pub durability: RedCoreDurability,
     pub snapshot_interval_writes: u64,
     pub strict_acid: bool,
@@ -71,8 +73,15 @@ impl Config {
         let storage_mode = env_first(&["RUSTY_RED_MODE", "THG_PRODUCT_STORE"])
             .map(|value| StorageMode::parse(&value))
             .unwrap_or(StorageMode::Embedded);
+        let railway_volume_mount_path = env::var("RAILWAY_VOLUME_MOUNT_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let data_dir = env_first(&["RUSTY_RED_DATA_DIR", "THG_PRODUCT_DATA_DIR"])
-            .or_else(|_| env::var("RAILWAY_VOLUME_MOUNT_PATH"))
+            .or_else(|_| {
+                railway_volume_mount_path
+                    .clone()
+                    .ok_or(env::VarError::NotPresent)
+            })
             .unwrap_or_else(|_| {
                 if railway_port.is_some() {
                     "/app/data/rusty-red".to_string()
@@ -80,6 +89,15 @@ impl Config {
                     "data/rusty-red".to_string()
                 }
             });
+        let require_volume = env_bool(
+            &["RUSTY_RED_REQUIRE_VOLUME", "THG_PRODUCT_REQUIRE_VOLUME"],
+            railway_port.is_some(),
+        );
+        let volume_available = railway_volume_mount_path.is_some()
+            || env_bool(
+                &["RUSTY_RED_VOLUME_MOUNTED", "THG_PRODUCT_VOLUME_MOUNTED"],
+                false,
+            );
         let durability = env_first(&["RUSTY_RED_DURABILITY", "THG_PRODUCT_DURABILITY"])
             .map(|value| RedCoreDurability::parse(&value))
             .unwrap_or(RedCoreDurability::AofEverysec);
@@ -139,6 +157,8 @@ impl Config {
             port,
             storage_mode,
             data_dir,
+            require_volume,
+            volume_available,
             durability,
             snapshot_interval_writes,
             strict_acid,
@@ -164,6 +184,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.storage_mode == StorageMode::Embedded
+            && self.require_volume
+            && !self.volume_available
+        {
+            return Err(
+                "RUSTY_RED_REQUIRE_VOLUME=true requires RAILWAY_VOLUME_MOUNT_PATH or RUSTY_RED_VOLUME_MOUNTED=true"
+                    .to_string(),
+            );
+        }
         if !self.strict_acid {
             return Ok(());
         }
@@ -228,6 +257,8 @@ mod tests {
             port: 8380,
             storage_mode: StorageMode::Embedded,
             data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::AofAlways,
             snapshot_interval_writes: 1_000,
             strict_acid: true,
@@ -259,5 +290,23 @@ mod tests {
     #[test]
     fn strict_acid_config_accepts_single_writer_serializable_embedded() {
         assert_eq!(base_config().validate(), Ok(()));
+    }
+
+    #[test]
+    fn embedded_config_rejects_missing_required_volume() {
+        let mut config = base_config();
+        config.require_volume = true;
+        config.volume_available = false;
+
+        assert!(config.validate().unwrap_err().contains("REQUIRE_VOLUME"));
+    }
+
+    #[test]
+    fn embedded_config_accepts_required_available_volume() {
+        let mut config = base_config();
+        config.require_volume = true;
+        config.volume_available = true;
+
+        assert_eq!(config.validate(), Ok(()));
     }
 }

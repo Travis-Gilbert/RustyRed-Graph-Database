@@ -1,0 +1,1481 @@
+use std::collections::BTreeMap;
+
+use axum::http::StatusCode;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use thg_core::{Direction, GraphStoreError, NeighborQuery, NodeQuery, NodeRecord};
+
+use crate::state::TenantGraphStore;
+
+const DEFAULT_LIMIT: usize = 100;
+const MAX_LIMIT: usize = 1_000;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PublicCypherBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    pub query: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuerySurfaceError {
+    status: StatusCode,
+    code: String,
+    message: String,
+}
+
+impl QuerySurfaceError {
+    fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    fn invalid(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    fn unsupported(feature: impl AsRef<str>, message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_cypher_feature",
+            format!("{}: {}", feature.as_ref(), message.into()),
+        )
+    }
+
+    fn missing_param(name: &str) -> Self {
+        Self::invalid(
+            "missing_cypher_param",
+            format!("missing required cypher parameter ${name}"),
+        )
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn payload(&self) -> Value {
+        json!({
+            "ok": false,
+            "error": self.code,
+            "message": self.message,
+        })
+    }
+}
+
+impl From<GraphStoreError> for QuerySurfaceError {
+    fn from(error: GraphStoreError) -> Self {
+        let status = match error.code.as_str() {
+            "redis_graph_store_error" | "redcore_io_error" | "store_internal_error" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Self::new(status, error.code, error.message)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedQuery {
+    operation: QueryOperation,
+    requested_limit: usize,
+}
+
+#[derive(Clone, Debug)]
+enum QueryOperation {
+    NodeMatch(NodeQuery),
+    Neighbors(NeighborQuery),
+}
+
+#[derive(Clone, Debug)]
+struct ParsedCypher {
+    normalized: String,
+    pattern: CypherPattern,
+    where_filter: Option<PropertyFilter>,
+    returns: Vec<ReturnItem>,
+    limit: usize,
+}
+
+#[derive(Clone, Debug)]
+enum CypherPattern {
+    Node(NodePattern),
+    Edge(EdgePattern),
+}
+
+#[derive(Clone, Debug)]
+struct NodePattern {
+    binding: String,
+    label: Option<String>,
+    properties: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug)]
+struct EdgePattern {
+    left: NodePattern,
+    edge_type: String,
+    right: NodePattern,
+}
+
+#[derive(Clone, Debug)]
+struct PropertyFilter {
+    binding: String,
+    key: String,
+    value: Value,
+}
+
+#[derive(Clone, Debug)]
+enum ReturnItem {
+    Variable(String),
+    Property {
+        binding: String,
+        key: String,
+        expression: String,
+    },
+}
+
+impl ReturnItem {
+    fn key(&self) -> &str {
+        match self {
+            Self::Variable(binding) => binding.as_str(),
+            Self::Property { expression, .. } => expression.as_str(),
+        }
+    }
+}
+
+pub fn resolve_tenant_id(
+    explicit_tenant: Option<&str>,
+    default_tenant: &str,
+) -> Result<String, QuerySurfaceError> {
+    let tenant = explicit_tenant
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .unwrap_or(default_tenant.trim());
+    if tenant.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "missing_tenant_id",
+            "tenant_id is required when no default tenant is configured",
+        ));
+    }
+    Ok(tenant.to_string())
+}
+
+pub fn execute_public_query(
+    store: &TenantGraphStore,
+    tenant: &str,
+    body: &Value,
+) -> Result<Value, QuerySurfaceError> {
+    let parsed = parse_public_query(body)?;
+    let explain = explain_public_query(tenant, body)?;
+    match parsed.operation {
+        QueryOperation::NodeMatch(mut query) => {
+            query.limit = Some(parsed.requested_limit.saturating_add(1));
+            let mut nodes = store.query_nodes(query)?;
+            let truncated = nodes.len() > parsed.requested_limit;
+            if truncated {
+                nodes.truncate(parsed.requested_limit);
+            }
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "operation": "node_match",
+                "nodes": nodes,
+                "stats": {
+                    "returned": nodes.len(),
+                    "truncated": truncated
+                },
+                "explain": explain,
+            }))
+        }
+        QueryOperation::Neighbors(query) => {
+            let mut neighbors = store.neighbors(query)?;
+            let truncated = neighbors.len() > parsed.requested_limit;
+            if truncated {
+                neighbors.truncate(parsed.requested_limit);
+            }
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "operation": "neighbors",
+                "neighbors": neighbors,
+                "stats": {
+                    "returned": neighbors.len(),
+                    "truncated": truncated
+                },
+                "explain": explain,
+            }))
+        }
+    }
+}
+
+pub fn explain_public_query(tenant: &str, body: &Value) -> Result<Value, QuerySurfaceError> {
+    let parsed = parse_public_query(body)?;
+    let (operation, plan) = match parsed.operation {
+        QueryOperation::NodeMatch(query) => {
+            let seek = if query.label.is_some() || !query.properties.is_empty() {
+                "node_index_seek"
+            } else {
+                "node_scan"
+            };
+            (
+                "node_match",
+                json!([
+                    {
+                        "op": seek,
+                        "bounded": true,
+                        "limit": parsed.requested_limit,
+                        "uses": {
+                            "label": query.label,
+                            "properties": query.properties
+                        }
+                    },
+                    {
+                        "op": "limit",
+                        "count": parsed.requested_limit
+                    }
+                ]),
+            )
+        }
+        QueryOperation::Neighbors(query) => (
+            "neighbors",
+            json!([
+                {
+                    "op": "adjacency_seek",
+                    "bounded": true,
+                    "limit": parsed.requested_limit,
+                    "direction": match query.direction {
+                        Direction::Out => "out",
+                        Direction::In => "in",
+                    },
+                    "edge_type": query.edge_type
+                },
+                {
+                    "op": "limit",
+                    "count": parsed.requested_limit
+                }
+            ]),
+        ),
+    };
+    Ok(json!({
+        "tenant": tenant,
+        "operation": operation,
+        "plan": plan,
+        "compatibility": {
+            "supported_operations": ["node_match", "neighbors"],
+            "pending": ["multi_hop_expand", "path_projection", "sorting", "aggregation"]
+        }
+    }))
+}
+
+pub fn execute_cypher_query(
+    store: &TenantGraphStore,
+    tenant: &str,
+    body: &PublicCypherBody,
+) -> Result<Value, QuerySurfaceError> {
+    let parsed = parse_cypher(&body.query, &body.params)?;
+    let explain = explain_cypher_query(tenant, body)?;
+    match &parsed.pattern {
+        CypherPattern::Node(node_pattern) => {
+            let query = node_query_for_pattern(
+                node_pattern,
+                parsed
+                    .where_filter
+                    .as_ref()
+                    .filter(|filter| filter.binding == node_pattern.binding),
+                parsed.limit.saturating_add(1),
+            )?;
+            let mut nodes = store.query_nodes(query.clone())?;
+            if let Some(filter) = parsed.where_filter.as_ref() {
+                nodes.retain(|node| {
+                    filter.binding == node_pattern.binding && node_matches_filter(node, filter)
+                });
+            }
+            let truncated = nodes.len() > parsed.limit;
+            if truncated {
+                nodes.truncate(parsed.limit);
+            }
+            let rows = nodes
+                .iter()
+                .map(|node| project_node_row(&parsed.returns, node_pattern, node))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "query": parsed.normalized,
+                "subset": "opencypher_v0_1_read_only",
+                "rows": rows,
+                "row_count": rows.len(),
+                "stats": {
+                    "returned": rows.len(),
+                    "truncated": truncated,
+                    "plan_operation": if query.label.is_some() || !query.properties.is_empty() {
+                        "node_index_seek"
+                    } else {
+                        "node_scan"
+                    }
+                },
+                "explain": explain,
+            }))
+        }
+        CypherPattern::Edge(edge_pattern) => {
+            let left_filter = parsed
+                .where_filter
+                .as_ref()
+                .filter(|filter| filter.binding == edge_pattern.left.binding);
+            let right_filter = parsed
+                .where_filter
+                .as_ref()
+                .filter(|filter| filter.binding == edge_pattern.right.binding);
+            let seed_query = node_query_for_pattern(
+                &edge_pattern.left,
+                left_filter,
+                parsed.limit.saturating_add(1),
+            )?;
+            if seed_query.label.is_none() && seed_query.properties.is_empty() {
+                return Err(QuerySurfaceError::unsupported(
+                    "relationship_scan",
+                    "relationship MATCH requires at least a left label or left property filter in this slice",
+                ));
+            }
+            let seeds = store.query_nodes(seed_query.clone())?;
+            let mut rows = Vec::new();
+            let mut edges_touched = 0usize;
+            for seed in &seeds {
+                if let Some(filter) = left_filter {
+                    if !node_matches_filter(seed, filter) {
+                        continue;
+                    }
+                }
+                let neighbors = store.neighbors(NeighborQuery {
+                    node_id: seed.id.clone(),
+                    direction: Direction::Out,
+                    edge_type: Some(edge_pattern.edge_type.clone()),
+                })?;
+                edges_touched += neighbors.len();
+                for hit in neighbors {
+                    let Some(target) = store.get_node(&hit.node_id)? else {
+                        continue;
+                    };
+                    if !node_matches_pattern(&target, &edge_pattern.right) {
+                        continue;
+                    }
+                    if let Some(filter) = right_filter {
+                        if !node_matches_filter(&target, filter) {
+                            continue;
+                        }
+                    }
+                    rows.push(project_edge_row(
+                        &parsed.returns,
+                        edge_pattern,
+                        seed,
+                        &target,
+                    )?);
+                    if rows.len() > parsed.limit {
+                        break;
+                    }
+                }
+                if rows.len() > parsed.limit {
+                    break;
+                }
+            }
+            let truncated = rows.len() > parsed.limit;
+            if truncated {
+                rows.truncate(parsed.limit);
+            }
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "query": parsed.normalized,
+                "subset": "opencypher_v0_1_read_only",
+                "rows": rows,
+                "row_count": rows.len(),
+                "stats": {
+                    "returned": rows.len(),
+                    "truncated": truncated,
+                    "seed_nodes": seeds.len(),
+                    "edges_touched": edges_touched,
+                    "plan_operation": if seed_query.properties.is_empty() {
+                        "node_by_label_expand_out"
+                    } else {
+                        "node_index_seek_expand_out"
+                    }
+                },
+                "explain": explain,
+            }))
+        }
+    }
+}
+
+pub fn explain_cypher_query(
+    tenant: &str,
+    body: &PublicCypherBody,
+) -> Result<Value, QuerySurfaceError> {
+    let parsed = parse_cypher(&body.query, &body.params)?;
+    let (pattern, plan) = match &parsed.pattern {
+        CypherPattern::Node(node_pattern) => {
+            let seek = if node_pattern.label.is_some() || !node_pattern.properties.is_empty() {
+                "node_index_seek"
+            } else {
+                "node_scan"
+            };
+            (
+                "node_match",
+                json!([
+                    {
+                        "op": seek,
+                        "binding": node_pattern.binding,
+                        "label": node_pattern.label,
+                        "properties": node_pattern.properties,
+                        "bounded": true
+                    },
+                    {
+                        "op": "project",
+                        "returns": parsed.returns.iter().map(ReturnItem::key).collect::<Vec<_>>()
+                    },
+                    {
+                        "op": "limit",
+                        "count": parsed.limit
+                    }
+                ]),
+            )
+        }
+        CypherPattern::Edge(edge_pattern) => {
+            let left_seek = if edge_pattern.left.properties.is_empty() {
+                "node_by_label"
+            } else {
+                "node_index_seek"
+            };
+            (
+                "relationship_expand",
+                json!([
+                    {
+                        "op": left_seek,
+                        "binding": edge_pattern.left.binding,
+                        "label": edge_pattern.left.label,
+                        "properties": edge_pattern.left.properties,
+                        "bounded": true
+                    },
+                    {
+                        "op": "expand_out",
+                        "edge_type": edge_pattern.edge_type,
+                        "target_binding": edge_pattern.right.binding,
+                        "target_label": edge_pattern.right.label,
+                        "target_properties": edge_pattern.right.properties
+                    },
+                    {
+                        "op": "project",
+                        "returns": parsed.returns.iter().map(ReturnItem::key).collect::<Vec<_>>()
+                    },
+                    {
+                        "op": "limit",
+                        "count": parsed.limit
+                    }
+                ]),
+            )
+        }
+    };
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant,
+        "query": parsed.normalized,
+        "subset": "opencypher_v0_1_read_only",
+        "pattern": pattern,
+        "plan": plan,
+        "compatibility": cypher_compatibility_matrix(),
+    }))
+}
+
+pub fn cypher_compatibility_matrix() -> Value {
+    json!({
+        "version": "opencypher_v0_1_read_only",
+        "supported": [
+            "MATCH (n) RETURN n LIMIT <n>",
+            "MATCH (n:Label {prop: $value}) RETURN n LIMIT <n>",
+            "MATCH (n:Label) WHERE n.prop = $value RETURN n LIMIT <n>",
+            "MATCH (a:Label)-[:TYPE]->(b:Label) RETURN a, b LIMIT <n>",
+            "MATCH (a:Label)-[:TYPE]->(b:Label) RETURN a.prop, b.prop LIMIT <n>"
+        ],
+        "rejected": [
+            "CREATE, MERGE, DELETE, SET, REMOVE",
+            "OPTIONAL MATCH, WITH, UNION",
+            "ORDER BY, SKIP, DISTINCT, aggregation",
+            "path aliases and variable-length relationships",
+            "incoming, undirected, and multi-hop relationship patterns",
+            "procedures, PROFILE, and EXPLAIN query prefixes"
+        ],
+        "pending": [
+            "bounded variable-length expand",
+            "sorting and aggregation",
+            "write clauses",
+            "procedures over search, cache, and GraphRAG"
+        ]
+    })
+}
+
+fn parse_public_query(body: &Value) -> Result<ParsedQuery, QuerySurfaceError> {
+    let operation = body
+        .get("operation")
+        .or_else(|| body.get("op"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if body.get("node_id").is_some() || body.get("direction").is_some() {
+                "neighbors"
+            } else {
+                "node_match"
+            }
+        });
+    let requested_limit = parse_limit(body.get("limit"))?;
+    match operation {
+        "node_match" | "node_index_seek" => {
+            let label = body
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string);
+            let properties = body
+                .get("properties")
+                .or_else(|| body.get("props"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let properties = serde_json::from_value::<BTreeMap<String, Value>>(properties)
+                .map_err(|error| {
+                    QuerySurfaceError::invalid(
+                        "invalid_query_properties",
+                        format!("properties must be an object: {error}"),
+                    )
+                })?;
+            Ok(ParsedQuery {
+                operation: QueryOperation::NodeMatch(NodeQuery {
+                    label,
+                    properties,
+                    limit: Some(requested_limit),
+                }),
+                requested_limit,
+            })
+        }
+        "neighbors" => {
+            let node_id = body
+                .get("node_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|node_id| !node_id.is_empty())
+                .ok_or_else(|| {
+                    QuerySurfaceError::invalid(
+                        "missing_node_id",
+                        "neighbors query requires node_id",
+                    )
+                })?;
+            let direction = match body
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("out")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "out" => Direction::Out,
+                "in" => Direction::In,
+                other => {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_direction",
+                        format!("direction must be \"out\" or \"in\", got {other}"),
+                    ))
+                }
+            };
+            let edge_type = body
+                .get("edge_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|edge_type| !edge_type.is_empty())
+                .map(str::to_string);
+            Ok(ParsedQuery {
+                operation: QueryOperation::Neighbors(NeighborQuery {
+                    node_id: node_id.to_string(),
+                    direction,
+                    edge_type,
+                }),
+                requested_limit,
+            })
+        }
+        other => Err(QuerySurfaceError::invalid(
+            "unsupported_query_operation",
+            format!("supported /v1/query operations are node_match and neighbors, got {other}"),
+        )),
+    }
+}
+
+fn parse_cypher(
+    query: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let normalized = normalize_query(query);
+    if normalized.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "empty_cypher_query",
+            "query is required",
+        ));
+    }
+    let upper = normalized.to_ascii_uppercase();
+    for keyword in [
+        "CREATE ",
+        "MERGE ",
+        "DELETE ",
+        "DETACH DELETE ",
+        "SET ",
+        "REMOVE ",
+    ] {
+        if upper.starts_with(keyword) || upper.contains(&format!(" {keyword}")) {
+            return Err(QuerySurfaceError::unsupported(
+                keyword.trim(),
+                "write clauses are not implemented in the first /v1/cypher subset",
+            ));
+        }
+    }
+    if upper.starts_with("EXPLAIN ") || upper.starts_with("PROFILE ") {
+        return Err(QuerySurfaceError::unsupported(
+            "query_prefix",
+            "use POST /v1/cypher/explain instead of EXPLAIN or PROFILE query prefixes",
+        ));
+    }
+    if !upper.starts_with("MATCH ") {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            "only MATCH-based read-only Cypher is supported in this slice",
+        ));
+    }
+    for keyword in [
+        " OPTIONAL MATCH ",
+        " WITH ",
+        " UNION ",
+        " CALL ",
+        " ORDER BY ",
+        " SKIP ",
+        " DISTINCT ",
+    ] {
+        if upper.contains(keyword) {
+            return Err(QuerySurfaceError::unsupported(
+                keyword.trim(),
+                "that clause is not implemented in the first /v1/cypher subset",
+            ));
+        }
+    }
+    if upper.contains("COUNT(") || upper.contains("SUM(") || upper.contains("AVG(") {
+        return Err(QuerySurfaceError::unsupported(
+            "aggregation",
+            "aggregation is a later compatibility slice",
+        ));
+    }
+    let return_index = upper.find(" RETURN ").ok_or_else(|| {
+        QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            "Cypher subset requires a RETURN clause",
+        )
+    })?;
+    let match_and_where = normalized["MATCH ".len()..return_index].trim();
+    if match_and_where.contains('*') {
+        return Err(QuerySurfaceError::unsupported(
+            "variable_length_expand",
+            "variable-length relationships are not implemented in the first /v1/cypher subset",
+        ));
+    }
+    let after_return = normalized[return_index + " RETURN ".len()..].trim();
+    let limit_index = after_return.to_ascii_uppercase().find(" LIMIT ");
+    let (return_part, limit_part) = match limit_index {
+        Some(index) => (
+            after_return[..index].trim(),
+            Some(after_return[index + " LIMIT ".len()..].trim()),
+        ),
+        None => (after_return, None),
+    };
+    let limit = match limit_part {
+        Some(limit_part) => parse_limit_literal(limit_part)?,
+        None => DEFAULT_LIMIT,
+    };
+    let where_index = match_and_where.to_ascii_uppercase().find(" WHERE ");
+    let (match_part, where_part) = match where_index {
+        Some(index) => (
+            match_and_where[..index].trim(),
+            Some(match_and_where[index + " WHERE ".len()..].trim()),
+        ),
+        None => (match_and_where, None),
+    };
+    if match_part.contains('=') {
+        return Err(QuerySurfaceError::unsupported(
+            "path_alias",
+            "path aliases are not implemented in the first /v1/cypher subset",
+        ));
+    }
+    let pattern = parse_pattern(match_part, params)?;
+    let where_filter = match where_part {
+        Some(where_part) => Some(parse_where_filter(where_part, params)?),
+        None => None,
+    };
+    let returns = parse_return_items(return_part)?;
+    validate_return_items(&pattern, &returns)?;
+    validate_where_filter(&pattern, where_filter.as_ref())?;
+    Ok(ParsedCypher {
+        normalized,
+        pattern,
+        where_filter,
+        returns,
+        limit,
+    })
+}
+
+fn validate_where_filter(
+    pattern: &CypherPattern,
+    filter: Option<&PropertyFilter>,
+) -> Result<(), QuerySurfaceError> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    let valid = match pattern {
+        CypherPattern::Node(node) => node.binding == filter.binding,
+        CypherPattern::Edge(edge) => {
+            edge.left.binding == filter.binding || edge.right.binding == filter.binding
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(QuerySurfaceError::invalid(
+            "invalid_where_binding",
+            format!(
+                "WHERE binding {} does not exist in the MATCH pattern",
+                filter.binding
+            ),
+        ))
+    }
+}
+
+fn validate_return_items(
+    pattern: &CypherPattern,
+    returns: &[ReturnItem],
+) -> Result<(), QuerySurfaceError> {
+    let bindings = match pattern {
+        CypherPattern::Node(node) => vec![node.binding.as_str()],
+        CypherPattern::Edge(edge) => vec![edge.left.binding.as_str(), edge.right.binding.as_str()],
+    };
+    for item in returns {
+        match item {
+            ReturnItem::Variable(binding) => {
+                if !bindings.contains(&binding.as_str()) {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN binding {binding} does not exist in the MATCH pattern"),
+                    ));
+                }
+            }
+            ReturnItem::Property { binding, .. } => {
+                if !bindings.contains(&binding.as_str()) {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN binding {binding} does not exist in the MATCH pattern"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_pattern(
+    match_part: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<CypherPattern, QuerySurfaceError> {
+    if let Some((left, rest)) = match_part.split_once(")-[") {
+        let left = format!("{left})");
+        let (relation, right) = rest.split_once("]->(").ok_or_else(|| {
+            QuerySurfaceError::unsupported(
+                "relationship_shape",
+                "only outgoing single-hop relationships are supported in the first /v1/cypher subset",
+            )
+        })?;
+        let right = format!("({right}");
+        let relation = relation.trim();
+        if !relation.starts_with(':') || relation.contains('{') || relation.contains(' ') {
+            return Err(QuerySurfaceError::unsupported(
+                "relationship_shape",
+                "only [:TYPE] relationships are supported in the first /v1/cypher subset",
+            ));
+        }
+        let edge_type = relation.trim_start_matches(':').trim();
+        if edge_type.is_empty() {
+            return Err(QuerySurfaceError::invalid(
+                "invalid_relationship_type",
+                "relationship type is required",
+            ));
+        }
+        return Ok(CypherPattern::Edge(EdgePattern {
+            left: parse_node_pattern(&left, params)?,
+            edge_type: edge_type.to_string(),
+            right: parse_node_pattern(&right, params)?,
+        }));
+    }
+    Ok(CypherPattern::Node(parse_node_pattern(match_part, params)?))
+}
+
+fn parse_node_pattern(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<NodePattern, QuerySurfaceError> {
+    let source = source.trim();
+    if !source.starts_with('(') || !source.ends_with(')') {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_node_pattern",
+            format!("invalid node pattern {source}"),
+        ));
+    }
+    let inner = source[1..source.len() - 1].trim();
+    let (binding, mut rest) = take_identifier(inner);
+    if binding.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_node_binding",
+            format!("node binding is required in {source}"),
+        ));
+    }
+    rest = rest.trim_start();
+    let mut label = None;
+    if rest.starts_with(':') {
+        let (label_name, next) = take_identifier(rest.trim_start_matches(':'));
+        if label_name.is_empty() {
+            return Err(QuerySurfaceError::invalid(
+                "invalid_node_label",
+                format!("node label is required in {source}"),
+            ));
+        }
+        label = Some(label_name.to_string());
+        rest = next.trim_start();
+    }
+    let mut properties = BTreeMap::new();
+    if rest.starts_with('{') {
+        let (block, next) = take_braced_block(rest)?;
+        properties = parse_property_block(block, params)?;
+        rest = next.trim_start();
+    }
+    if !rest.is_empty() {
+        return Err(QuerySurfaceError::unsupported(
+            "node_pattern_tail",
+            format!("unsupported node pattern tail {rest}"),
+        ));
+    }
+    Ok(NodePattern {
+        binding: binding.to_string(),
+        label,
+        properties,
+    })
+}
+
+fn parse_where_filter(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<PropertyFilter, QuerySurfaceError> {
+    let source = source.trim();
+    let upper = source.to_ascii_uppercase();
+    if upper.contains(" AND ") || upper.contains(" OR ") {
+        return Err(QuerySurfaceError::unsupported(
+            "where_boolean_logic",
+            "only a single equality WHERE predicate is supported in the first /v1/cypher subset",
+        ));
+    }
+    let (left, right) = source.split_once('=').ok_or_else(|| {
+        QuerySurfaceError::invalid(
+            "invalid_where_clause",
+            "WHERE clause must be a single equality predicate",
+        )
+    })?;
+    let (binding, key) = left.trim().split_once('.').ok_or_else(|| {
+        QuerySurfaceError::invalid(
+            "invalid_where_clause",
+            "WHERE clause must use binding.property = value",
+        )
+    })?;
+    Ok(PropertyFilter {
+        binding: binding.trim().to_string(),
+        key: key.trim().to_string(),
+        value: parse_scalar_value(right.trim(), params)?,
+    })
+}
+
+fn parse_return_items(source: &str) -> Result<Vec<ReturnItem>, QuerySurfaceError> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "empty_return_clause",
+            "RETURN clause is required",
+        ));
+    }
+    let mut items = Vec::new();
+    for part in split_top_level(source, ',') {
+        let part = part.trim();
+        let upper = part.to_ascii_uppercase();
+        if upper.contains(" AS ") {
+            return Err(QuerySurfaceError::unsupported(
+                "return_alias",
+                "RETURN aliases are a later compatibility slice",
+            ));
+        }
+        if part.contains('(') || part.contains(')') {
+            return Err(QuerySurfaceError::unsupported(
+                "return_expression",
+                "RETURN expressions are a later compatibility slice",
+            ));
+        }
+        if let Some((binding, key)) = part.split_once('.') {
+            items.push(ReturnItem::Property {
+                binding: binding.trim().to_string(),
+                key: key.trim().to_string(),
+                expression: part.to_string(),
+            });
+            continue;
+        }
+        let (binding, tail) = take_identifier(part);
+        if binding.is_empty() || !tail.trim().is_empty() {
+            return Err(QuerySurfaceError::invalid(
+                "invalid_return_clause",
+                format!("unsupported RETURN item {part}"),
+            ));
+        }
+        items.push(ReturnItem::Variable(binding.to_string()));
+    }
+    Ok(items)
+}
+
+fn node_query_for_pattern(
+    pattern: &NodePattern,
+    filter: Option<&PropertyFilter>,
+    limit: usize,
+) -> Result<NodeQuery, QuerySurfaceError> {
+    let mut properties = pattern.properties.clone();
+    if let Some(filter) = filter {
+        match properties.get(filter.key.as_str()) {
+            Some(existing) if existing != &filter.value => {
+                return Err(QuerySurfaceError::invalid(
+                    "contradictory_filter",
+                    format!(
+                        "WHERE {}.{} conflicts with inline property filter",
+                        filter.binding, filter.key
+                    ),
+                ))
+            }
+            Some(_) => {}
+            None => {
+                properties.insert(filter.key.clone(), filter.value.clone());
+            }
+        }
+    }
+    Ok(NodeQuery {
+        label: pattern.label.clone(),
+        properties,
+        limit: Some(limit),
+    })
+}
+
+fn project_node_row(
+    items: &[ReturnItem],
+    pattern: &NodePattern,
+    node: &NodeRecord,
+) -> Result<Value, QuerySurfaceError> {
+    let mut row = serde_json::Map::new();
+    for item in items {
+        match item {
+            ReturnItem::Variable(binding) if binding == &pattern.binding => {
+                row.insert(binding.clone(), json!(node));
+            }
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } if binding == &pattern.binding => {
+                row.insert(expression.clone(), property_value(node, key));
+            }
+            ReturnItem::Variable(binding) | ReturnItem::Property { binding, .. } => {
+                return Err(QuerySurfaceError::invalid(
+                    "invalid_return_binding",
+                    format!("RETURN binding {binding} does not exist in the MATCH pattern"),
+                ))
+            }
+        }
+    }
+    Ok(Value::Object(row))
+}
+
+fn project_edge_row(
+    items: &[ReturnItem],
+    pattern: &EdgePattern,
+    left: &NodeRecord,
+    right: &NodeRecord,
+) -> Result<Value, QuerySurfaceError> {
+    let mut row = serde_json::Map::new();
+    for item in items {
+        match item {
+            ReturnItem::Variable(binding) if binding == &pattern.left.binding => {
+                row.insert(binding.clone(), json!(left));
+            }
+            ReturnItem::Variable(binding) if binding == &pattern.right.binding => {
+                row.insert(binding.clone(), json!(right));
+            }
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } if binding == &pattern.left.binding => {
+                row.insert(expression.clone(), property_value(left, key));
+            }
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } if binding == &pattern.right.binding => {
+                row.insert(expression.clone(), property_value(right, key));
+            }
+            ReturnItem::Variable(binding) | ReturnItem::Property { binding, .. } => {
+                return Err(QuerySurfaceError::invalid(
+                    "invalid_return_binding",
+                    format!("RETURN binding {binding} does not exist in the MATCH pattern"),
+                ))
+            }
+        }
+    }
+    Ok(Value::Object(row))
+}
+
+fn node_matches_pattern(node: &NodeRecord, pattern: &NodePattern) -> bool {
+    if let Some(label) = pattern.label.as_ref() {
+        if !node.labels.iter().any(|candidate| candidate == label) {
+            return false;
+        }
+    }
+    pattern
+        .properties
+        .iter()
+        .all(|(key, value)| property_value(node, key) == *value)
+}
+
+fn node_matches_filter(node: &NodeRecord, filter: &PropertyFilter) -> bool {
+    property_value(node, &filter.key) == filter.value
+}
+
+fn property_value(node: &NodeRecord, key: &str) -> Value {
+    node.properties.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn parse_property_block(
+    block: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, QuerySurfaceError> {
+    let block = block.trim();
+    if !block.starts_with('{') || !block.ends_with('}') {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_property_block",
+            format!("invalid property block {block}"),
+        ));
+    }
+    let mut properties = BTreeMap::new();
+    let inner = block[1..block.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(properties);
+    }
+    for entry in split_top_level(inner, ',') {
+        let (key, value) = entry.split_once(':').ok_or_else(|| {
+            QuerySurfaceError::invalid(
+                "invalid_property_filter",
+                format!("property filter must be key: value, got {entry}"),
+            )
+        })?;
+        properties.insert(
+            key.trim().to_string(),
+            parse_scalar_value(value.trim(), params)?,
+        );
+    }
+    Ok(properties)
+}
+
+fn parse_scalar_value(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<Value, QuerySurfaceError> {
+    if let Some(name) = source.strip_prefix('$') {
+        return params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| QuerySurfaceError::missing_param(name));
+    }
+    if source.len() >= 2
+        && ((source.starts_with('"') && source.ends_with('"'))
+            || (source.starts_with('\'') && source.ends_with('\'')))
+    {
+        return Ok(Value::String(source[1..source.len() - 1].to_string()));
+    }
+    match source {
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        "null" => return Ok(Value::Null),
+        _ => {}
+    }
+    if let Ok(value) = source.parse::<i64>() {
+        return Ok(json!(value));
+    }
+    if let Ok(value) = source.parse::<f64>() {
+        return Ok(json!(value));
+    }
+    Err(QuerySurfaceError::invalid(
+        "invalid_cypher_literal",
+        format!("unsupported literal {source}"),
+    ))
+}
+
+fn parse_limit(limit: Option<&Value>) -> Result<usize, QuerySurfaceError> {
+    match limit {
+        Some(Value::Number(number)) => {
+            let limit = number.as_u64().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_limit", "limit must be a positive integer")
+            })?;
+            if limit == 0 {
+                return Err(QuerySurfaceError::invalid(
+                    "invalid_limit",
+                    "limit must be greater than zero",
+                ));
+            }
+            Ok((limit as usize).min(MAX_LIMIT))
+        }
+        Some(_) => Err(QuerySurfaceError::invalid(
+            "invalid_limit",
+            "limit must be a positive integer",
+        )),
+        None => Ok(DEFAULT_LIMIT),
+    }
+}
+
+fn parse_limit_literal(source: &str) -> Result<usize, QuerySurfaceError> {
+    let limit = source.trim().parse::<usize>().map_err(|_| {
+        QuerySurfaceError::invalid("invalid_limit", format!("invalid LIMIT value {source}"))
+    })?;
+    if limit == 0 {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_limit",
+            "LIMIT must be greater than zero",
+        ));
+    }
+    Ok(limit.min(MAX_LIMIT))
+}
+
+fn normalize_query(query: &str) -> String {
+    let trimmed = query.trim().trim_end_matches(';');
+    let mut normalized = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut last_was_space = false;
+    for ch in trimmed.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                normalized.push(ch);
+                last_was_space = false;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                normalized.push(ch);
+                last_was_space = false;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !last_was_space {
+                    normalized.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ => {
+                normalized.push(ch);
+                last_was_space = false;
+            }
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn split_top_level(source: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut brace_depth = 0usize;
+    for ch in source.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            '{' if !in_single && !in_double => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_single && !in_double => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            c if c == separator && !in_single && !in_double && brace_depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn take_identifier(source: &str) -> (&str, &str) {
+    let mut end = 0usize;
+    for (index, ch) in source.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    source.split_at(end)
+}
+
+fn take_braced_block(source: &str) -> Result<(&str, &str), QuerySurfaceError> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0usize;
+    for (index, ch) in source.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '{' if !in_single && !in_double => depth += 1,
+            '}' if !in_single && !in_double => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let split = index + ch.len_utf8();
+                    return Ok(source.split_at(split));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(QuerySurfaceError::invalid(
+        "invalid_property_block",
+        format!("unterminated property block {source}"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+    use thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
+
+    use super::{
+        cypher_compatibility_matrix, execute_cypher_query, execute_public_query,
+        explain_cypher_query, explain_public_query, parse_cypher, resolve_tenant_id,
+        PublicCypherBody,
+    };
+    use crate::{
+        config::{Config, StorageMode},
+        state::{AppState, TenantGraphStore},
+    };
+
+    fn graph_store() -> TenantGraphStore {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+        let mut store = state.tenant_graph_store("tenant-a").unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "file:lib",
+                ["File"],
+                json!({ "path": "src/lib.rs", "repo": "rusty-red" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "file:main",
+                ["File"],
+                json!({ "path": "src/main.rs", "repo": "rusty-red" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "symbol:parse",
+                ["Symbol"],
+                json!({ "name": "parse" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:imports",
+                "file:lib",
+                "IMPORTS",
+                "file:main",
+                json!({}),
+            ))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn resolves_tenant_from_explicit_or_default() {
+        assert_eq!(
+            resolve_tenant_id(Some("tenant-a"), "default").unwrap(),
+            "tenant-a"
+        );
+        assert_eq!(resolve_tenant_id(None, "default").unwrap(), "default");
+    }
+
+    #[test]
+    fn public_query_supports_node_match_and_neighbors() {
+        let store = graph_store();
+
+        let node_match = execute_public_query(
+            &store,
+            "demo",
+            &json!({
+                "operation": "node_match",
+                "label": "File",
+                "properties": { "path": "src/lib.rs" },
+                "limit": 10
+            }),
+        )
+        .unwrap();
+        assert_eq!(node_match["nodes"][0]["id"], "file:lib");
+
+        let neighbors = execute_public_query(
+            &store,
+            "demo",
+            &json!({
+                "operation": "neighbors",
+                "node_id": "file:lib",
+                "direction": "out",
+                "edge_type": "IMPORTS",
+                "limit": 10
+            }),
+        )
+        .unwrap();
+        assert_eq!(neighbors["neighbors"][0]["node_id"], "file:main");
+    }
+
+    #[test]
+    fn public_query_explain_names_supported_subset() {
+        let explain = explain_public_query(
+            "demo",
+            &json!({
+                "operation": "node_match",
+                "label": "File",
+                "properties": { "path": "src/lib.rs" }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(explain["operation"], "node_match");
+        assert_eq!(
+            explain["compatibility"]["supported_operations"][0],
+            "node_match"
+        );
+    }
+
+    #[test]
+    fn cypher_subset_executes_node_match_with_where() {
+        let store = graph_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:File) WHERE n.path = $path RETURN n LIMIT 5".to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+        };
+
+        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+
+        assert_eq!(response["row_count"], 1);
+        assert_eq!(response["rows"][0]["n"]["id"], "file:lib");
+    }
+
+    #[test]
+    fn cypher_subset_executes_relationship_projection() {
+        let store = graph_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query:
+                "MATCH (a:File {path: $path})-[:IMPORTS]->(b:File) RETURN a.path, b.path LIMIT 10"
+                    .to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+        };
+
+        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+
+        assert_eq!(response["rows"][0]["a.path"], "src/lib.rs");
+        assert_eq!(response["rows"][0]["b.path"], "src/main.rs");
+    }
+
+    #[test]
+    fn cypher_explain_includes_compatibility_matrix() {
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:File) RETURN n LIMIT 10".to_string(),
+            params: BTreeMap::new(),
+        };
+
+        let response = explain_cypher_query("demo", &body).unwrap();
+
+        assert_eq!(response["subset"], "opencypher_v0_1_read_only");
+        assert_eq!(
+            response["compatibility"]["supported"][0],
+            "MATCH (n) RETURN n LIMIT <n>"
+        );
+    }
+
+    #[test]
+    fn cypher_subset_rejects_writes_and_var_expands() {
+        let write_error = parse_cypher("CREATE (:File)", &BTreeMap::new()).unwrap_err();
+        assert_eq!(write_error.payload()["error"], "unsupported_cypher_feature");
+
+        let expand_error = parse_cypher(
+            "MATCH p = (a:File)-[:IMPORTS*1..2]->(b:File) RETURN p",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            expand_error.payload()["error"],
+            "unsupported_cypher_feature"
+        );
+    }
+
+    #[test]
+    fn compatibility_matrix_lists_pending_work() {
+        let matrix = cypher_compatibility_matrix();
+
+        assert_eq!(matrix["pending"][0], "bounded variable-length expand");
+    }
+}

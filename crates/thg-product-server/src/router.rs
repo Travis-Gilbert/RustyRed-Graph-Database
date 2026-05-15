@@ -20,6 +20,13 @@ use thg_mcp::{agent_manifest, handle_mcp_request_with_context, mcp_manifest, Mcp
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_scope;
+use crate::graph_cache::{
+    GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
+};
+use crate::query_surface::{
+    execute_cypher_query, execute_public_query, explain_cypher_query, resolve_tenant_id,
+    PublicCypherBody, QuerySurfaceError,
+};
 use crate::state::{AppState, StoreAccessError, TenantGraphStore};
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +38,23 @@ pub struct CommandBody {
 
 #[derive(Debug, Deserialize)]
 pub struct BatchBody {
+    #[serde(default)]
+    pub commands: Vec<CommandBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RootCommandBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    pub command: String,
+    #[serde(default, alias = "payload")]
+    pub args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RootBatchBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     #[serde(default)]
     pub commands: Vec<CommandBody>,
 }
@@ -107,6 +131,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
         .route("/metrics", get(crate::metrics::metrics))
+        .route("/v1/command", post(root_command))
+        .route("/v1/batch", post(root_batch))
+        .route("/v1/query", post(public_query))
+        .route("/v1/cypher", post(public_cypher))
+        .route("/v1/cypher/explain", post(public_cypher_explain))
+        .route("/v1/cache/put", post(root_cache_put))
+        .route("/v1/cache/get", post(root_cache_get))
+        .route("/v1/cache/check", post(root_cache_check))
+        .route("/v1/cache/explain", post(root_cache_explain))
+        .route("/v1/cache/invalidate", post(root_cache_invalidate))
+        .route("/v1/cache/stats", post(root_cache_stats))
         .route("/v1/tenants/:tenant_id/command", post(command))
         .route("/v1/tenants/:tenant_id/batch", post(batch))
         .route("/v1/tenants/:tenant_id/runs/:run_id", get(run_get))
@@ -206,6 +241,7 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             "mode": report.mode,
             "durability": report.durability,
             "strict_acid": report.strict_acid,
+            "require_volume": report.require_volume,
             "data_dir": report.data_dir
         }))
         .into_response(),
@@ -241,6 +277,28 @@ async fn command(
     execute_tenant_command(&state, &tenant_id, &body.command, body.args)
 }
 
+async fn root_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RootCommandBody>,
+) -> impl IntoResponse {
+    let scope = required_scope_for_command(&body.command);
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    execute_tenant_command(&state, &tenant_id, &body.command, body.args)
+}
+
 async fn batch(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -258,65 +316,175 @@ async fn batch(
             return status.into_response();
         }
     }
+    execute_batch_commands(&state, &tenant_id, body.commands)
+}
 
-    if let Err(error) = state.store_ready() {
-        return store_unavailable_response(error);
-    }
-    let needs_state_store = body
-        .commands
-        .iter()
-        .any(|item| !is_graph_command(&item.command));
-    let mut executor = if needs_state_store {
-        let store = match state.tenant_store(&tenant_id) {
-            Ok(store) => store,
-            Err(error) => return store_unavailable_response(error),
+async fn root_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RootBatchBody>,
+) -> impl IntoResponse {
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
         };
-        Some(StoreBackedThgExecutor::new(store))
-    } else {
-        None
-    };
-    let mut graph_store: Option<TenantGraphStore> = None;
-    let mut results = Vec::with_capacity(body.commands.len());
-    for item in body.commands {
-        let command = item.command;
-        let args = item.args;
-        let response = if is_graph_command(&command) {
-            if graph_store.is_none() {
-                match state.tenant_graph_store(&tenant_id) {
-                    Ok(store) => graph_store = Some(store),
-                    Err(error) => {
-                        results.push(ThgResponse::err(
-                            command,
-                            ThgError::new(error.code, error.message),
-                            "graph:unavailable",
-                        ));
-                        continue;
-                    }
-                }
-            }
-            execute_graph_store_command(
-                graph_store.as_mut().expect("graph store initialized"),
-                &command,
-                args,
-            )
-        } else {
-            executor
-                .as_mut()
-                .expect("state executor initialized for non-graph command")
-                .execute_request(ThgRequest::new(command, args))
-        };
-        results.push(response);
+    for item in &body.commands {
+        let scope = required_scope_for_command(&item.command);
+        if let Err(status) = require_scope(
+            &headers,
+            &state.config.api_tokens,
+            scope,
+            state.config.require_auth,
+        ) {
+            return status.into_response();
+        }
     }
-    let state_hash = executor
-        .as_ref()
-        .map(|executor| executor.state().hash())
-        .unwrap_or_else(|| {
-            graph_store
-                .as_ref()
-                .map(graph_response_hash)
-                .unwrap_or_else(|| "graph:empty_batch".to_string())
-        });
-    Json(json!({ "ok": true, "results": results, "state_hash": state_hash })).into_response()
+    execute_batch_commands(&state, &tenant_id, body.commands)
+}
+
+async fn root_cache_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCachePutBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_put(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_get(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_check(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_explain(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_invalidate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheInvalidateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_invalidate(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheStatsBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match execute_cache_stats(&state, &tenant_id) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
 }
 
 async fn run_get(
@@ -338,6 +506,97 @@ async fn run_get(
         "THG.RUN.GET",
         json!({ "run_id": run_id }),
     )
+}
+
+async fn public_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id = match resolve_tenant_id(
+        body.get("tenant_id").and_then(Value::as_str),
+        &state.config.mcp_default_tenant,
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return query_surface_error_response(error),
+    };
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match execute_public_query(&store, &tenant_id, &body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => query_surface_error_response(error),
+    }
+}
+
+async fn public_cypher(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PublicCypherBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match execute_cypher_query(&store, &tenant_id, &body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => query_surface_error_response(error),
+    }
+}
+
+async fn public_cypher_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PublicCypherBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    match explain_cypher_query(&tenant_id, &body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => query_surface_error_response(error),
+    }
 }
 
 async fn graph_query(
@@ -620,6 +879,12 @@ fn execute_tenant_command(
         ))
         .into_response();
     }
+    if is_cache_command(command) {
+        return Json(execute_tenant_cache_command(
+            state, tenant_id, command, args,
+        ))
+        .into_response();
+    }
     let store = match state.tenant_store(tenant_id) {
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
@@ -653,6 +918,35 @@ fn execute_tenant_graph_command(
         }
     };
     execute_graph_store_command(&mut store, command_name, args)
+}
+
+fn execute_tenant_cache_command(
+    state: &AppState,
+    tenant_id: &str,
+    command_name: &str,
+    args: Value,
+) -> ThgResponse {
+    let cache = match state.tenant_graph_cache(tenant_id) {
+        Ok(cache) => cache,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    let graph_version = match current_graph_version(state, tenant_id) {
+        Ok(version) => version,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    execute_graph_cache_command(&cache, command_name, args, graph_version)
 }
 
 fn execute_graph_store_command(
@@ -830,6 +1124,19 @@ fn is_graph_command(command: &str) -> bool {
     )
 }
 
+fn is_cache_command(command: &str) -> bool {
+    matches!(
+        command.trim().to_ascii_uppercase().as_str(),
+        "THG.CACHE.PUT"
+            | "THG.CACHE.STORE"
+            | "THG.CACHE.GET"
+            | "THG.CACHE.CHECK"
+            | "THG.CACHE.EXPLAIN"
+            | "THG.CACHE.INVALIDATE"
+            | "THG.CACHE.STATS"
+    )
+}
+
 fn graph_command_invalid_params(
     command: &str,
     message: String,
@@ -854,6 +1161,107 @@ fn graph_command_error(
     )
 }
 
+fn execute_graph_cache_command(
+    cache: &std::sync::Arc<crate::graph_cache::GraphCacheTenant>,
+    command_name: &str,
+    args: Value,
+    graph_version: u64,
+) -> ThgResponse {
+    let upper = command_name.trim().to_ascii_uppercase();
+    let result = match upper.as_str() {
+        "THG.CACHE.PUT" | "THG.CACHE.STORE" => serde_json::from_value::<GraphCachePutBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.put(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    "stored",
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "THG.CACHE.GET" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.get(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "THG.CACHE.CHECK" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.check(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "THG.CACHE.EXPLAIN" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.explain(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "explain_hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "THG.CACHE.INVALIDATE" => serde_json::from_value::<GraphCacheInvalidateBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.invalidate(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.removed > 0 {
+                        "invalidated"
+                    } else {
+                        "no_match"
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "THG.CACHE.STATS" => cache.stats(graph_version).map(|payload| {
+            ThgResponse::ok(
+                command_name,
+                "ok",
+                json!({ "cache": payload }),
+                cache_state_hash(cache, graph_version),
+            )
+        }),
+        _ => Err(GraphStoreError::new(
+            "unsupported_graph_cache_command",
+            format!("unsupported graph cache command: {command_name}"),
+        )),
+    };
+    result.unwrap_or_else(|error| {
+        ThgResponse::err(
+            command_name,
+            ThgError::new(error.code, error.message),
+            cache_state_hash(cache, graph_version),
+        )
+    })
+}
+
 fn graph_response_hash(store: &TenantGraphStore) -> String {
     store
         .stats()
@@ -861,8 +1269,251 @@ fn graph_response_hash(store: &TenantGraphStore) -> String {
         .unwrap_or_else(|_| "graph:unavailable".to_string())
 }
 
+fn cache_state_hash(
+    cache: &std::sync::Arc<crate::graph_cache::GraphCacheTenant>,
+    graph_version: u64,
+) -> String {
+    cache
+        .stats(graph_version)
+        .map(|stats| stable_hash(stats))
+        .unwrap_or_else(|_| format!("cache:unavailable:{graph_version}"))
+}
+
 fn graph_stats_hash(stats: &GraphStats) -> String {
     stable_hash(stats)
+}
+
+fn current_graph_version(state: &AppState, tenant_id: &str) -> Result<u64, GraphStoreError> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    Ok(store.stats()?.version)
+}
+
+fn execute_cache_put(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCachePutBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.put(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_get(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.get(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_check(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.check(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_explain(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.explain(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_invalidate(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheInvalidateBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.invalidate(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_stats(state: &AppState, tenant_id: &str) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.stats(graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_batch_commands(
+    state: &AppState,
+    tenant_id: &str,
+    commands: Vec<CommandBody>,
+) -> axum::response::Response {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let needs_state_store = commands
+        .iter()
+        .any(|item| !is_graph_command(&item.command) && !is_cache_command(&item.command));
+    let mut executor = if needs_state_store {
+        let store = match state.tenant_store(tenant_id) {
+            Ok(store) => store,
+            Err(error) => return store_unavailable_response(error),
+        };
+        Some(StoreBackedThgExecutor::new(store))
+    } else {
+        None
+    };
+    let mut graph_store: Option<TenantGraphStore> = None;
+    let mut graph_cache = None;
+    let mut results = Vec::with_capacity(commands.len());
+    for item in commands {
+        let command = item.command;
+        let args = item.args;
+        let response = if is_graph_command(&command) {
+            if graph_store.is_none() {
+                match state.tenant_graph_store(tenant_id) {
+                    Ok(store) => graph_store = Some(store),
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            }
+            execute_graph_store_command(
+                graph_store.as_mut().expect("graph store initialized"),
+                &command,
+                args,
+            )
+        } else if is_cache_command(&command) {
+            if graph_cache.is_none() {
+                match state.tenant_graph_cache(tenant_id) {
+                    Ok(cache) => graph_cache = Some(cache),
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let graph_version = if let Some(store) = graph_store.as_ref() {
+                match store.stats() {
+                    Ok(stats) => stats.version,
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                match current_graph_version(state, tenant_id) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            };
+            execute_graph_cache_command(
+                graph_cache.as_ref().expect("graph cache initialized"),
+                &command,
+                args,
+                graph_version,
+            )
+        } else {
+            executor
+                .as_mut()
+                .expect("state executor initialized for non-graph command")
+                .execute_request(ThgRequest::new(command, args))
+        };
+        results.push(response);
+    }
+    let state_hash = executor
+        .as_ref()
+        .map(|executor| executor.state().hash())
+        .unwrap_or_else(|| {
+            graph_store
+                .as_ref()
+                .map(graph_response_hash)
+                .or_else(|| {
+                    graph_cache.as_ref().map(|cache| {
+                        cache_state_hash(
+                            cache,
+                            current_graph_version(state, tenant_id).unwrap_or(0),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "graph:empty_batch".to_string())
+        });
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "results": results,
+        "state_hash": state_hash
+    }))
+    .into_response()
+}
+
+fn query_surface_error_response(error: QuerySurfaceError) -> axum::response::Response {
+    (error.status(), Json(error.payload())).into_response()
 }
 
 fn store_unavailable_response(error: StoreAccessError) -> axum::response::Response {
@@ -886,7 +1537,10 @@ fn graph_error_status(code: &str) -> StatusCode {
         | "empty_graph_transaction"
         | "missing_graph_endpoint"
         | "tombstoned_graph_endpoint"
-        | "invalid_graph_record" => StatusCode::BAD_REQUEST,
+        | "invalid_graph_record"
+        | "invalid_graph_cache_request"
+        | "unsupported_graph_cache_kind"
+        | "unsupported_graph_cache_command" => StatusCode::BAD_REQUEST,
         "redis_graph_store_error"
         | "redcore_io_error"
         | "redcore_aof_frame_invalid"
@@ -895,7 +1549,8 @@ fn graph_error_status(code: &str) -> StatusCode {
         | "redcore_lock_unavailable"
         | "redcore_strict_mode_invalid"
         | "redcore_writer_lock_poisoned"
-        | "redcore_snapshot_lock_poisoned" => StatusCode::SERVICE_UNAVAILABLE,
+        | "redcore_snapshot_lock_poisoned"
+        | "graph_cache_lock_poisoned" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -913,8 +1568,13 @@ fn required_scope_for_command(command: &str) -> &'static str {
         | "THG.GRAPH.NODES.QUERY"
         | "THG.GRAPH.NEIGHBORS"
         | "THG.GRAPH.STATS"
-        | "THG.GRAPH.VERIFY" => "graph:read",
+        | "THG.GRAPH.VERIFY"
+        | "THG.CACHE.GET"
+        | "THG.CACHE.CHECK"
+        | "THG.CACHE.EXPLAIN"
+        | "THG.CACHE.STATS" => "graph:read",
         "THG.GRAPH.REBUILD_INDEXES" | "THG.GRAPH.REBUILD" => "graph:write",
+        "THG.CACHE.PUT" | "THG.CACHE.STORE" | "THG.CACHE.INVALIDATE" => "graph:write",
         _ => "run:write",
     }
 }
@@ -959,8 +1619,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        execute_graph_store_command, execute_tenant_command, graph_error_status, is_graph_command,
-        mcp_origin_allowed, required_scope_for_command,
+        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
+        graph_error_status, is_cache_command, is_graph_command, mcp_origin_allowed,
+        required_scope_for_command,
     };
     use crate::{
         config::{Config, StorageMode},
@@ -995,6 +1656,8 @@ mod tests {
             required_scope_for_command("THG.GRAPH.REBUILD_INDEXES"),
             "graph:write"
         );
+        assert_eq!(required_scope_for_command("THG.CACHE.CHECK"), "graph:read");
+        assert_eq!(required_scope_for_command("THG.CACHE.PUT"), "graph:write");
     }
 
     #[test]
@@ -1004,6 +1667,9 @@ mod tests {
         assert!(is_graph_command("THG.GRAPH.VERIFY"));
         assert!(is_graph_command("thg.graph.rebuild_indexes"));
         assert!(!is_graph_command("THG.RUN.BEGIN"));
+        assert!(is_cache_command("thg.cache.check"));
+        assert!(is_cache_command(" THG.CACHE.PUT "));
+        assert!(!is_cache_command("THG.RUN.BEGIN"));
     }
 
     #[test]
@@ -1013,6 +1679,8 @@ mod tests {
             port: 8380,
             storage_mode: StorageMode::Redis,
             data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::AofEverysec,
             snapshot_interval_writes: 1_000,
             strict_acid: false,
@@ -1044,6 +1712,8 @@ mod tests {
             port: 8380,
             storage_mode: StorageMode::Memory,
             data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
             durability: RedCoreDurability::None,
             snapshot_interval_writes: 0,
             strict_acid: false,
@@ -1090,9 +1760,93 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
+            graph_error_status("invalid_graph_cache_request"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
             graph_error_status("redis_graph_store_error"),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn cache_command_reports_stale_after_graph_write_advances_version() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+
+        let first_write = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:a",
+                "labels": ["File"],
+                "properties": { "path": "src/lib.rs" }
+            }),
+        );
+        assert_eq!(first_write.status(), StatusCode::OK);
+
+        let cache_put = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "THG.CACHE.PUT",
+            json!({
+                "kind": "query_result",
+                "key": { "label": "File", "path": "src/lib.rs" },
+                "value": { "nodes": ["node:a"] },
+                "metadata": { "operation": "node_match" }
+            }),
+        );
+        assert_eq!(cache_put.status(), StatusCode::OK);
+
+        let second_write = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:b",
+                "labels": ["File"],
+                "properties": { "path": "src/main.rs" }
+            }),
+        );
+        assert_eq!(second_write.status(), StatusCode::OK);
+
+        let cache_check = execute_tenant_cache_command(
+            &state,
+            "tenant-a",
+            "THG.CACHE.CHECK",
+            json!({
+                "kind": "query_result",
+                "key": { "label": "File", "path": "src/lib.rs" }
+            }),
+        );
+        assert!(cache_check.ok);
+        assert_eq!(cache_check.status, "graph_version_mismatch");
+        assert_eq!(cache_check.payload["cache"]["stale"], true);
+        assert_eq!(cache_check.payload["cache"]["accepted"], false);
     }
 
     #[test]
