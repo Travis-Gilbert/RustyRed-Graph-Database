@@ -1293,7 +1293,9 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "labels_total",
                         "edge_types_total",
                         "property_keys_total",
-                        "property_indexes_total"
+                        "property_indexes_total",
+                        "memory_bytes",
+                        "memory_quota_bytes"
                     ],
                     "properties": {
                         "version": { "type": "integer", "minimum": 0 },
@@ -1302,7 +1304,9 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "labels_total": { "type": "integer", "minimum": 0 },
                         "edge_types_total": { "type": "integer", "minimum": 0 },
                         "property_keys_total": { "type": "integer", "minimum": 0 },
-                        "property_indexes_total": { "type": "integer", "minimum": 0 }
+                        "property_indexes_total": { "type": "integer", "minimum": 0 },
+                        "memory_bytes": { "type": "integer", "minimum": 0 },
+                        "memory_quota_bytes": { "type": "integer", "minimum": 0 }
                     },
                     "additionalProperties": false
                 },
@@ -1543,6 +1547,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1588,5 +1594,16 @@ mod tests {
                 "#/components/schemas/GraphCacheLookupResult".to_string()
             ))
         );
+
+        let graph_stats_required = document
+            .pointer("/components/schemas/GraphStats/required")
+            .and_then(|value| value.as_array())
+            .expect("GraphStats.required");
+        let graph_stats_required = graph_stats_required
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(graph_stats_required.contains(&"memory_bytes"));
+        assert!(graph_stats_required.contains(&"memory_quota_bytes"));
     }
 }

@@ -1300,6 +1300,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,

@@ -41,6 +41,8 @@ pub struct Config {
     pub strict_acid: bool,
     pub concurrency: String,
     pub txn_isolation: String,
+    pub tenant_memory_quota_bytes: usize,
+    pub tenant_memory_quota_config_error: Option<String>,
     pub redis_url: String,
     pub redis_key_prefix: String,
     pub require_auth: bool,
@@ -119,6 +121,13 @@ impl Config {
                     "snapshot".to_string()
                 }
             });
+        let (tenant_memory_quota_bytes, tenant_memory_quota_config_error) = env_usize(
+            &[
+                "RUSTY_RED_TENANT_MEMORY_QUOTA_BYTES",
+                "THG_PRODUCT_TENANT_MEMORY_QUOTA_BYTES",
+            ],
+            0,
+        );
         let redis_url = env_first(&["RUSTY_RED_REDIS_URL", "THG_REDIS_URL"])
             .or_else(|_| env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -164,6 +173,8 @@ impl Config {
             strict_acid,
             concurrency,
             txn_isolation,
+            tenant_memory_quota_bytes,
+            tenant_memory_quota_config_error,
             redis_url,
             redis_key_prefix,
             require_auth,
@@ -184,12 +195,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(error) = &self.tenant_memory_quota_config_error {
+            return Err(error.clone());
+        }
         if self.storage_mode == StorageMode::Embedded
             && self.require_volume
             && !self.volume_available
         {
             return Err(
                 "RUSTY_RED_REQUIRE_VOLUME=true requires RAILWAY_VOLUME_MOUNT_PATH or RUSTY_RED_VOLUME_MOUNTED=true"
+                    .to_string(),
+                );
+        }
+        if self.storage_mode == StorageMode::Redis && self.tenant_memory_quota_bytes > 0 {
+            return Err(
+                "RUSTY_RED_TENANT_MEMORY_QUOTA_BYTES is currently enforced only for RUSTY_RED_MODE=embedded or RUSTY_RED_MODE=memory; redis mode quota enforcement is a separate follow-up gate"
                     .to_string(),
             );
         }
@@ -235,6 +255,22 @@ fn env_bool(keys: &[&str], default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_usize(keys: &[&str], default: usize) -> (usize, Option<String>) {
+    match env_first(keys) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) => (parsed, None),
+            Err(_) => (
+                default,
+                Some(format!(
+                    "{} must be an unsigned byte count, got {value}",
+                    keys.join(" or "),
+                )),
+            ),
+        },
+        Err(_) => (default, None),
+    }
+}
+
 fn env_first(keys: &[&str]) -> Result<String, env::VarError> {
     for key in keys {
         match env::var(key) {
@@ -264,6 +300,8 @@ mod tests {
             strict_acid: true,
             concurrency: "single_writer".to_string(),
             txn_isolation: "serializable".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -308,5 +346,26 @@ mod tests {
         config.volume_available = true;
 
         assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn invalid_tenant_memory_quota_config_fails_validation() {
+        let mut config = base_config();
+        config.tenant_memory_quota_config_error =
+            Some("RUSTY_RED_TENANT_MEMORY_QUOTA_BYTES must be an unsigned byte count".to_string());
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("unsigned byte count"));
+    }
+
+    #[test]
+    fn redis_mode_rejects_tenant_memory_quota_until_supported() {
+        let mut config = base_config();
+        config.storage_mode = StorageMode::Redis;
+        config.tenant_memory_quota_bytes = 1024;
+
+        assert!(config.validate().unwrap_err().contains("redis mode quota"));
     }
 }

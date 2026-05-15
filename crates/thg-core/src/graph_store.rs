@@ -284,6 +284,9 @@ pub struct GraphStats {
     pub edge_types_total: usize,
     pub property_keys_total: usize,
     pub property_indexes_total: usize,
+    /// Estimated serialized footprint for live graph records and derived indexes.
+    pub memory_bytes: usize,
+    pub memory_quota_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -565,7 +568,21 @@ impl InMemoryGraphStore {
             edge_types_total: self.edge_type_index.len(),
             property_keys_total: self.property_keys().len(),
             property_indexes_total: self.property_index.len(),
+            memory_bytes: self.estimated_memory_bytes(),
+            memory_quota_bytes: 0,
         }
+    }
+
+    fn estimated_memory_bytes(&self) -> usize {
+        let snapshot_bytes = serde_json::to_vec(&self.snapshot())
+            .map(|raw| raw.len())
+            .unwrap_or_default();
+        snapshot_bytes
+            + string_index_bytes(&self.label_index)
+            + string_index_bytes(&self.edge_type_index)
+            + tuple_index_bytes(&self.out_adjacency)
+            + tuple_index_bytes(&self.in_adjacency)
+            + tuple_index_bytes(&self.property_index)
     }
 
     pub fn verify(&self) -> VerifyReport {
@@ -2148,6 +2165,8 @@ impl RedisGraphStore {
             edge_types_total: self.edge_types()?.len(),
             property_keys_total: self.property_keys()?.len(),
             property_indexes_total: self.redis_indexes()?.property_index.len(),
+            memory_bytes: 0,
+            memory_quota_bytes: 0,
         })
     }
 
@@ -2523,6 +2542,22 @@ fn sorted_values(values: Option<&BTreeSet<String>>) -> Vec<String> {
     values
         .map(|values| values.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+fn string_index_bytes(index: &BTreeMap<String, BTreeSet<String>>) -> usize {
+    index
+        .iter()
+        .map(|(key, values)| key.len() + values.iter().map(String::len).sum::<usize>())
+        .sum()
+}
+
+fn tuple_index_bytes(index: &BTreeMap<(String, String), BTreeSet<String>>) -> usize {
+    index
+        .iter()
+        .map(|((left, right), values)| {
+            left.len() + right.len() + values.iter().map(String::len).sum::<usize>()
+        })
+        .sum()
 }
 
 fn merge_candidates(candidates: &mut Option<BTreeSet<String>>, next: Option<BTreeSet<String>>) {

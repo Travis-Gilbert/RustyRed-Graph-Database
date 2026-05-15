@@ -1541,6 +1541,7 @@ fn graph_error_status(code: &str) -> StatusCode {
         | "invalid_graph_cache_request"
         | "unsupported_graph_cache_kind"
         | "unsupported_graph_cache_command" => StatusCode::BAD_REQUEST,
+        "tenant_memory_quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
         "redis_graph_store_error"
         | "redcore_io_error"
         | "redcore_aof_frame_invalid"
@@ -1686,6 +1687,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1719,6 +1722,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1767,6 +1772,10 @@ mod tests {
             graph_error_status("redis_graph_store_error"),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        assert_eq!(
+            graph_error_status("tenant_memory_quota_exceeded"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]
@@ -1783,6 +1792,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,

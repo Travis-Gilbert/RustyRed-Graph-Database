@@ -32,6 +32,7 @@ impl AppState {
     }
 
     pub fn tenant_store(&self, tenant_id: &str) -> Result<RedisThgStore, StoreAccessError> {
+        self.config.validate().map_err(StoreAccessError::internal)?;
         if self.config.storage_mode != StorageMode::Redis {
             return Err(StoreAccessError::unsupported(
                 "run/context state commands are available only in RUSTY_RED_MODE=redis in this slice",
@@ -50,6 +51,7 @@ impl AppState {
         &self,
         tenant_id: &str,
     ) -> Result<TenantGraphStore, StoreAccessError> {
+        self.config.validate().map_err(StoreAccessError::internal)?;
         match self.config.storage_mode {
             StorageMode::Embedded => Ok(TenantGraphStore::RedCore(
                 self.redcore_store_for_tenant(tenant_id)?,
@@ -68,9 +70,9 @@ impl AppState {
     }
 
     pub fn store_ready(&self) -> Result<ReadyReport, StoreAccessError> {
+        self.config.validate().map_err(StoreAccessError::internal)?;
         match self.config.storage_mode {
             StorageMode::Embedded => {
-                self.config.validate().map_err(StoreAccessError::internal)?;
                 let data_dir = PathBuf::from(&self.config.data_dir);
                 RedCoreGraphStore::readiness_check(
                     &data_dir,
@@ -159,9 +161,10 @@ impl AppState {
             snapshot_interval_writes: self.config.snapshot_interval_writes,
             strict_acid: self.config.strict_acid,
         };
-        let store = Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::open(
-            data_dir, options,
-        )?)?);
+        let store = Arc::new(RedCoreTenantExecutor::new(
+            RedCoreGraphStore::open(data_dir, options)?,
+            self.config.tenant_memory_quota_bytes,
+        )?);
         stores.insert(safe_tenant, store.clone());
         Ok(store)
     }
@@ -178,7 +181,10 @@ impl AppState {
         if let Some(store) = stores.get(&safe_tenant) {
             return Ok(store.clone());
         }
-        let store = Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory())?);
+        let store = Arc::new(RedCoreTenantExecutor::new(
+            RedCoreGraphStore::memory(),
+            self.config.tenant_memory_quota_bytes,
+        )?);
         stores.insert(safe_tenant, store.clone());
         Ok(store)
     }
@@ -247,19 +253,22 @@ impl From<GraphStoreError> for StoreAccessError {
 pub struct RedCoreTenantExecutor {
     writer: Mutex<RedCoreGraphStore>,
     committed_snapshot: RwLock<InMemoryGraphStore>,
+    tenant_memory_quota_bytes: usize,
 }
 
 impl RedCoreTenantExecutor {
-    fn new(store: RedCoreGraphStore) -> GraphStoreResult<Self> {
+    fn new(store: RedCoreGraphStore, tenant_memory_quota_bytes: usize) -> GraphStoreResult<Self> {
         let committed_snapshot = InMemoryGraphStore::from_snapshot(store.graph_snapshot())?;
         Ok(Self {
             writer: Mutex::new(store),
             committed_snapshot: RwLock::new(committed_snapshot),
+            tenant_memory_quota_bytes,
         })
     }
 
     pub fn commit_batch(&self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
         let mut writer = self.lock_writer()?;
+        self.enforce_tenant_memory_quota(&writer, &batch)?;
         let transaction = writer.commit_batch(batch)?;
         let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
         *self.committed_snapshot.write().map_err(|_| {
@@ -308,7 +317,11 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn stats(&self) -> GraphStoreResult<GraphStats> {
-        self.with_snapshot(|snapshot| snapshot.stats())
+        self.with_snapshot(|snapshot| {
+            let mut stats = snapshot.stats();
+            stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
+            stats
+        })
     }
 
     pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
@@ -357,6 +370,41 @@ impl RedCoreTenantExecutor {
             )
         })?;
         Ok(read(&snapshot))
+    }
+
+    fn enforce_tenant_memory_quota(
+        &self,
+        writer: &RedCoreGraphStore,
+        batch: &GraphMutationBatch,
+    ) -> GraphStoreResult<()> {
+        if self.tenant_memory_quota_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut projected_store = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        for mutation in &batch.mutations {
+            match mutation {
+                GraphMutation::NodeUpsert(node) => {
+                    projected_store.upsert_node(node.clone())?;
+                }
+                GraphMutation::EdgeUpsert(edge) => {
+                    projected_store.upsert_edge(edge.clone())?;
+                }
+            }
+        }
+
+        let projected_memory = projected_store.stats().memory_bytes;
+        if projected_memory > self.tenant_memory_quota_bytes {
+            return Err(GraphStoreError::new(
+                "tenant_memory_quota_exceeded",
+                format!(
+                    "tenant memory quota exceeded: projected {projected_memory} > quota {}",
+                    self.tenant_memory_quota_bytes,
+                ),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -526,6 +574,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -561,6 +611,8 @@ mod tests {
             strict_acid: true,
             concurrency: "single_writer".to_string(),
             txn_isolation: "serializable".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -611,6 +663,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -645,6 +699,8 @@ mod tests {
             strict_acid: false,
             concurrency: "single_writer".to_string(),
             txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -668,7 +724,8 @@ mod tests {
 
     #[test]
     fn redcore_executor_serializes_concurrent_writes_with_monotonic_txn_ids() {
-        let executor = Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory()).unwrap());
+        let executor =
+            Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap());
         let start = Arc::new(Barrier::new(9));
         let handles = (0..8)
             .map(|idx| {
@@ -704,7 +761,7 @@ mod tests {
 
     #[test]
     fn redcore_executor_reads_only_committed_snapshots() {
-        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory()).unwrap();
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
         let error = executor
             .commit_batch(GraphMutationBatch::new([
                 GraphMutation::NodeUpsert(NodeRecord::new(
@@ -755,6 +812,26 @@ mod tests {
             "node:b"
         );
         assert_eq!(executor.verify().unwrap().ok, true);
+    }
+
+    #[test]
+    fn redcore_executor_enforces_tenant_memory_quota_on_commit() {
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 1).unwrap();
+        let error = executor
+            .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+                NodeRecord::new("node:oversize", ["File"], json!({ "path": "src/lib.rs" })),
+            )]))
+            .unwrap_err();
+
+        assert_eq!(error.code, "tenant_memory_quota_exceeded");
+    }
+
+    #[test]
+    fn redcore_executor_includes_tenant_memory_quota_in_stats() {
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 128).unwrap();
+        let stats = executor.stats().unwrap();
+
+        assert_eq!(stats.memory_quota_bytes, 128);
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {

@@ -6,6 +6,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::auth::require_scope;
+use crate::config::StorageMode;
 use crate::state::AppState;
 
 pub async fn metrics(
@@ -18,6 +19,10 @@ pub async fn metrics(
         "admin:read",
         state.config.require_auth,
     )?;
+    let tenant_memory_quota_supported = matches!(
+        state.config.storage_mode,
+        StorageMode::Embedded | StorageMode::Memory
+    );
     Ok(Json(json!({
         "service": state.config.service_name.as_str(),
         "status": "ok",
@@ -25,6 +30,10 @@ pub async fn metrics(
         "configured_origins": state.config.allowed_origins.len(),
         "storage_mode": state.config.storage_mode.as_str(),
         "durability": state.config.durability.as_str(),
-        "strict_acid": state.config.strict_acid
+        "strict_acid": state.config.strict_acid,
+        "tenant_memory_quota_bytes": state.config.tenant_memory_quota_bytes,
+        "tenant_memory_quota_supported": tenant_memory_quota_supported,
+        "tenant_memory_quota_enforced": tenant_memory_quota_supported
+            && state.config.tenant_memory_quota_bytes > 0
     })))
 }
