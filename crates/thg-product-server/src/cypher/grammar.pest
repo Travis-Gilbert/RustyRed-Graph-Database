@@ -1,48 +1,72 @@
-// Pest grammar for the read-only Cypher subset. Single-hop, multi-hop, and
-// variable-length expand. Path binding (MATCH p = ...) is captured for the
-// var-length and chain branches.
+// Pest grammar for the Cypher subset rusty-red supports.
+// Read shapes: single-hop, multi-hop chain, variable-length expand.
+// Write shapes (§P3-A): CREATE, MERGE with ON CREATE/ON MATCH branches,
+// MATCH ... SET, MATCH ... DELETE, MATCH ... DETACH DELETE.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
-query        = { SOI ~ match_clause ~ where_clause? ~ return_clause ~ limit_clause? ~ EOI }
+query        = { SOI ~ (write_query | read_query) ~ EOI }
 
-match_clause = { ^"MATCH" ~ path_binding? ~ pattern }
-path_binding = { ident ~ "=" }
+read_query   = { match_clause ~ where_clause? ~ return_clause ~ limit_clause? }
 
-where_clause = { ^"WHERE" ~ where_expr }
-return_clause = { ^"RETURN" ~ return_items }
-limit_clause = { ^"LIMIT" ~ integer }
+write_query  = {
+    create_node_only
+    | merge_clause
+    | match_with_set
+    | match_with_delete
+}
 
-// Pattern: var-length first (its `*` is the discriminator), then chain
-// (one or more continuations), then bare node.
-pattern         = { var_length_pattern | edge_chain_pattern | node_pattern }
+create_node_only = { ^"CREATE" ~ create_target }
+create_target    = { create_edge_form | node_pattern }
+create_edge_form = { node_pattern ~ edge_continuation }
+
+merge_clause     = { ^"MERGE" ~ node_pattern ~ merge_branch* }
+merge_branch     = { (^"ON" ~ ^"CREATE" ~ set_list) | (^"ON" ~ ^"MATCH" ~ set_list) }
+set_list         = { ^"SET" ~ set_assignment ~ ("," ~ set_assignment)* }
+set_assignment   = { property_path ~ "=" ~ set_value_expr }
+set_value_expr   = { increment_expr | value }
+increment_expr   = { property_path ~ "+" ~ value }
+
+match_with_set    = { match_clause ~ where_clause? ~ set_list }
+match_with_delete = { match_clause ~ where_clause? ~ delete_form }
+delete_form       = { detach_delete | plain_delete }
+detach_delete     = { ^"DETACH" ~ ^"DELETE" ~ ident }
+plain_delete      = { ^"DELETE" ~ ident }
+
+match_clause     = { ^"MATCH" ~ path_binding? ~ pattern }
+path_binding     = { ident ~ "=" }
+where_clause     = { ^"WHERE" ~ where_expr }
+return_clause    = { ^"RETURN" ~ return_items }
+limit_clause     = { ^"LIMIT" ~ integer }
+
+pattern          = { var_length_pattern | edge_chain_pattern | node_pattern }
 edge_chain_pattern = { node_pattern ~ edge_continuation+ }
 var_length_pattern = { node_pattern ~ edge_var_length ~ node_pattern }
 
 edge_continuation = { "-[" ~ rel_type ~ "]->" ~ node_pattern }
 edge_var_length   = { "-[" ~ rel_type ~ "*" ~ var_length_range? ~ "]->" }
 var_length_range  = { integer ~ ".." ~ integer | integer }
-rel_type     = { ":" ~ ident }
+rel_type          = { ":" ~ ident }
 
-node_pattern = { "(" ~ binding? ~ label? ~ property_block? ~ ")" }
-binding      = { ident }
-label        = { ":" ~ ident }
+node_pattern   = { "(" ~ binding? ~ label? ~ property_block? ~ ")" }
+binding        = { ident }
+label          = { ":" ~ ident }
 property_block = { "{" ~ property_pair ~ ("," ~ property_pair)* ~ "}" }
 property_pair  = { ident ~ ":" ~ value }
 
-where_expr   = { property_path ~ "=" ~ value }
-property_path = { ident ~ "." ~ ident }
+where_expr     = { property_path ~ "=" ~ value }
+property_path  = { ident ~ "." ~ ident }
 
-return_items = { return_item ~ ("," ~ return_item)* }
-return_item  = { count_call | property_path | ident }
-count_call   = { ^"COUNT" ~ "(" ~ count_arg ~ ")" }
-count_arg    = { "*" | ident }
+return_items   = { return_item ~ ("," ~ return_item)* }
+return_item    = { count_call | property_path | ident }
+count_call     = { ^"COUNT" ~ "(" ~ count_arg ~ ")" }
+count_arg      = { "*" | ident }
 
-value        = { param | string | number | boolean | null }
-param        = { "$" ~ ident }
-string       = @{ "'" ~ (!"'" ~ ANY)* ~ "'" | "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
-number       = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-integer      = @{ ASCII_DIGIT+ }
-boolean      = { ^"true" | ^"false" }
-null         = { ^"null" }
-ident        = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+value   = { param | string | number | boolean | null }
+param   = { "$" ~ ident }
+string  = @{ "'" ~ (!"'" ~ ANY)* ~ "'" | "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+number  = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+integer = @{ ASCII_DIGIT+ }
+boolean = { ^"true" | ^"false" }
+null    = { ^"null" }
+ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

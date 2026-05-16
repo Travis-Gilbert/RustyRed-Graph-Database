@@ -39,12 +39,30 @@ pub fn parse_cypher_pest(
         .next()
         .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty pest output"))?;
 
+    // The new grammar wraps clauses in `read_query` or `write_query`. Unwrap
+    // to find the body whose clauses we iterate. write_query bodies are not
+    // yet built into the AST: pa3.1.3 will add `parse_write_query`. For now
+    // we surface a typed "pending" error so callers can distinguish
+    // unsupported-yet from invalid.
+    let body_pair = query_pair
+        .into_inner()
+        .find(|p| matches!(p.as_rule(), Rule::read_query | Rule::write_query))
+        .ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "missing query body")
+        })?;
+    if matches!(body_pair.as_rule(), Rule::write_query) {
+        return Err(QuerySurfaceError::unsupported(
+            "write_clauses_pending",
+            "CREATE / MERGE / SET / DELETE parse but the AST builder lands in §P3-A pa3.1.3",
+        ));
+    }
+
     let mut pattern: Option<CypherPattern> = None;
     let mut where_filter: Option<PropertyFilter> = None;
     let mut returns: Vec<ReturnItem> = Vec::new();
     let mut limit: usize = DEFAULT_LIMIT;
 
-    for inner in query_pair.into_inner() {
+    for inner in body_pair.into_inner() {
         match inner.as_rule() {
             Rule::match_clause => {
                 pattern = Some(parse_match(inner, params)?);
@@ -62,7 +80,7 @@ pub fn parse_cypher_pest(
             other => {
                 return Err(QuerySurfaceError::invalid(
                     "invalid_cypher_query",
-                    format!("unexpected top-level rule: {other:?}"),
+                    format!("unexpected clause rule: {other:?}"),
                 ));
             }
         }
@@ -736,5 +754,55 @@ mod parse_to_ast_tests {
             parsed.returns[0],
             ReturnItem::Path { ref binding, .. } if binding == "p"
         ));
+    }
+}
+
+#[cfg(test)]
+mod write_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn grammar_parses_create_node() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_merge_with_on_create_and_on_match() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_match_set() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc {id: 'a'}) SET n.flag = true",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_match_delete() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc {id: 'a'}) DELETE n",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_match_detach_delete() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc {id: 'a'}) DETACH DELETE n",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
     }
 }
