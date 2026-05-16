@@ -22,8 +22,8 @@ pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
 pub use fulltext::{
-    make_fulltext_backend, FullTextBackend, FullTextBackendError, FullTextDesignation,
-    FullTextIndex,
+    make_fulltext_backend, make_fulltext_backend_from_value, FullTextBackend, FullTextBackendError,
+    FullTextDesignation, FullTextIndex, RUSTY_RED_FULLTEXT_BACKEND_ENV,
 };
 #[allow(deprecated)]
 pub use graph::louvain_communities;
@@ -43,6 +43,7 @@ pub use graph_store::{
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
 pub use spatial::{
-    make_spatial_backend, SpatialBackend, SpatialDesignation, SpatialError, SpatialIndex,
+    make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,
+    SpatialError, SpatialIndex, RUSTY_RED_SPATIAL_BACKEND_ENV,
 };
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};

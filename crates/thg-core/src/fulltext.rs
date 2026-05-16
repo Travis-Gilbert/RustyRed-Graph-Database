@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+/// §P5-A pa5.3: env var that selects the fulltext backend at construction time.
+pub const RUSTY_RED_FULLTEXT_BACKEND_ENV: &str = "RUSTY_RED_FULLTEXT_BACKEND";
+
+// Canonical backend-name strings; the dispatcher accepts a few aliases per kind.
+pub(crate) const FULLTEXT_BACKEND_HAND_ROLLED: &str = "hand_rolled";
+pub(crate) const FULLTEXT_BACKEND_TANTIVY: &str = "tantivy";
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FullTextDesignation {
     pub label: String,
@@ -44,7 +51,7 @@ pub struct FullTextIndex {
 /// hand-rolled `FullTextIndex` is the only impl today; a tantivy-backed
 /// implementation will sit behind a `tantivy` feature flag once the SPEC's
 /// switch is implemented.
-pub trait FullTextBackend: Send + Sync {
+pub trait FullTextBackend: Send + Sync + std::fmt::Debug {
     /// Index (or re-index) a document under `doc_id` with the given text.
     fn upsert(&mut self, doc_id: &str, text: &str);
     /// Remove a document from the index.
@@ -180,8 +187,6 @@ fn tokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    static FULLTEXT_BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn search_ranks_relevant_doc_higher() {
         let mut idx = FullTextIndex::for_designation(FullTextDesignation {
@@ -260,56 +265,40 @@ mod tests {
             label: "Doc".into(),
             property: "text".into(),
         });
-        // No `.as_ref()` / `.unwrap()` needed: the field is the value itself.
         assert_eq!(idx.designation.label, "Doc");
         assert_eq!(idx.designation.property, "text");
     }
 
-    // §P5-A pa5.3: env-switch factory.
+    // §P5-A pa5.3: env-switch factory. Tests go through the pure dispatcher so
+    // they can run in parallel without mutating the global env.
+
+    fn fixture_designation() -> FullTextDesignation {
+        FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        }
+    }
 
     #[test]
     fn make_fulltext_backend_defaults_to_hand_rolled() {
-        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
-        let backend = make_fulltext_backend(FullTextDesignation {
-            label: "Doc".into(),
-            property: "text".into(),
-        })
-        .unwrap();
+        let backend =
+            make_fulltext_backend_from_value(fixture_designation(), "").unwrap();
         assert_eq!(backend.designation().label, "Doc");
         assert_eq!(backend.doc_count(), 0);
     }
 
     #[test]
     fn make_fulltext_backend_rejects_unknown_backend() {
-        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::set_var("RUSTY_RED_FULLTEXT_BACKEND", "elastic");
-        let result = make_fulltext_backend(FullTextDesignation {
-            label: "Doc".into(),
-            property: "text".into(),
-        });
-        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
-        let err = match result {
-            Ok(_) => panic!("unknown backend should error"),
-            Err(err) => err,
-        };
+        let err = make_fulltext_backend_from_value(fixture_designation(), "elastic")
+            .expect_err("unknown backend should error");
         assert_eq!(err.code(), "unknown_fulltext_backend");
     }
 
     #[cfg(not(feature = "tantivy"))]
     #[test]
     fn make_fulltext_backend_errors_when_tantivy_requested_without_feature() {
-        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::set_var("RUSTY_RED_FULLTEXT_BACKEND", "tantivy");
-        let result = make_fulltext_backend(FullTextDesignation {
-            label: "Doc".into(),
-            property: "text".into(),
-        });
-        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
-        let err = match result {
-            Ok(_) => panic!("tantivy without feature should error"),
-            Err(err) => err,
-        };
+        let err = make_fulltext_backend_from_value(fixture_designation(), "tantivy")
+            .expect_err("tantivy without feature should error");
         assert_eq!(err.code(), "unknown_fulltext_backend");
         assert!(err.message().to_ascii_lowercase().contains("tantivy"));
     }
@@ -346,7 +335,7 @@ impl FullTextBackend for FullTextIndex {
 pub fn make_fulltext_backend(
     designation: FullTextDesignation,
 ) -> Result<Box<dyn FullTextBackend>, FullTextBackendError> {
-    let raw = std::env::var("RUSTY_RED_FULLTEXT_BACKEND").unwrap_or_default();
+    let raw = std::env::var(RUSTY_RED_FULLTEXT_BACKEND_ENV).unwrap_or_default();
     make_fulltext_backend_from_value(designation, &raw)
 }
 
@@ -360,10 +349,10 @@ pub fn make_fulltext_backend_from_value(
     raw: &str,
 ) -> Result<Box<dyn FullTextBackend>, FullTextBackendError> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "hand_rolled" | "hand-rolled" | "bm25" => {
+        "" | FULLTEXT_BACKEND_HAND_ROLLED | "hand-rolled" | "bm25" => {
             Ok(Box::new(FullTextIndex::for_designation(designation)))
         }
-        "tantivy" => {
+        FULLTEXT_BACKEND_TANTIVY => {
             #[cfg(feature = "tantivy")]
             {
                 Ok(Box::new(
@@ -380,7 +369,7 @@ pub fn make_fulltext_backend_from_value(
             }
         }
         other => Err(FullTextBackendError::UnknownBackend(format!(
-            "unknown RUSTY_RED_FULLTEXT_BACKEND value: {other}"
+            "unknown {RUSTY_RED_FULLTEXT_BACKEND_ENV} value: {other}"
         ))),
     }
 }

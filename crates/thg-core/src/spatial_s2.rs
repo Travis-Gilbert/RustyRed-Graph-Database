@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng as S2LatLng;
 
-use crate::spatial::{SpatialBackend, SpatialDesignation, SpatialError};
+use crate::spatial::{haversine_km, SpatialBackend, SpatialDesignation, SpatialError};
 
 /// S2 supports levels 0..=30. We size to H3's 0..=15 range.
 const MAX_S2_LEVEL: u64 = 30;
@@ -33,10 +33,29 @@ fn lat_lng_degrees(lat: f64, lon: f64) -> S2LatLng {
     S2LatLng::from_degrees(lat, lon)
 }
 
+/// Validate that `(lat, lon)` is a finite WGS84 coordinate. Shared by every
+/// public entry point that takes raw coordinates so the rejection logic stays
+/// in sync between writes and queries.
+fn validate_coord(lat: f64, lon: f64) -> Result<(), SpatialError> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return Err(SpatialError::InvalidCoordinate(format!(
+            "non-finite coordinate ({lat}, {lon})"
+        )));
+    }
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(SpatialError::InvalidCoordinate(format!(
+            "out-of-range coordinate ({lat}, {lon})"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct S2SpatialBackend {
     designation: SpatialDesignation,
-    cells: HashMap<u64, Vec<String>>,
+    /// node_id -> (cell_id, lat, lon). The cell_id is retained so future
+    /// optimizations (S2 RegionCoverer-based radius prefilter) can group nodes
+    /// without re-deriving the cell on every query.
     node_to_cell: HashMap<String, (u64, f64, f64)>,
     level: u64,
 }
@@ -46,7 +65,6 @@ impl S2SpatialBackend {
         let level = level_from_h3_resolution(designation.resolution);
         Self {
             designation,
-            cells: HashMap::new(),
             node_to_cell: HashMap::new(),
             level,
         }
@@ -64,37 +82,15 @@ impl SpatialBackend for S2SpatialBackend {
     }
 
     fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError> {
-        if !lat.is_finite() || !lon.is_finite() {
-            return Err(SpatialError::InvalidCoordinate(format!(
-                "non-finite coordinate ({lat}, {lon})"
-            )));
-        }
-        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-            return Err(SpatialError::InvalidCoordinate(format!(
-                "out-of-range coordinate ({lat}, {lon})"
-            )));
-        }
+        validate_coord(lat, lon)?;
         let cell = self.cell_for(lat, lon);
-        if let Some((old_cell, _, _)) = self.node_to_cell.get(node_id).copied() {
-            if let Some(vec) = self.cells.get_mut(&old_cell) {
-                vec.retain(|id| id != node_id);
-            }
-        }
-        self.cells
-            .entry(cell)
-            .or_default()
-            .push(node_id.to_string());
         self.node_to_cell
             .insert(node_id.to_string(), (cell, lat, lon));
         Ok(())
     }
 
     fn remove(&mut self, node_id: &str) {
-        if let Some((cell, _, _)) = self.node_to_cell.remove(node_id) {
-            if let Some(vec) = self.cells.get_mut(&cell) {
-                vec.retain(|id| id != node_id);
-            }
-        }
+        self.node_to_cell.remove(node_id);
     }
 
     fn radius_search(
@@ -103,11 +99,7 @@ impl SpatialBackend for S2SpatialBackend {
         lon: f64,
         radius_km: f64,
     ) -> Result<Vec<String>, SpatialError> {
-        if !lat.is_finite() || !lon.is_finite() {
-            return Err(SpatialError::InvalidCoordinate(format!(
-                "non-finite query coordinate ({lat}, {lon})"
-            )));
-        }
+        validate_coord(lat, lon)?;
         let mut out: Vec<String> = self
             .node_to_cell
             .iter()
@@ -143,16 +135,6 @@ impl SpatialBackend for S2SpatialBackend {
     fn node_count(&self) -> usize {
         self.node_to_cell.len()
     }
-}
-
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r_km = 6371.0_f64;
-    let to_rad = std::f64::consts::PI / 180.0;
-    let dlat = (lat2 - lat1) * to_rad;
-    let dlon = (lon2 - lon1) * to_rad;
-    let a = (dlat / 2.0).sin().powi(2)
-        + (lat1 * to_rad).cos() * (lat2 * to_rad).cos() * (dlon / 2.0).sin().powi(2);
-    2.0 * r_km * a.sqrt().asin()
 }
 
 #[cfg(test)]
@@ -191,19 +173,15 @@ mod tests {
     }
 
     #[test]
-    fn s2_backend_upsert_replaces_node_in_old_cell() {
+    fn s2_backend_upsert_moves_node_between_cells() {
         let mut backend = S2SpatialBackend::new(designation());
         backend.upsert("node", 37.7749, -122.4194).unwrap();
         let (old_cell, _, _) = backend.node_to_cell["node"];
         backend.upsert("node", 37.8, -120.0).unwrap();
-        let (new_cell, _, _) = backend.node_to_cell["node"];
+        let (new_cell, new_lat, new_lon) = backend.node_to_cell["node"];
         assert_ne!(old_cell, new_cell);
-        // Old cell either drained or doesn't reference the node.
-        assert!(!backend
-            .cells
-            .get(&old_cell)
-            .map(|v| v.contains(&"node".to_string()))
-            .unwrap_or(false));
+        assert_eq!(new_lat, 37.8);
+        assert_eq!(new_lon, -120.0);
     }
 
     #[test]

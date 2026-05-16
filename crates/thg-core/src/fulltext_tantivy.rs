@@ -26,7 +26,10 @@ use tantivy::{
 
 use crate::fulltext::{FullTextBackend, FullTextDesignation};
 
-const WRITER_MEMORY_BUDGET: usize = 50_000_000; // 50 MB: tantivy's recommended minimum.
+/// Tantivy 0.22's documented minimum is 15 MB; we sit right at that floor so
+/// many concurrent designations don't multiply by a much larger per-writer
+/// arena. A future bulk-upsert path can share writers across designations.
+const WRITER_MEMORY_BUDGET: usize = 15_000_000;
 
 pub struct TantivyFullTextBackend {
     designation: FullTextDesignation,
@@ -73,28 +76,38 @@ impl TantivyFullTextBackend {
     }
 }
 
-impl FullTextBackend for TantivyFullTextBackend {
-    fn upsert(&mut self, doc_id: &str, text: &str) {
-        // Delete any existing doc with the same id, then re-add. tantivy's
-        // delete_term takes the indexed term; we use the doc_id field (STRING
-        // tokenization keeps the value exact-match).
+impl TantivyFullTextBackend {
+    /// Delete any existing doc with the given id; STRING tokenization on
+    /// `doc_id_field` keeps the term match exact. The companion `commit_now`
+    /// flushes to a segment so the next `searcher()` sees the change — that
+    /// matches the `FullTextBackend` write-then-read contract.
+    fn delete_doc_id(&mut self, doc_id: &str) {
         let term = Term::from_field_text(self.doc_id_field, doc_id);
         let _ = self.writer.delete_term(term);
+    }
+
+    /// commit-per-write keeps the `FullTextBackend` contract honest; the
+    /// tradeoff (commit() is hundreds of ms per write) is documented at the
+    /// top of the file.
+    fn commit_now(&mut self) {
+        let _ = self.writer.commit();
+        let _ = self.reader.reload();
+    }
+}
+
+impl FullTextBackend for TantivyFullTextBackend {
+    fn upsert(&mut self, doc_id: &str, text: &str) {
+        self.delete_doc_id(doc_id);
         let _ = self.writer.add_document(doc!(
             self.doc_id_field => doc_id,
             self.text_field => text,
         ));
-        // commit-per-write keeps the FullTextBackend contract honest. Tradeoff
-        // documented at the top of the file.
-        let _ = self.writer.commit();
-        let _ = self.reader.reload();
+        self.commit_now();
     }
 
     fn remove(&mut self, doc_id: &str) {
-        let term = Term::from_field_text(self.doc_id_field, doc_id);
-        let _ = self.writer.delete_term(term);
-        let _ = self.writer.commit();
-        let _ = self.reader.reload();
+        self.delete_doc_id(doc_id);
+        self.commit_now();
     }
 
     fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {

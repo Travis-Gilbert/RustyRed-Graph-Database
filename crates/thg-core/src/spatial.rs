@@ -12,6 +12,13 @@ use std::collections::HashMap;
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::{Deserialize, Serialize};
 
+/// §P8-A pa8.3: env var that selects the spatial backend at construction time.
+pub const RUSTY_RED_SPATIAL_BACKEND_ENV: &str = "RUSTY_RED_SPATIAL_BACKEND";
+
+// Canonical backend-name strings; the dispatcher accepts a few aliases per kind.
+pub(crate) const SPATIAL_BACKEND_H3: &str = "h3";
+pub(crate) const SPATIAL_BACKEND_S2: &str = "s2";
+
 /// One spatial designation: a (lat, lon) property pair on a label that
 /// should be H3-indexed at a given resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,7 +31,7 @@ pub struct SpatialDesignation {
 
 /// §P8-A pa8.1: trait abstraction over the spatial storage layer. H3 is the
 /// default impl; an S2-cell impl lives behind the `s2` feature flag.
-pub trait SpatialBackend: Send + Sync {
+pub trait SpatialBackend: Send + Sync + std::fmt::Debug {
     fn designation(&self) -> &SpatialDesignation;
     fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError>;
     fn remove(&mut self, node_id: &str);
@@ -44,8 +51,10 @@ pub trait SpatialBackend: Send + Sync {
 #[derive(Debug)]
 pub struct SpatialIndex {
     pub designation: SpatialDesignation,
-    pub cells: HashMap<CellIndex, Vec<String>>,
-    pub node_to_cell: HashMap<String, (CellIndex, f64, f64)>, // node_id -> (cell, lat, lon)
+    // Storage is `pub(crate)` so other `thg-core` modules (and tests in this
+    // file) can inspect it, while external crates must go through the trait.
+    pub(crate) cells: HashMap<CellIndex, Vec<String>>,
+    pub(crate) node_to_cell: HashMap<String, (CellIndex, f64, f64)>, // node_id -> (cell, lat, lon)
 }
 
 impl SpatialIndex {
@@ -175,7 +184,9 @@ impl SpatialError {
     }
 }
 
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+/// Haversine distance between two (lat, lon) points, in kilometers. Shared by
+/// both spatial backends (H3 here, S2 in `spatial_s2.rs`).
+pub(crate) fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let r_km = 6371.0_f64;
     let to_rad = std::f64::consts::PI / 180.0;
     let dlat = (lat2 - lat1) * to_rad;
@@ -188,8 +199,6 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static SPATIAL_BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn radius_search_includes_close_points_only() {
@@ -278,56 +287,38 @@ mod tests {
             lon_property: "lon".into(),
             resolution: 7,
         });
-        // No `.as_ref()` / `.unwrap()` needed.
         assert_eq!(idx.designation.label, "Place");
         assert_eq!(idx.designation.resolution, 7);
     }
 
-    #[test]
-    fn make_spatial_backend_defaults_to_h3() {
-        // No RUSTY_RED_SPATIAL_BACKEND env var set => hand-rolled H3.
-        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
-        let backend = make_spatial_backend(SpatialDesignation {
+    fn fixture_designation() -> SpatialDesignation {
+        SpatialDesignation {
             label: "Place".into(),
             lat_property: "lat".into(),
             lon_property: "lon".into(),
             resolution: 7,
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn make_spatial_backend_defaults_to_h3() {
+        let backend =
+            make_spatial_backend_from_value(fixture_designation(), "").unwrap();
         assert_eq!(backend.designation().label, "Place");
     }
 
     #[test]
     fn make_spatial_backend_rejects_unknown_backend() {
-        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::set_var("RUSTY_RED_SPATIAL_BACKEND", "rtree");
-        let result = make_spatial_backend(SpatialDesignation {
-            label: "Place".into(),
-            lat_property: "lat".into(),
-            lon_property: "lon".into(),
-            resolution: 7,
-        });
-        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
-        assert!(result.is_err());
+        let err = make_spatial_backend_from_value(fixture_designation(), "rtree")
+            .expect_err("unknown backend should error");
+        assert_eq!(err.code(), "unknown_spatial_backend");
     }
 
     #[cfg(not(feature = "s2"))]
     #[test]
     fn make_spatial_backend_errors_when_s2_requested_without_feature() {
-        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
-        std::env::set_var("RUSTY_RED_SPATIAL_BACKEND", "s2");
-        let result = make_spatial_backend(SpatialDesignation {
-            label: "Place".into(),
-            lat_property: "lat".into(),
-            lon_property: "lon".into(),
-            resolution: 7,
-        });
-        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
-        let err = match result {
-            Ok(_) => panic!("s2 backend without feature should error"),
-            Err(err) => err,
-        };
+        let err = make_spatial_backend_from_value(fixture_designation(), "s2")
+            .expect_err("s2 backend without feature should error");
         assert_eq!(err.code(), "unknown_spatial_backend");
         assert!(err.message().to_ascii_lowercase().contains("s2"));
     }
@@ -368,18 +359,28 @@ impl SpatialBackend for SpatialIndex {
 }
 
 /// §P8-A pa8.3: env-switch factory. Reads `RUSTY_RED_SPATIAL_BACKEND` and
-/// returns the corresponding boxed backend. Default ("" / "h3" / "hand_rolled")
-/// returns the H3 impl. `"s2"` returns the S2 impl when compiled with
-/// `--features s2`; otherwise an explicit error so the caller knows to rebuild.
+/// forwards to the pure dispatcher below.
 pub fn make_spatial_backend(
     designation: SpatialDesignation,
 ) -> Result<Box<dyn SpatialBackend>, SpatialError> {
-    let raw = std::env::var("RUSTY_RED_SPATIAL_BACKEND").unwrap_or_default();
+    let raw = std::env::var(RUSTY_RED_SPATIAL_BACKEND_ENV).unwrap_or_default();
+    make_spatial_backend_from_value(designation, &raw)
+}
+
+/// Pure dispatcher: takes the env-var value as an explicit parameter so unit
+/// tests can run in parallel without mutating global state. Default ("" /
+/// "h3" / "hand_rolled" / "hand-rolled") returns the H3 impl. `"s2"` returns
+/// the S2 impl when compiled with `--features s2`; otherwise an explicit
+/// error so the caller knows to rebuild.
+pub fn make_spatial_backend_from_value(
+    designation: SpatialDesignation,
+    raw: &str,
+) -> Result<Box<dyn SpatialBackend>, SpatialError> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "h3" | "hand_rolled" | "hand-rolled" => {
+        "" | SPATIAL_BACKEND_H3 | "hand_rolled" | "hand-rolled" => {
             Ok(Box::new(SpatialIndex::for_designation(designation)))
         }
-        "s2" => {
+        SPATIAL_BACKEND_S2 => {
             #[cfg(feature = "s2")]
             {
                 Ok(Box::new(crate::spatial_s2::S2SpatialBackend::new(
@@ -395,7 +396,7 @@ pub fn make_spatial_backend(
             }
         }
         other => Err(SpatialError::UnknownBackend(format!(
-            "unknown RUSTY_RED_SPATIAL_BACKEND value: {other}"
+            "unknown {RUSTY_RED_SPATIAL_BACKEND_ENV} value: {other}"
         ))),
     }
 }
