@@ -44,7 +44,7 @@ pub struct FullTextIndex {
 /// hand-rolled `FullTextIndex` is the only impl today; a tantivy-backed
 /// implementation will sit behind a `tantivy` feature flag once the SPEC's
 /// switch is implemented.
-pub trait FullTextBackend {
+pub trait FullTextBackend: Send + Sync {
     /// Index (or re-index) a document under `doc_id` with the given text.
     fn upsert(&mut self, doc_id: &str, text: &str);
     /// Remove a document from the index.
@@ -180,6 +180,8 @@ fn tokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    static FULLTEXT_BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn search_ranks_relevant_doc_higher() {
         let mut idx = FullTextIndex::for_designation(FullTextDesignation {
@@ -262,10 +264,59 @@ mod tests {
         assert_eq!(idx.designation.label, "Doc");
         assert_eq!(idx.designation.property, "text");
     }
+
+    // §P5-A pa5.3: env-switch factory.
+
+    #[test]
+    fn make_fulltext_backend_defaults_to_hand_rolled() {
+        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
+        let backend = make_fulltext_backend(FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        })
+        .unwrap();
+        assert_eq!(backend.designation().label, "Doc");
+        assert_eq!(backend.doc_count(), 0);
+    }
+
+    #[test]
+    fn make_fulltext_backend_rejects_unknown_backend() {
+        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTY_RED_FULLTEXT_BACKEND", "elastic");
+        let result = make_fulltext_backend(FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        });
+        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
+        let err = match result {
+            Ok(_) => panic!("unknown backend should error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "unknown_fulltext_backend");
+    }
+
+    #[cfg(not(feature = "tantivy"))]
+    #[test]
+    fn make_fulltext_backend_errors_when_tantivy_requested_without_feature() {
+        let _guard = FULLTEXT_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTY_RED_FULLTEXT_BACKEND", "tantivy");
+        let result = make_fulltext_backend(FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        });
+        std::env::remove_var("RUSTY_RED_FULLTEXT_BACKEND");
+        let err = match result {
+            Ok(_) => panic!("tantivy without feature should error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "unknown_fulltext_backend");
+        assert!(err.message().to_ascii_lowercase().contains("tantivy"));
+    }
 }
 
-// §P5-A pa5.1: the hand-rolled backend wired through the trait. Until the
-// optional tantivy backend lands, this is the only `FullTextBackend` impl.
+// §P5-A pa5.1: the hand-rolled backend wired through the trait. The tantivy
+// alternative lives in `crate::fulltext_tantivy` behind the `tantivy` feature.
 impl FullTextBackend for FullTextIndex {
     fn upsert(&mut self, doc_id: &str, text: &str) {
         FullTextIndex::upsert(self, doc_id, text);
@@ -287,3 +338,78 @@ impl FullTextBackend for FullTextIndex {
         FullTextIndex::doc_count(self)
     }
 }
+
+/// §P5-A pa5.3: env-switch factory. Reads `RUSTY_RED_FULLTEXT_BACKEND` and
+/// forwards to the pure dispatcher below. The pure dispatcher exists so unit
+/// tests can exercise every code path without racing on a process-global env
+/// var; this thin wrapper is the production entry point.
+pub fn make_fulltext_backend(
+    designation: FullTextDesignation,
+) -> Result<Box<dyn FullTextBackend>, FullTextBackendError> {
+    let raw = std::env::var("RUSTY_RED_FULLTEXT_BACKEND").unwrap_or_default();
+    make_fulltext_backend_from_value(designation, &raw)
+}
+
+/// Pure dispatcher; takes the env-var value as an explicit parameter so unit
+/// tests can run in parallel without mutating global state. Default ("" /
+/// "hand_rolled" / "hand-rolled" / "bm25") returns the BM25 impl. `"tantivy"`
+/// returns the tantivy-backed impl when compiled with `--features tantivy`;
+/// otherwise an explicit error so the caller knows to rebuild.
+pub fn make_fulltext_backend_from_value(
+    designation: FullTextDesignation,
+    raw: &str,
+) -> Result<Box<dyn FullTextBackend>, FullTextBackendError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "hand_rolled" | "hand-rolled" | "bm25" => {
+            Ok(Box::new(FullTextIndex::for_designation(designation)))
+        }
+        "tantivy" => {
+            #[cfg(feature = "tantivy")]
+            {
+                Ok(Box::new(
+                    crate::fulltext_tantivy::TantivyFullTextBackend::new(designation)
+                        .map_err(FullTextBackendError::TantivyInit)?,
+                ))
+            }
+            #[cfg(not(feature = "tantivy"))]
+            {
+                let _ = designation;
+                Err(FullTextBackendError::UnknownBackend(
+                    "tantivy backend requires building with --features tantivy".to_string(),
+                ))
+            }
+        }
+        other => Err(FullTextBackendError::UnknownBackend(format!(
+            "unknown RUSTY_RED_FULLTEXT_BACKEND value: {other}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FullTextBackendError {
+    UnknownBackend(String),
+    TantivyInit(String),
+}
+
+impl FullTextBackendError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownBackend(_) => "unknown_fulltext_backend",
+            Self::TantivyInit(_) => "tantivy_init_failed",
+        }
+    }
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownBackend(s) => s.clone(),
+            Self::TantivyInit(s) => format!("tantivy initialization failed: {s}"),
+        }
+    }
+}
+
+impl std::fmt::Display for FullTextBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for FullTextBackendError {}

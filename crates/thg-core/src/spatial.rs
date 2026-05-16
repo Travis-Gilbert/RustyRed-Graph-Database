@@ -22,9 +22,28 @@ pub struct SpatialDesignation {
     pub resolution: u8,
 }
 
-#[derive(Debug, Default)]
+/// §P8-A pa8.1: trait abstraction over the spatial storage layer. H3 is the
+/// default impl; an S2-cell impl lives behind the `s2` feature flag.
+pub trait SpatialBackend: Send + Sync {
+    fn designation(&self) -> &SpatialDesignation;
+    fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError>;
+    fn remove(&mut self, node_id: &str);
+    fn radius_search(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> Result<Vec<String>, SpatialError>;
+    fn bbox_search(&self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Vec<String>;
+    fn node_count(&self) -> usize;
+}
+
+/// §cc.3 (spatial half): designation is now a required, owned field. The
+/// per-tenant map keys already carry (label, lat_property, lon_property),
+/// so wrapping the designation in `Option` was redundant.
+#[derive(Debug)]
 pub struct SpatialIndex {
-    pub designation: Option<SpatialDesignation>,
+    pub designation: SpatialDesignation,
     pub cells: HashMap<CellIndex, Vec<String>>,
     pub node_to_cell: HashMap<String, (CellIndex, f64, f64)>, // node_id -> (cell, lat, lon)
 }
@@ -32,14 +51,14 @@ pub struct SpatialIndex {
 impl SpatialIndex {
     pub fn for_designation(d: SpatialDesignation) -> Self {
         Self {
-            designation: Some(d),
+            designation: d,
             cells: HashMap::new(),
             node_to_cell: HashMap::new(),
         }
     }
 
     pub fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<CellIndex, SpatialError> {
-        let res = self.designation.as_ref().map(|d| d.resolution).unwrap_or(8);
+        let res = self.designation.resolution;
         let resolution =
             Resolution::try_from(res).map_err(|_| SpatialError::InvalidResolution(res))?;
         let cell = LatLng::new(lat, lon)
@@ -76,7 +95,7 @@ impl SpatialIndex {
         lon: f64,
         radius_km: f64,
     ) -> Result<Vec<String>, SpatialError> {
-        let res = self.designation.as_ref().map(|d| d.resolution).unwrap_or(8);
+        let res = self.designation.resolution;
         let resolution =
             Resolution::try_from(res).map_err(|_| SpatialError::InvalidResolution(res))?;
         let center_ll = LatLng::new(lat, lon)
@@ -134,6 +153,9 @@ impl SpatialIndex {
 pub enum SpatialError {
     InvalidResolution(u8),
     InvalidCoordinate(String),
+    /// §P8-A pa8.3: env-switch selected a backend that isn't compiled in,
+    /// or used an unknown name.
+    UnknownBackend(String),
 }
 
 impl SpatialError {
@@ -141,12 +163,14 @@ impl SpatialError {
         match self {
             Self::InvalidResolution(_) => "invalid_resolution",
             Self::InvalidCoordinate(_) => "invalid_coordinate",
+            Self::UnknownBackend(_) => "unknown_spatial_backend",
         }
     }
     pub fn message(&self) -> String {
         match self {
             Self::InvalidResolution(r) => format!("H3 resolution {r} is outside 0..=15"),
             Self::InvalidCoordinate(s) => format!("invalid coordinate: {s}"),
+            Self::UnknownBackend(s) => format!("unknown spatial backend: {s}"),
         }
     }
 }
@@ -164,6 +188,8 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static SPATIAL_BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn radius_search_includes_close_points_only() {
@@ -222,5 +248,154 @@ mod tests {
             .get(&old_cell)
             .map(|v| v.contains(&"node".to_string()))
             .unwrap_or(false));
+    }
+
+    // §P8-A pa8.1 + cc.3 (spatial): backend trait + designation-required tests.
+
+    #[test]
+    fn h3_spatial_index_implements_spatial_backend_trait() {
+        let designation = SpatialDesignation {
+            label: "Place".into(),
+            lat_property: "lat".into(),
+            lon_property: "lon".into(),
+            resolution: 7,
+        };
+        let mut backend: Box<dyn SpatialBackend> =
+            Box::new(SpatialIndex::for_designation(designation));
+        SpatialBackend::upsert(backend.as_mut(), "sf", 37.7749, -122.4194).unwrap();
+        SpatialBackend::upsert(backend.as_mut(), "oak", 37.8044, -122.2712).unwrap();
+        let near = backend.radius_search(37.7749, -122.4194, 50.0).unwrap();
+        assert!(near.contains(&"sf".to_string()));
+        assert!(near.contains(&"oak".to_string()));
+        assert_eq!(backend.node_count(), 2);
+    }
+
+    #[test]
+    fn spatial_designation_is_owned_value_not_optional() {
+        let idx = SpatialIndex::for_designation(SpatialDesignation {
+            label: "Place".into(),
+            lat_property: "lat".into(),
+            lon_property: "lon".into(),
+            resolution: 7,
+        });
+        // No `.as_ref()` / `.unwrap()` needed.
+        assert_eq!(idx.designation.label, "Place");
+        assert_eq!(idx.designation.resolution, 7);
+    }
+
+    #[test]
+    fn make_spatial_backend_defaults_to_h3() {
+        // No RUSTY_RED_SPATIAL_BACKEND env var set => hand-rolled H3.
+        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
+        let backend = make_spatial_backend(SpatialDesignation {
+            label: "Place".into(),
+            lat_property: "lat".into(),
+            lon_property: "lon".into(),
+            resolution: 7,
+        })
+        .unwrap();
+        assert_eq!(backend.designation().label, "Place");
+    }
+
+    #[test]
+    fn make_spatial_backend_rejects_unknown_backend() {
+        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTY_RED_SPATIAL_BACKEND", "rtree");
+        let result = make_spatial_backend(SpatialDesignation {
+            label: "Place".into(),
+            lat_property: "lat".into(),
+            lon_property: "lon".into(),
+            resolution: 7,
+        });
+        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
+        assert!(result.is_err());
+    }
+
+    #[cfg(not(feature = "s2"))]
+    #[test]
+    fn make_spatial_backend_errors_when_s2_requested_without_feature() {
+        let _guard = SPATIAL_BACKEND_ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTY_RED_SPATIAL_BACKEND", "s2");
+        let result = make_spatial_backend(SpatialDesignation {
+            label: "Place".into(),
+            lat_property: "lat".into(),
+            lon_property: "lon".into(),
+            resolution: 7,
+        });
+        std::env::remove_var("RUSTY_RED_SPATIAL_BACKEND");
+        let err = match result {
+            Ok(_) => panic!("s2 backend without feature should error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "unknown_spatial_backend");
+        assert!(err.message().to_ascii_lowercase().contains("s2"));
+    }
+}
+
+// §P8-A pa8.1: SpatialBackend trait impl for the default (H3) index. Signature
+// matches the existing inherent `upsert`/`remove`/etc., minus the cell-return
+// detail (the trait returns `()`).
+impl SpatialBackend for SpatialIndex {
+    fn designation(&self) -> &SpatialDesignation {
+        &self.designation
+    }
+
+    fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError> {
+        SpatialIndex::upsert(self, node_id, lat, lon).map(|_| ())
+    }
+
+    fn remove(&mut self, node_id: &str) {
+        SpatialIndex::remove(self, node_id);
+    }
+
+    fn radius_search(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> Result<Vec<String>, SpatialError> {
+        SpatialIndex::radius_search(self, lat, lon, radius_km)
+    }
+
+    fn bbox_search(&self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Vec<String> {
+        SpatialIndex::bbox_search(self, min_lat, min_lon, max_lat, max_lon)
+    }
+
+    fn node_count(&self) -> usize {
+        self.node_to_cell.len()
+    }
+}
+
+/// §P8-A pa8.3: env-switch factory. Reads `RUSTY_RED_SPATIAL_BACKEND` and
+/// returns the corresponding boxed backend. Default ("" / "h3" / "hand_rolled")
+/// returns the H3 impl. `"s2"` returns the S2 impl when compiled with
+/// `--features s2`; otherwise an explicit error so the caller knows to rebuild.
+pub fn make_spatial_backend(
+    designation: SpatialDesignation,
+) -> Result<Box<dyn SpatialBackend>, SpatialError> {
+    let raw = std::env::var("RUSTY_RED_SPATIAL_BACKEND").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "h3" | "hand_rolled" | "hand-rolled" => {
+            Ok(Box::new(SpatialIndex::for_designation(designation)))
+        }
+        "s2" => {
+            #[cfg(feature = "s2")]
+            {
+                Ok(Box::new(crate::spatial_s2::S2SpatialBackend::new(
+                    designation,
+                )))
+            }
+            #[cfg(not(feature = "s2"))]
+            {
+                let _ = designation;
+                Err(SpatialError::UnknownBackend(
+                    "s2 backend requires building with --features s2".to_string(),
+                ))
+            }
+        }
+        other => Err(SpatialError::UnknownBackend(format!(
+            "unknown RUSTY_RED_SPATIAL_BACKEND value: {other}"
+        ))),
     }
 }

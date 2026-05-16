@@ -8,16 +8,23 @@ pub mod commands;
 pub mod errors;
 pub mod executor;
 pub mod fulltext;
+#[cfg(feature = "tantivy")]
+pub mod fulltext_tantivy;
 pub mod graph;
 pub mod graph_store;
 pub mod spatial;
+#[cfg(feature = "s2")]
+pub mod spatial_s2;
 pub mod state;
 pub mod store;
 
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
-pub use fulltext::{FullTextBackend, FullTextDesignation, FullTextIndex};
+pub use fulltext::{
+    make_fulltext_backend, FullTextBackend, FullTextBackendError, FullTextDesignation,
+    FullTextIndex,
+};
 #[allow(deprecated)]
 pub use graph::louvain_communities;
 pub use graph::{
@@ -35,5 +42,7 @@ pub use graph_store::{
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
-pub use spatial::{SpatialDesignation, SpatialError, SpatialIndex};
+pub use spatial::{
+    make_spatial_backend, SpatialBackend, SpatialDesignation, SpatialError, SpatialIndex,
+};
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};

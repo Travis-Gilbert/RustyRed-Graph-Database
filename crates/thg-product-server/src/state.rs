@@ -9,11 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use thg_core::store::RedisThgStore;
 use thg_core::{
-    sanitize_tenant_segment, EdgeRecord, EpistemicType, FullTextDesignation, FullTextIndex,
-    GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphStats, GraphStoreError,
-    GraphStoreResult, GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
-    RedisGraphStore, SpatialDesignation, SpatialIndex, VectorDesignation, VerifyReport,
+    make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
+    EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
+    GraphRebuildReport, GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction,
+    GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
+    SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
@@ -33,11 +34,12 @@ struct GraphTransactionContext {
 
 /// Per-tenant Phase 8 spatial indexes. Keyed by tenant_id then by
 /// (label, lat_property, lon_property).
-type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), SpatialIndex>>;
+type SpatialIndexes =
+    BTreeMap<String, BTreeMap<(String, String, String), Box<dyn SpatialBackend>>>;
 
 /// Per-tenant Phase 5 full-text indexes. Keyed by tenant_id then by
 /// (label, property).
-type FullTextIndexes = BTreeMap<String, BTreeMap<(String, String), FullTextIndex>>;
+type FullTextIndexes = BTreeMap<String, BTreeMap<(String, String), Box<dyn FullTextBackend>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -83,7 +85,12 @@ impl AppState {
             label: label.to_string(),
             property: property.to_string(),
         };
-        let mut index = FullTextIndex::for_designation(designation);
+        // §P5-A pa5.3: env switch resolves at backend construction time so
+        // each `/fulltext/designate` call honors the current
+        // RUSTY_RED_FULLTEXT_BACKEND setting. Default is the hand-rolled BM25;
+        // `tantivy` selects the tantivy-backed impl when the feature is built.
+        let mut index = make_fulltext_backend(designation)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))?;
         // Bulk-index any existing nodes for the label.
         let nodes = store
             .query_nodes(NodeQuery {
@@ -199,7 +206,12 @@ impl AppState {
             lon_property: lon_property.to_string(),
             resolution,
         };
-        let mut index = SpatialIndex::for_designation(designation.clone());
+        // §P8-A pa8.3: env switch resolves at backend construction time so
+        // each `/spatial/designate` call honors the current
+        // RUSTY_RED_SPATIAL_BACKEND setting. Default is the H3 impl; `s2`
+        // selects the S2-cell impl when the feature is built.
+        let mut index: Box<dyn SpatialBackend> = make_spatial_backend(designation.clone())
+            .map_err(|err| StoreAccessError::unsupported(err.message()))?;
         // Bulk-index any existing nodes for the label.
         let nodes = store
             .query_nodes(NodeQuery {
@@ -212,7 +224,7 @@ impl AppState {
                 node.properties.get(lat_property).and_then(|v| v.as_f64()),
                 node.properties.get(lon_property).and_then(|v| v.as_f64()),
             ) {
-                let _ = index.upsert(&node.id, lat, lon);
+                let _ = SpatialBackend::upsert(index.as_mut(), &node.id, lat, lon);
             }
         }
         let mut indexes = self
@@ -246,7 +258,7 @@ impl AppState {
             let lat = node.properties.get(lat_prop).and_then(|v| v.as_f64());
             let lon = node.properties.get(lon_prop).and_then(|v| v.as_f64());
             if let (Some(lat), Some(lon)) = (lat, lon) {
-                let _ = index.upsert(&node.id, lat, lon);
+                let _ = SpatialBackend::upsert(index.as_mut(), &node.id, lat, lon);
             }
         }
     }
@@ -1416,9 +1428,7 @@ impl McpGraphBackend for TenantGraphStore {
         ))
     }
 
-    fn algo_communities(
-        &self,
-    ) -> GraphStoreResult<(std::collections::HashMap<String, u64>, f64)> {
+    fn algo_communities(&self) -> GraphStoreResult<(std::collections::HashMap<String, u64>, f64)> {
         let edges = self.list_edges_arc()?;
         Ok(thg_core::label_propagation_communities(edges.as_slice()))
     }
