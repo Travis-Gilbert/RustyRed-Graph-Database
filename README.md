@@ -156,13 +156,13 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 |------|-------------|
 | `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
 | `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
-| `thg.algorithm.ppr` / `thg.algorithm.components` / `thg.algorithm.pagerank` / `thg.algorithm.communities` | Graph algorithms, with communities reported honestly as label propagation |
-| `thg.fulltext.search` / `thg.spatial.radius` / `thg.spatial.bbox` | Full-text and spatial read surfaces |
+| `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms (PPR, connected components, PageRank, label-propagation communities). §P6-B SPEC names accepted as aliases. |
+| `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces. §P6-B SPEC names accepted as aliases. |
 | `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
 | `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
 | `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
 | `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
-| `thg.fulltext.designate` / `thg.spatial.designate` / `thg.bulk.nodes` / `thg.bulk.edges` | Write-mode-only designation and bulk ingest tools |
+| `thg.fulltext.designate` (alias: `thg.graph.fulltext.designate`) / `thg.spatial.designate` (`thg.graph.spatial.designate`) / `thg.bulk.nodes` (`thg.graph.bulk.nodes`) / `thg.bulk.edges` (`thg.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools. §P6-B SPEC names accepted as aliases. |
 | `thg.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
 
 The public query surface is now split cleanly:

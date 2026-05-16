@@ -518,7 +518,7 @@ fn call_tool<P: McpGraphProvider>(
         "thg.algorithm.communities" | "thg.algo.communities" => {
             algorithm_communities_payload(&tenant, &backend)?
         }
-        "thg.fulltext.search" => {
+        "thg.fulltext.search" | "thg.graph.fulltext.search" => {
             let property = required_str(&arguments, "property", name)?;
             let query = required_str(&arguments, "query", name)?;
             let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
@@ -530,13 +530,13 @@ fn call_tool<P: McpGraphProvider>(
                 "stats": { "returned": results.len(), "k": k }
             })
         }
-        "thg.fulltext.designate" if config.read_only => {
+        "thg.fulltext.designate" | "thg.graph.fulltext.designate" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
                 "message": "Write tools are unavailable while read-only mode is active."
             })))
         }
-        "thg.fulltext.designate" => {
+        "thg.fulltext.designate" | "thg.graph.fulltext.designate" => {
             let label = required_str(&arguments, "label", name)?;
             let property = required_str(&arguments, "property", name)?;
             backend.designate_fulltext_property(label, property)?;
@@ -545,7 +545,7 @@ fn call_tool<P: McpGraphProvider>(
                 "designated": { "label": label, "property": property }
             })
         }
-        "thg.spatial.radius" => {
+        "thg.spatial.radius" | "thg.graph.spatial.radius" => {
             let label = required_str(&arguments, "label", name)?;
             let lat_property = required_str(&arguments, "lat_property", name)?;
             let lon_property = required_str(&arguments, "lon_property", name)?;
@@ -566,7 +566,7 @@ fn call_tool<P: McpGraphProvider>(
                 "stats": { "returned": node_ids.len() }
             })
         }
-        "thg.spatial.bbox" => {
+        "thg.spatial.bbox" | "thg.graph.spatial.bbox" => {
             let label = required_str(&arguments, "label", name)?;
             let lat_property = required_str(&arguments, "lat_property", name)?;
             let lon_property = required_str(&arguments, "lon_property", name)?;
@@ -589,13 +589,13 @@ fn call_tool<P: McpGraphProvider>(
                 "stats": { "returned": node_ids.len() }
             })
         }
-        "thg.spatial.designate" if config.read_only => {
+        "thg.spatial.designate" | "thg.graph.spatial.designate" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
                 "message": "Write tools are unavailable while read-only mode is active."
             })))
         }
-        "thg.spatial.designate" => {
+        "thg.spatial.designate" | "thg.graph.spatial.designate" => {
             let label = required_str(&arguments, "label", name)?;
             let lat_property = required_str(&arguments, "lat_property", name)?;
             let lon_property = required_str(&arguments, "lon_property", name)?;
@@ -615,13 +615,13 @@ fn call_tool<P: McpGraphProvider>(
                 }
             })
         }
-        "thg.bulk.nodes" if config.read_only => {
+        "thg.bulk.nodes" | "thg.graph.bulk.nodes" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
                 "message": "Write tools are unavailable while read-only mode is active."
             })))
         }
-        "thg.bulk.nodes" => {
+        "thg.bulk.nodes" | "thg.graph.bulk.nodes" => {
             let records = arguments
                 .get("nodes")
                 .or_else(|| arguments.get("records"))
@@ -655,13 +655,13 @@ fn call_tool<P: McpGraphProvider>(
                 "errors": errors,
             })
         }
-        "thg.bulk.edges" if config.read_only => {
+        "thg.bulk.edges" | "thg.graph.bulk.edges" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
                 "message": "Write tools are unavailable while read-only mode is active."
             })))
         }
-        "thg.bulk.edges" => {
+        "thg.bulk.edges" | "thg.graph.bulk.edges" => {
             let records = arguments
                 .get("edges")
                 .or_else(|| arguments.get("records"))
