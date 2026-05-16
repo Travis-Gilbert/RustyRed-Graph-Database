@@ -16,7 +16,8 @@ pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
 pub use graph::{
-    expand_bounded, expand_bounded_weighted, paths_shortest, paths_shortest_weighted, EdgeTuple,
+    connected_components, expand_bounded, expand_bounded_weighted, louvain_communities, pagerank,
+    paths_shortest, paths_shortest_weighted, personalized_pagerank, EdgeTuple,
 };
 pub use graph_store::{
     manifest_version_compatible, read_manifest, sanitize_tenant_segment, Direction, EdgeRecord,

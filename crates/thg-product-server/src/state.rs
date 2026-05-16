@@ -525,6 +525,12 @@ impl RedCoreTenantExecutor {
         self.with_snapshot(|snapshot| snapshot.property_keys())
     }
 
+    /// Phase 6: snapshot all live edges for graph-algorithm endpoints.
+    /// Returns a clone of the edge vector; caller must not hold a lock.
+    pub fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        self.with_snapshot(|snapshot| snapshot.snapshot().edges)
+    }
+
     pub fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -734,6 +740,18 @@ impl TenantGraphStore {
         match self {
             Self::RedCore(store) => store.property_keys(),
             Self::Redis(store) => store.property_keys(),
+        }
+    }
+
+    /// Phase 6: snapshot all live edges for graph algorithms.
+    /// Redis backend is currently unsupported (would require a full scan).
+    pub fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        match self {
+            Self::RedCore(store) => store.list_edges(),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "graph algorithms are not supported on Redis graph stores",
+            )),
         }
     }
 

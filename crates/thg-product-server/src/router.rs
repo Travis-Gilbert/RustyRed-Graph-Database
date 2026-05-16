@@ -269,6 +269,22 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/graph/epistemic-neighbors",
             post(graph_epistemic_neighbors),
         )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/ppr",
+            post(graph_algorithm_ppr),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/components",
+            post(graph_algorithm_components),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/pagerank",
+            post(graph_algorithm_pagerank),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/communities",
+            post(graph_algorithm_communities),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -2054,6 +2070,247 @@ fn mcp_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
     allowed_origins.iter().any(|allowed| {
         allowed == "*" || allowed.trim_end_matches('/') == origin.trim_end_matches('/')
     })
+}
+
+// ===== Phase 6: Graph algorithm endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct PprBody {
+    seeds: std::collections::HashMap<String, f64>,
+    #[serde(default = "default_ppr_alpha")]
+    alpha: f64,
+    #[serde(default = "default_ppr_epsilon")]
+    epsilon: f64,
+    #[serde(default = "default_ppr_max_pushes")]
+    max_pushes: usize,
+    #[serde(default)]
+    top_k: Option<usize>,
+}
+
+fn default_ppr_alpha() -> f64 {
+    0.15
+}
+fn default_ppr_epsilon() -> f64 {
+    1e-4
+}
+fn default_ppr_max_pushes() -> usize {
+    200_000
+}
+
+#[derive(Debug, Deserialize)]
+struct ComponentsBody {
+    #[serde(default)]
+    directed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageRankBody {
+    #[serde(default = "default_pr_damping")]
+    damping: f64,
+    #[serde(default = "default_pr_max_iter")]
+    max_iter: usize,
+    #[serde(default = "default_pr_tolerance")]
+    tolerance: f64,
+    #[serde(default)]
+    top_k: Option<usize>,
+}
+
+fn default_pr_damping() -> f64 {
+    0.85
+}
+fn default_pr_max_iter() -> usize {
+    100
+}
+fn default_pr_tolerance() -> f64 {
+    1e-6
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CommunitiesBody {}
+
+async fn graph_algorithm_ppr(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<PprBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let edges = match store.list_edges() {
+        Ok(e) => e,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let mut adjacency: std::collections::HashMap<String, Vec<(String, f64)>> =
+        std::collections::HashMap::new();
+    for edge in edges.iter() {
+        if edge.tombstone {
+            continue;
+        }
+        adjacency
+            .entry(edge.from_id.clone())
+            .or_default()
+            .push((edge.to_id.clone(), edge.effective_confidence()));
+    }
+    state.observability.record_ppr();
+    let scores = thg_core::personalized_pagerank(
+        &adjacency,
+        &body.seeds,
+        body.alpha,
+        body.epsilon,
+        body.max_pushes,
+    );
+    let mut entries: Vec<(String, f64)> = scores.into_iter().collect();
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(k) = body.top_k {
+        entries.truncate(k);
+    }
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "alpha": body.alpha,
+        "epsilon": body.epsilon,
+        "scores": entries
+            .into_iter()
+            .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+async fn graph_algorithm_components(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ComponentsBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let edges = match store.list_edges() {
+        Ok(e) => e,
+        Err(error) => return graph_store_error_response(error),
+    };
+    state.observability.record_components();
+    let components = thg_core::connected_components(&edges, body.directed);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "directed": body.directed,
+        "components": components,
+        "count": components.len(),
+    }))
+    .into_response()
+}
+
+async fn graph_algorithm_pagerank(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<PageRankBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let edges = match store.list_edges() {
+        Ok(e) => e,
+        Err(error) => return graph_store_error_response(error),
+    };
+    state.observability.record_pagerank();
+    let rank = thg_core::pagerank(&edges, body.damping, body.max_iter, body.tolerance);
+    let mut entries: Vec<(String, f64)> = rank.into_iter().collect();
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(k) = body.top_k {
+        entries.truncate(k);
+    }
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "damping": body.damping,
+        "scores": entries
+            .into_iter()
+            .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+async fn graph_algorithm_communities(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(_body): Json<CommunitiesBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let edges = match store.list_edges() {
+        Ok(e) => e,
+        Err(error) => return graph_store_error_response(error),
+    };
+    state.observability.record_communities();
+    let (community, modularity) = thg_core::louvain_communities(&edges);
+    let mut entries: Vec<Value> = community
+        .into_iter()
+        .map(|(node_id, c)| json!({ "node_id": node_id, "community_id": c }))
+        .collect();
+    entries.sort_by(|a, b| {
+        a["node_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["node_id"].as_str().unwrap_or(""))
+    });
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "communities": entries,
+        "modularity": modularity,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
