@@ -8,6 +8,10 @@ use thg_core::{
     NodeQuery, NodeRecord,
 };
 
+use crate::cypher::ast::{
+    CypherPattern, EdgePattern, NodePattern, ParsedCypher, PropertyFilter, ReturnItem,
+};
+use crate::cypher::parse::parse_cypher_pest;
 use crate::state::TenantGraphStore;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -96,66 +100,10 @@ enum QueryOperation {
     Neighbors(NeighborQuery),
 }
 
-#[derive(Clone, Debug)]
-struct ParsedCypher {
-    normalized: String,
-    pattern: CypherPattern,
-    where_filter: Option<PropertyFilter>,
-    returns: Vec<ReturnItem>,
-    limit: usize,
-}
-
-#[derive(Clone, Debug)]
-enum CypherPattern {
-    Node(NodePattern),
-    Edge(EdgePattern),
-}
-
-#[derive(Clone, Debug)]
-struct NodePattern {
-    binding: String,
-    label: Option<String>,
-    properties: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug)]
-struct EdgePattern {
-    left: NodePattern,
-    edge_type: String,
-    right: NodePattern,
-}
-
-#[derive(Clone, Debug)]
-struct PropertyFilter {
-    binding: String,
-    key: String,
-    value: Value,
-}
-
-#[derive(Clone, Debug)]
-enum ReturnItem {
-    Variable(String),
-    Property {
-        binding: String,
-        key: String,
-        expression: String,
-    },
-    /// Phase 2: COUNT(*) or COUNT(binding) aggregation.
-    Count {
-        binding: Option<String>,
-        expression: String,
-    },
-}
-
-impl ReturnItem {
-    fn key(&self) -> &str {
-        match self {
-            Self::Variable(binding) => binding.as_str(),
-            Self::Property { expression, .. } => expression.as_str(),
-            Self::Count { expression, .. } => expression.as_str(),
-        }
-    }
-}
+// ParsedCypher, CypherPattern, NodePattern, EdgePattern, PropertyFilter,
+// ReturnItem, and ReturnItem::key are imported from crate::cypher::ast.
+// The hand-rolled parser body in this file delegates to
+// crate::cypher::parse::parse_cypher_pest.
 
 pub fn resolve_tenant_id(
     explicit_tenant: Option<&str>,
@@ -693,12 +641,22 @@ fn parse_cypher(
     query: &str,
     params: &BTreeMap<String, Value>,
 ) -> Result<ParsedCypher, QuerySurfaceError> {
-    let normalized = normalize_query(query);
+    reject_unsupported_subset(query)?;
+    let parsed = parse_cypher_pest(query, params)?;
+    validate_return_items(&parsed.pattern, &parsed.returns)?;
+    validate_where_filter(&parsed.pattern, parsed.where_filter.as_ref())?;
+    Ok(parsed)
+}
+
+/// Read-only-subset pre-check. Surfaces `unsupported_cypher_feature` for the
+/// clauses the pest grammar will accept in later stages (CREATE, MERGE, DELETE,
+/// SET, REMOVE, OPTIONAL MATCH, WITH, UNION, CALL, ORDER BY, SKIP, DISTINCT,
+/// SUM/AVG aggregations, variable-length expand, path aliases) so callers see a
+/// more actionable error than the bare pest `invalid_cypher_query`.
+fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
+    let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        return Err(QuerySurfaceError::invalid(
-            "empty_cypher_query",
-            "query is required",
-        ));
+        return Ok(());
     }
     let upper = normalized.to_ascii_uppercase();
     for keyword in [
@@ -720,12 +678,6 @@ fn parse_cypher(
         return Err(QuerySurfaceError::unsupported(
             "query_prefix",
             "use POST /v1/cypher/explain instead of EXPLAIN or PROFILE query prefixes",
-        ));
-    }
-    if !upper.starts_with("MATCH ") {
-        return Err(QuerySurfaceError::invalid(
-            "invalid_cypher_query",
-            "only MATCH-based read-only Cypher is supported in this slice",
         ));
     }
     for keyword in [
@@ -750,61 +702,37 @@ fn parse_cypher(
             "SUM/AVG aggregations are a later compatibility slice; COUNT is supported",
         ));
     }
-    let return_index = upper.find(" RETURN ").ok_or_else(|| {
-        QuerySurfaceError::invalid(
-            "invalid_cypher_query",
-            "Cypher subset requires a RETURN clause",
-        )
-    })?;
-    let match_and_where = normalized["MATCH ".len()..return_index].trim();
-    if match_and_where.contains('*') {
+    let match_segment = if upper.starts_with("MATCH ") {
+        if let Some(return_index) = upper.find(" RETURN ") {
+            normalized[..return_index].to_string()
+        } else {
+            normalized.clone()
+        }
+    } else {
+        String::new()
+    };
+    let match_segment_upper = match_segment.to_ascii_uppercase();
+    if match_segment_upper.contains('*') {
         return Err(QuerySurfaceError::unsupported(
             "variable_length_expand",
             "variable-length relationships are not implemented in the first /v1/cypher subset",
         ));
     }
-    let after_return = normalized[return_index + " RETURN ".len()..].trim();
-    let limit_index = after_return.to_ascii_uppercase().find(" LIMIT ");
-    let (return_part, limit_part) = match limit_index {
-        Some(index) => (
-            after_return[..index].trim(),
-            Some(after_return[index + " LIMIT ".len()..].trim()),
-        ),
-        None => (after_return, None),
-    };
-    let limit = match limit_part {
-        Some(limit_part) => parse_limit_literal(limit_part)?,
-        None => DEFAULT_LIMIT,
-    };
-    let where_index = match_and_where.to_ascii_uppercase().find(" WHERE ");
-    let (match_part, where_part) = match where_index {
-        Some(index) => (
-            match_and_where[..index].trim(),
-            Some(match_and_where[index + " WHERE ".len()..].trim()),
-        ),
-        None => (match_and_where, None),
-    };
-    if match_part.contains('=') {
-        return Err(QuerySurfaceError::unsupported(
-            "path_alias",
-            "path aliases are not implemented in the first /v1/cypher subset",
-        ));
+    if !match_segment.is_empty() {
+        let body = match_segment["MATCH ".len()..].trim();
+        let where_index = body.to_ascii_uppercase().find(" WHERE ");
+        let match_part = match where_index {
+            Some(idx) => body[..idx].trim(),
+            None => body,
+        };
+        if match_part.contains('=') {
+            return Err(QuerySurfaceError::unsupported(
+                "path_alias",
+                "path aliases are not implemented in the first /v1/cypher subset",
+            ));
+        }
     }
-    let pattern = parse_pattern(match_part, params)?;
-    let where_filter = match where_part {
-        Some(where_part) => Some(parse_where_filter(where_part, params)?),
-        None => None,
-    };
-    let returns = parse_return_items(return_part)?;
-    validate_return_items(&pattern, &returns)?;
-    validate_where_filter(&pattern, where_filter.as_ref())?;
-    Ok(ParsedCypher {
-        normalized,
-        pattern,
-        where_filter,
-        returns,
-        limit,
-    })
+    Ok(())
 }
 
 fn validate_where_filter(
@@ -879,42 +807,6 @@ fn returns_are_pure_count(returns: &[ReturnItem]) -> bool {
         && returns
             .iter()
             .all(|r| matches!(r, ReturnItem::Count { .. }))
-}
-
-fn parse_pattern(
-    match_part: &str,
-    params: &BTreeMap<String, Value>,
-) -> Result<CypherPattern, QuerySurfaceError> {
-    if let Some((left, rest)) = match_part.split_once(")-[") {
-        let left = format!("{left})");
-        let (relation, right) = rest.split_once("]->(").ok_or_else(|| {
-            QuerySurfaceError::unsupported(
-                "relationship_shape",
-                "only outgoing single-hop relationships are supported in the first /v1/cypher subset",
-            )
-        })?;
-        let right = format!("({right}");
-        let relation = relation.trim();
-        if !relation.starts_with(':') || relation.contains('{') || relation.contains(' ') {
-            return Err(QuerySurfaceError::unsupported(
-                "relationship_shape",
-                "only [:TYPE] relationships are supported in the first /v1/cypher subset",
-            ));
-        }
-        let edge_type = relation.trim_start_matches(':').trim();
-        if edge_type.is_empty() {
-            return Err(QuerySurfaceError::invalid(
-                "invalid_relationship_type",
-                "relationship type is required",
-            ));
-        }
-        return Ok(CypherPattern::Edge(EdgePattern {
-            left: parse_node_pattern(&left, params)?,
-            edge_type: edge_type.to_string(),
-            right: parse_node_pattern(&right, params)?,
-        }));
-    }
-    Ok(CypherPattern::Node(parse_node_pattern(match_part, params)?))
 }
 
 fn parse_tx_create_mutation(
@@ -1129,104 +1021,6 @@ fn parse_node_pattern(
     })
 }
 
-fn parse_where_filter(
-    source: &str,
-    params: &BTreeMap<String, Value>,
-) -> Result<PropertyFilter, QuerySurfaceError> {
-    let source = source.trim();
-    let upper = source.to_ascii_uppercase();
-    if upper.contains(" AND ") || upper.contains(" OR ") {
-        return Err(QuerySurfaceError::unsupported(
-            "where_boolean_logic",
-            "only a single equality WHERE predicate is supported in the first /v1/cypher subset",
-        ));
-    }
-    let (left, right) = source.split_once('=').ok_or_else(|| {
-        QuerySurfaceError::invalid(
-            "invalid_where_clause",
-            "WHERE clause must be a single equality predicate",
-        )
-    })?;
-    let (binding, key) = left.trim().split_once('.').ok_or_else(|| {
-        QuerySurfaceError::invalid(
-            "invalid_where_clause",
-            "WHERE clause must use binding.property = value",
-        )
-    })?;
-    Ok(PropertyFilter {
-        binding: binding.trim().to_string(),
-        key: key.trim().to_string(),
-        value: parse_scalar_value(right.trim(), params)?,
-    })
-}
-
-fn parse_return_items(source: &str) -> Result<Vec<ReturnItem>, QuerySurfaceError> {
-    let source = source.trim();
-    if source.is_empty() {
-        return Err(QuerySurfaceError::invalid(
-            "empty_return_clause",
-            "RETURN clause is required",
-        ));
-    }
-    let mut items = Vec::new();
-    for part in split_top_level(source, ',') {
-        let part = part.trim();
-        let upper = part.to_ascii_uppercase();
-        if upper.contains(" AS ") {
-            return Err(QuerySurfaceError::unsupported(
-                "return_alias",
-                "RETURN aliases are a later compatibility slice",
-            ));
-        }
-        // Phase 2: COUNT(*) and COUNT(binding).
-        if upper.starts_with("COUNT(") && part.ends_with(')') {
-            let inner = part[6..part.len() - 1].trim();
-            if inner == "*" {
-                items.push(ReturnItem::Count {
-                    binding: None,
-                    expression: part.to_string(),
-                });
-                continue;
-            }
-            let (binding, tail) = take_identifier(inner);
-            if !binding.is_empty() && tail.trim().is_empty() {
-                items.push(ReturnItem::Count {
-                    binding: Some(binding.to_string()),
-                    expression: part.to_string(),
-                });
-                continue;
-            }
-            return Err(QuerySurfaceError::invalid(
-                "invalid_count",
-                "COUNT only accepts * or a bare binding identifier",
-            ));
-        }
-        if part.contains('(') || part.contains(')') {
-            return Err(QuerySurfaceError::unsupported(
-                "return_expression",
-                "RETURN expressions are a later compatibility slice",
-            ));
-        }
-        if let Some((binding, key)) = part.split_once('.') {
-            items.push(ReturnItem::Property {
-                binding: binding.trim().to_string(),
-                key: key.trim().to_string(),
-                expression: part.to_string(),
-            });
-            continue;
-        }
-        let (binding, tail) = take_identifier(part);
-        if binding.is_empty() || !tail.trim().is_empty() {
-            return Err(QuerySurfaceError::invalid(
-                "invalid_return_clause",
-                format!("unsupported RETURN item {part}"),
-            ));
-        }
-        items.push(ReturnItem::Variable(binding.to_string()));
-    }
-    Ok(items)
-}
-
 fn node_query_for_pattern(
     pattern: &NodePattern,
     filter: Option<&PropertyFilter>,
@@ -1439,19 +1233,6 @@ fn parse_limit(limit: Option<&Value>) -> Result<usize, QuerySurfaceError> {
         )),
         None => Ok(DEFAULT_LIMIT),
     }
-}
-
-fn parse_limit_literal(source: &str) -> Result<usize, QuerySurfaceError> {
-    let limit = source.trim().parse::<usize>().map_err(|_| {
-        QuerySurfaceError::invalid("invalid_limit", format!("invalid LIMIT value {source}"))
-    })?;
-    if limit == 0 {
-        return Err(QuerySurfaceError::invalid(
-            "invalid_limit",
-            "LIMIT must be greater than zero",
-        ));
-    }
-    Ok(limit.min(MAX_LIMIT))
 }
 
 fn normalize_query(query: &str) -> String {
