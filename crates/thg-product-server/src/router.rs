@@ -305,6 +305,14 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/graph/fulltext/search",
             post(graph_fulltext_search),
         )
+        .route(
+            "/v1/tenants/:tenant_id/graph/bulk/nodes",
+            post(graph_bulk_nodes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/bulk/edges",
+            post(graph_bulk_edges),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -2290,6 +2298,159 @@ async fn graph_algorithm_pagerank(
             .into_iter()
             .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
             .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+// ===== Phase 3: Bulk loader =====
+//
+// JSONL-only for now (one record per line). CSV with headers is straightforward
+// to add later; JSONL keeps the contract simple and avoids ambiguity around
+// quoting/escaping for nested properties.
+
+#[derive(Debug, Deserialize)]
+struct BulkNodesBody {
+    /// JSONL: one node per line. Each line must be `{"id": "...", "labels": [...], "properties": {...}}`.
+    jsonl: String,
+    #[serde(default = "default_bulk_batch_size")]
+    batch_size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkEdgesBody {
+    /// JSONL: one edge per line. Each line must be
+    /// `{"id": "...", "from_id": "...", "to_id": "...", "edge_type": "...", "properties": {...}}`.
+    jsonl: String,
+    #[serde(default = "default_bulk_batch_size")]
+    batch_size: usize,
+}
+
+fn default_bulk_batch_size() -> usize {
+    500
+}
+
+async fn graph_bulk_nodes(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BulkNodesBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    for (line_no, line) in body.jsonl.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: Result<NodeRecord, _> = serde_json::from_str(trimmed);
+        let node = match parsed {
+            Ok(node) => node,
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "line": line_no + 1, "error": err.to_string() }));
+                }
+                continue;
+            }
+        };
+        match store.upsert_node(node.clone()) {
+            Ok(_) => {
+                inserted += 1;
+                state.observability.record_mutation();
+                state.maybe_index_node_spatially(&tenant_id, &node);
+                state.maybe_index_node_fulltext(&tenant_id, &node);
+            }
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "line": line_no + 1, "error": format!("{err:?}") }));
+                }
+            }
+        }
+        // batch_size acts as a cooperative yielding boundary for future
+        // async chunking; today every record is a separate write txn.
+        let _ = body.batch_size;
+    }
+    Json(json!({
+        "ok": failed == 0,
+        "tenant": tenant_id,
+        "inserted": inserted,
+        "failed": failed,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
+async fn graph_bulk_edges(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BulkEdgesBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    for (line_no, line) in body.jsonl.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: Result<EdgeRecord, _> = serde_json::from_str(trimmed);
+        let edge = match parsed {
+            Ok(edge) => edge,
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "line": line_no + 1, "error": err.to_string() }));
+                }
+                continue;
+            }
+        };
+        match store.upsert_edge(edge) {
+            Ok(_) => {
+                inserted += 1;
+                state.observability.record_mutation();
+            }
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "line": line_no + 1, "error": format!("{err:?}") }));
+                }
+            }
+        }
+        let _ = body.batch_size;
+    }
+    Json(json!({
+        "ok": failed == 0,
+        "tenant": tenant_id,
+        "inserted": inserted,
+        "failed": failed,
+        "errors": errors,
     }))
     .into_response()
 }

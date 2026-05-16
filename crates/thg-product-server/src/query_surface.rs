@@ -140,6 +140,11 @@ enum ReturnItem {
         key: String,
         expression: String,
     },
+    /// Phase 2: COUNT(*) or COUNT(binding) aggregation.
+    Count {
+        binding: Option<String>,
+        expression: String,
+    },
 }
 
 impl ReturnItem {
@@ -147,6 +152,7 @@ impl ReturnItem {
         match self {
             Self::Variable(binding) => binding.as_str(),
             Self::Property { expression, .. } => expression.as_str(),
+            Self::Count { expression, .. } => expression.as_str(),
         }
     }
 }
@@ -284,13 +290,21 @@ pub fn execute_cypher_query(
     let explain = explain_cypher_query(tenant, body)?;
     match &parsed.pattern {
         CypherPattern::Node(node_pattern) => {
+            // For pure-COUNT queries we ignore LIMIT for the scan, count all
+            // matching nodes, and emit one aggregate row.
+            let pure_count = returns_are_pure_count(&parsed.returns);
+            let scan_limit = if pure_count {
+                usize::MAX
+            } else {
+                parsed.limit.saturating_add(1)
+            };
             let query = node_query_for_pattern(
                 node_pattern,
                 parsed
                     .where_filter
                     .as_ref()
                     .filter(|filter| filter.binding == node_pattern.binding),
-                parsed.limit.saturating_add(1),
+                scan_limit,
             )?;
             let mut nodes = store.query_nodes(query.clone())?;
             if let Some(filter) = parsed.where_filter.as_ref() {
@@ -298,6 +312,31 @@ pub fn execute_cypher_query(
                     filter.binding == node_pattern.binding && node_matches_filter(node, filter)
                 });
             }
+
+            if pure_count {
+                let count = nodes.len();
+                let mut row = serde_json::Map::new();
+                for item in &parsed.returns {
+                    if let ReturnItem::Count { expression, .. } = item {
+                        row.insert(expression.clone(), json!(count));
+                    }
+                }
+                return Ok(json!({
+                    "ok": true,
+                    "tenant": tenant,
+                    "query": parsed.normalized,
+                    "subset": "opencypher_v0_1_read_only",
+                    "rows": [Value::Object(row)],
+                    "row_count": 1,
+                    "stats": {
+                        "returned": 1,
+                        "truncated": false,
+                        "plan_operation": "aggregate_count",
+                    },
+                    "explain": explain,
+                }));
+            }
+
             let truncated = nodes.len() > parsed.limit;
             if truncated {
                 nodes.truncate(parsed.limit);
@@ -705,10 +744,10 @@ fn parse_cypher(
             ));
         }
     }
-    if upper.contains("COUNT(") || upper.contains("SUM(") || upper.contains("AVG(") {
+    if upper.contains("SUM(") || upper.contains("AVG(") {
         return Err(QuerySurfaceError::unsupported(
             "aggregation",
-            "aggregation is a later compatibility slice",
+            "SUM/AVG aggregations are a later compatibility slice; COUNT is supported",
         ));
     }
     let return_index = upper.find(" RETURN ").ok_or_else(|| {
@@ -820,9 +859,26 @@ fn validate_return_items(
                     ));
                 }
             }
+            ReturnItem::Count { binding, .. } => {
+                if let Some(b) = binding {
+                    if !bindings.contains(&b.as_str()) {
+                        return Err(QuerySurfaceError::invalid(
+                            "invalid_return_binding",
+                            format!("COUNT({b}) binding does not exist in the MATCH pattern"),
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn returns_are_pure_count(returns: &[ReturnItem]) -> bool {
+    !returns.is_empty()
+        && returns
+            .iter()
+            .all(|r| matches!(r, ReturnItem::Count { .. }))
 }
 
 fn parse_pattern(
@@ -1122,6 +1178,29 @@ fn parse_return_items(source: &str) -> Result<Vec<ReturnItem>, QuerySurfaceError
                 "RETURN aliases are a later compatibility slice",
             ));
         }
+        // Phase 2: COUNT(*) and COUNT(binding).
+        if upper.starts_with("COUNT(") && part.ends_with(')') {
+            let inner = part[6..part.len() - 1].trim();
+            if inner == "*" {
+                items.push(ReturnItem::Count {
+                    binding: None,
+                    expression: part.to_string(),
+                });
+                continue;
+            }
+            let (binding, tail) = take_identifier(inner);
+            if !binding.is_empty() && tail.trim().is_empty() {
+                items.push(ReturnItem::Count {
+                    binding: Some(binding.to_string()),
+                    expression: part.to_string(),
+                });
+                continue;
+            }
+            return Err(QuerySurfaceError::invalid(
+                "invalid_count",
+                "COUNT only accepts * or a bare binding identifier",
+            ));
+        }
         if part.contains('(') || part.contains(')') {
             return Err(QuerySurfaceError::unsupported(
                 "return_expression",
@@ -1202,6 +1281,11 @@ fn project_node_row(
                     format!("RETURN binding {binding} does not exist in the MATCH pattern"),
                 ))
             }
+            ReturnItem::Count { .. } => {
+                // COUNT handled by the executor after rows are materialized.
+                // project_node_row is not called when returns are pure counts.
+                unreachable!("count items handled at the executor level");
+            }
         }
     }
     Ok(Value::Object(row))
@@ -1241,6 +1325,9 @@ fn project_edge_row(
                     "invalid_return_binding",
                     format!("RETURN binding {binding} does not exist in the MATCH pattern"),
                 ))
+            }
+            ReturnItem::Count { .. } => {
+                unreachable!("count items handled at the executor level");
             }
         }
     }
@@ -1611,6 +1698,35 @@ mod tests {
             explain["compatibility"]["supported_operations"][0],
             "node_match"
         );
+    }
+
+    #[test]
+    fn cypher_count_star_aggregates_to_scalar() {
+        let store = graph_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:File) RETURN COUNT(*)".to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        assert_eq!(response["row_count"], 1);
+        assert_eq!(response["rows"][0]["COUNT(*)"], 2);
+        assert_eq!(response["stats"]["plan_operation"], "aggregate_count");
+    }
+
+    #[test]
+    fn cypher_count_binding_aggregates_filtered_rows() {
+        let store = graph_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:Symbol) RETURN COUNT(n)".to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        assert_eq!(response["row_count"], 1);
+        assert_eq!(response["rows"][0]["COUNT(n)"], 1);
     }
 
     #[test]

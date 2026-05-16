@@ -15,24 +15,29 @@ Template ID pending: after creating or publishing the Railway template, replace 
 - **Graph storage** with AOF/snapshot persistence, per-tenant isolation, single-writer serializable commits, and committed read snapshots
 - **Stable, versioned on-disk format** with `thg-upgrade-format` migrations between releases (no export/re-import on upgrade)
 - **HNSW vector search** on node properties via `instant-distance`, with hybrid scoring that blends vector similarity and graph proximity
+- **Inverted-index BM25 full-text search** with automatic indexing on node upserts
+- **H3 spatial index** on node lat/lon properties with radius and bounding-box queries
 - **Epistemic edge types** (Supports, Contradicts, Tension, Derives, Cites) with confidence-weighted traversal across configurable hop depth
+- **Graph algorithms over HTTP/MCP**: PPR, connected components, PageRank, and label-propagation community detection
 - **MCP agent port** with scoped auth tokens, read-only and read-write modes, tool annotations, and structured tool/resource/prompt surfaces
 - **Graph-version-aware cache** (10 kinds) that detects stale entries when the underlying graph mutates
-- **Cypher subset** for read-only queries: single-hop MATCH with label/property filters, RETURN with aliases, LIMIT
+- **Read-only Cypher subset**: single-hop MATCH with label/property filters, RETURN with aliases, LIMIT, and `COUNT(*) / COUNT(binding)` aggregations
+- **JSONL bulk loader** for nodes and edges
+- **Observability**: Prometheus `/metrics` (17 counters), slow-query ring buffer at `/v1/diagnostics/slow_queries`
+- **HTTP transaction API**: `/v1/transactions/begin|commit|rollback` with snapshot isolation
 - **50x to 400x** faster Personalized PageRank than Python (ACL local-push algorithm, exposed via PyO3)
 
 ## What you can't do yet
 
 These are on the roadmap, in roughly this priority order:
 
-1. Multi-hop Cypher patterns (`MATCH (a)-[:T*1..3]->(b)`) and path projection
-2. Write clauses in Cypher (`CREATE`, `MERGE`, `SET`, `DELETE`)
-3. Aggregations (`COUNT`, `SUM`, `AVG`) and `WITH` pipeline stages
-4. Full-text search (BM25 via tantivy)
-5. Transaction API on the HTTP surface (`/v1/transactions/begin|commit|rollback`)
-6. Bulk loader (`LOAD CSV` / `COPY FROM`)
-7. Graph algorithms over HTTP/MCP (PPR, connected components, community detection)
-8. Spatial indexing (H3/S2)
+1. Multi-hop Cypher patterns (`MATCH (a)-[:T1]->(b)-[:T2]->(c)`) and variable-length expand (`*1..3`, `*`)
+2. Write clauses in Cypher (`CREATE`, `MERGE`, `SET`, `DELETE`) — use the bulk loader or `THG.GRAPH.NODE.UPSERT` MCP/HTTP today
+3. `SUM` and `AVG` aggregations, `WITH` pipeline stages, `ORDER BY`, `SKIP`
+4. Path projection (`MATCH p = (a)-[:T*]->(b) RETURN p`)
+5. CSV/JSONL `LOAD CSV` syntactic form (JSONL bulk endpoints exist already)
+6. Distributed snapshot replication
+7. Spatial S2 cell index (H3 ships today)
 
 ## Crate structure
 
@@ -127,6 +132,19 @@ POST /v1/tenants/{tenant_id}/graph/vector/search
 POST /v1/tenants/{tenant_id}/graph/vector/hybrid
 POST /v1/tenants/{tenant_id}/graph/vector/designate
 POST /v1/tenants/{tenant_id}/graph/epistemic/neighbors
+POST /v1/tenants/{tenant_id}/graph/algorithms/ppr
+POST /v1/tenants/{tenant_id}/graph/algorithms/components
+POST /v1/tenants/{tenant_id}/graph/algorithms/pagerank
+POST /v1/tenants/{tenant_id}/graph/algorithms/communities
+POST /v1/tenants/{tenant_id}/graph/spatial/designate
+POST /v1/tenants/{tenant_id}/graph/spatial/radius
+POST /v1/tenants/{tenant_id}/graph/spatial/bbox
+POST /v1/tenants/{tenant_id}/graph/fulltext/designate
+POST /v1/tenants/{tenant_id}/graph/fulltext/search
+POST /v1/tenants/{tenant_id}/graph/bulk/nodes
+POST /v1/tenants/{tenant_id}/graph/bulk/edges
+GET  /v1/diagnostics/slow_queries
+GET  /v1/diagnostics/config
 POST /v1/tenants/{tenant_id}/context/pack
 ```
 
