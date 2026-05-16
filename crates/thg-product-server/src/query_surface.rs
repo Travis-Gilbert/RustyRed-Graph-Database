@@ -9,9 +9,11 @@ use thg_core::{
 };
 
 use crate::cypher::ast::{
-    CypherPattern, EdgePattern, NodePattern, ParsedCypher, PropertyFilter, ReturnItem,
+    AggOp, CypherPattern, EdgePattern, NodePattern, ParsedCypher, PropertyFilter, ReturnItem,
+    WithItem,
 };
 use crate::cypher::parse::parse_cypher_pest;
+use crate::cypher::planner;
 use crate::state::TenantGraphStore;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -244,7 +246,10 @@ pub fn execute_cypher_query(
             // For pure-COUNT queries we ignore LIMIT for the scan, count all
             // matching nodes, and emit one aggregate row.
             let pure_count = returns_are_pure_count(&parsed.returns);
-            let scan_limit = if pure_count {
+            let pipeline = needs_pipeline(&parsed);
+            let scan_limit = if pure_count || pipeline {
+                // Pipeline operators (SUM/AVG/MIN/MAX, ORDER BY, SKIP) need to
+                // see every matching row before deciding what to keep.
                 usize::MAX
             } else {
                 parsed.limit.saturating_add(1)
@@ -283,6 +288,41 @@ pub fn execute_cypher_query(
                         "returned": 1,
                         "truncated": false,
                         "plan_operation": "aggregate_count",
+                    },
+                    "explain": explain,
+                }));
+            }
+
+            if pipeline {
+                let total_matched = nodes.len();
+                let raw_rows: Vec<serde_json::Map<String, Value>> = nodes
+                    .iter()
+                    .map(|node| node_to_raw_row(node, node_pattern))
+                    .collect();
+                let processed = run_pipeline(raw_rows, &parsed);
+                let row_count = processed.len();
+                let truncated = parsed.with_clause.is_none()
+                    && parsed.limit > 0
+                    && total_matched > row_count + parsed.skip.unwrap_or(0);
+                let plan_op = if parsed.with_clause.is_some() {
+                    "node_with_aggregate"
+                } else if returns_have_aggregate(&parsed.returns) {
+                    "node_implicit_aggregate"
+                } else {
+                    "node_pipeline"
+                };
+                let rows: Vec<Value> = processed.into_iter().map(Value::Object).collect();
+                return Ok(json!({
+                    "ok": true,
+                    "tenant": tenant,
+                    "query": parsed.normalized,
+                    "subset": "opencypher_v0_1_read_only",
+                    "rows": rows,
+                    "row_count": row_count,
+                    "stats": {
+                        "returned": row_count,
+                        "truncated": truncated,
+                        "plan_operation": plan_op,
                     },
                     "explain": explain,
                 }));
@@ -408,11 +448,8 @@ pub fn execute_cypher_query(
                 .where_filter
                 .as_ref()
                 .filter(|f| f.binding == chain.start.binding);
-            let seed_query = node_query_for_pattern(
-                &chain.start,
-                seed_filter,
-                parsed.limit.saturating_add(1),
-            )?;
+            let seed_query =
+                node_query_for_pattern(&chain.start, seed_filter, parsed.limit.saturating_add(1))?;
             if seed_query.label.is_none() && seed_query.properties.is_empty() {
                 return Err(QuerySurfaceError::unsupported(
                     "chain_scan",
@@ -599,11 +636,7 @@ fn walk_chain(
     hops_touched: &mut usize,
 ) -> Result<(), QuerySurfaceError> {
     if step_index >= chain.steps.len() {
-        rows.push(project_chain_row(
-            &parsed.returns,
-            chain,
-            path_bindings,
-        )?);
+        rows.push(project_chain_row(&parsed.returns, chain, path_bindings)?);
         return Ok(());
     }
     if rows.len() > parsed.limit {
@@ -701,7 +734,10 @@ fn project_chain_row(
                     format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
                 ));
             }
-            ReturnItem::Path { binding, expression } => {
+            ReturnItem::Path {
+                binding,
+                expression,
+            } => {
                 if chain.path_binding.as_deref() != Some(binding.as_str()) {
                     return Err(QuerySurfaceError::invalid(
                         "invalid_return_binding",
@@ -761,7 +797,10 @@ fn project_var_length_row(
                     format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
                 ));
             }
-            ReturnItem::Path { binding, expression } => {
+            ReturnItem::Path {
+                binding,
+                expression,
+            } => {
                 if var.path_binding.as_deref() != Some(binding.as_str()) {
                     return Err(QuerySurfaceError::invalid(
                         "invalid_return_binding",
@@ -843,11 +882,8 @@ fn execute_write_cypher(
                     .as_ref()
                     .map(|l| vec![l.clone()])
                     .unwrap_or_default();
-                let record = thg_core::NodeRecord::new(
-                    id.to_string(),
-                    labels,
-                    Value::Object(props),
-                );
+                let record =
+                    thg_core::NodeRecord::new(id.to_string(), labels, Value::Object(props));
                 batch
                     .mutations
                     .push(thg_core::GraphMutation::NodeUpsert(record));
@@ -862,9 +898,7 @@ fn execute_write_cypher(
                     other => {
                         return Err(QuerySurfaceError::invalid(
                             "set_binding_unresolved",
-                            format!(
-                                "SET binding {binding} not bound by MATCH pattern: {other:?}"
-                            ),
+                            format!("SET binding {binding} not bound by MATCH pattern: {other:?}"),
                         ));
                     }
                 };
@@ -893,9 +927,7 @@ fn execute_write_cypher(
                     other => {
                         return Err(QuerySurfaceError::invalid(
                             "delete_binding_unresolved",
-                            format!(
-                                "DELETE binding {binding} not bound by MATCH: {other:?}"
-                            ),
+                            format!("DELETE binding {binding} not bound by MATCH: {other:?}"),
                         ));
                     }
                 };
@@ -959,10 +991,7 @@ fn resolve_set_expr(
             base_key,
             delta,
         } => {
-            let current = current_props
-                .get(base_key)
-                .cloned()
-                .unwrap_or(Value::Null);
+            let current = current_props.get(base_key).cloned().unwrap_or(Value::Null);
             let current_int = current.as_i64().unwrap_or(0);
             let delta_int = delta.as_i64().unwrap_or(0);
             Ok(json!(current_int + delta_int))
@@ -1149,20 +1178,19 @@ pub fn cypher_compatibility_matrix() -> Value {
             "MATCH (n:Label {prop: $value}) RETURN n LIMIT <n>",
             "MATCH (n:Label) WHERE n.prop = $value RETURN n LIMIT <n>",
             "MATCH (a:Label)-[:TYPE]->(b:Label) RETURN a, b LIMIT <n>",
-            "MATCH (a:Label)-[:TYPE]->(b:Label) RETURN a.prop, b.prop LIMIT <n>"
+            "MATCH (a:Label)-[:TYPE]->(b:Label) RETURN a.prop, b.prop LIMIT <n>",
+            "MATCH (a)-[:TYPE]->(b)-[:TYPE]->(c) RETURN a, b, c LIMIT <n>",
+            "MATCH p = (a)-[:TYPE*1..3]->(b) RETURN p LIMIT <n>"
         ],
         "rejected": [
-            "CREATE, MERGE, DELETE, SET, REMOVE",
+            "REMOVE",
             "OPTIONAL MATCH, WITH, UNION",
             "ORDER BY, SKIP, DISTINCT, aggregation",
-            "path aliases and variable-length relationships",
-            "incoming, undirected, and multi-hop relationship patterns",
+            "incoming and undirected relationship patterns",
             "procedures, PROFILE, and EXPLAIN query prefixes"
         ],
         "pending": [
-            "bounded variable-length expand",
             "sorting and aggregation",
-            "write clauses",
             "procedures over search, cache, and GraphRAG"
         ]
     })
@@ -1266,7 +1294,12 @@ fn parse_cypher(
 ) -> Result<ParsedCypher, QuerySurfaceError> {
     reject_unsupported_subset(query)?;
     let parsed = parse_cypher_pest(query, params)?;
-    validate_return_items(&parsed.pattern, &parsed.returns)?;
+    // RETURN binding validation only fires when there is no WITH clause:
+    // a WITH clause introduces fresh aliases that the RETURN may reference,
+    // and those aliases are not bound by the MATCH pattern.
+    if parsed.with_clause.is_none() {
+        validate_return_items(&parsed.pattern, &parsed.returns)?;
+    }
     validate_where_filter(&parsed.pattern, parsed.where_filter.as_ref())?;
     Ok(parsed)
 }
@@ -1274,7 +1307,7 @@ fn parse_cypher(
 /// Read-only-subset pre-check. Surfaces `unsupported_cypher_feature` for the
 /// clauses the pest grammar will accept in later stages (CREATE, MERGE, DELETE,
 /// SET, REMOVE, OPTIONAL MATCH, WITH, UNION, CALL, ORDER BY, SKIP, DISTINCT,
-/// SUM/AVG aggregations, variable-length expand, path aliases) so callers see a
+/// SUM/AVG aggregations) so callers see a
 /// more actionable error than the bare pest `invalid_cypher_query`.
 fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
     let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1297,13 +1330,13 @@ fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
             "use POST /v1/cypher/explain instead of EXPLAIN or PROFILE query prefixes",
         ));
     }
+    // WITH, ORDER BY, SKIP are now supported by §P2-C (pc.2.1..pc.3.1) along
+    // with SUM/AVG/MIN/MAX aggregations. OPTIONAL MATCH, UNION, CALL, and
+    // DISTINCT remain unsupported.
     for keyword in [
         " OPTIONAL MATCH ",
-        " WITH ",
         " UNION ",
         " CALL ",
-        " ORDER BY ",
-        " SKIP ",
         " DISTINCT ",
     ] {
         if upper.contains(keyword) {
@@ -1312,12 +1345,6 @@ fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
                 "that clause is not implemented in the first /v1/cypher subset",
             ));
         }
-    }
-    if upper.contains("SUM(") || upper.contains("AVG(") {
-        return Err(QuerySurfaceError::unsupported(
-            "aggregation",
-            "SUM/AVG aggregations are a later compatibility slice; COUNT is supported",
-        ));
     }
     // Variable-length expand and path aliases (`MATCH p = ...`) are now
     // supported by the pest grammar (§P2-B), so do not reject them here.
@@ -1443,6 +1470,184 @@ fn returns_are_pure_count(returns: &[ReturnItem]) -> bool {
         && returns
             .iter()
             .all(|r| matches!(r, ReturnItem::Count { .. }))
+}
+
+/// True when RETURN contains any SUM/AVG/MIN/MAX item that needs implicit
+/// aggregation. COUNT is excluded because the executor still has a dedicated
+/// pure-count fast path.
+fn returns_have_aggregate(returns: &[ReturnItem]) -> bool {
+    returns
+        .iter()
+        .any(|r| matches!(r, ReturnItem::Aggregate { .. }))
+}
+
+/// True when the parsed query needs the WITH/sort/skip/aggregate pipeline.
+fn needs_pipeline(parsed: &ParsedCypher) -> bool {
+    parsed.with_clause.is_some()
+        || returns_have_aggregate(&parsed.returns)
+        || !parsed.order_by.is_empty()
+        || parsed.skip.is_some()
+}
+
+/// Expand a matched node into a flat map carrying the binding, the binding-as-
+/// JSON value (so RETURN n returns the whole node), and every "binding.key"
+/// property path so the pipeline can read source columns by name.
+fn node_to_raw_row(node: &NodeRecord, pattern: &NodePattern) -> serde_json::Map<String, Value> {
+    let mut row = serde_json::Map::new();
+    row.insert(pattern.binding.clone(), json!(node));
+    if let Value::Object(props) = json!(node.properties.clone()) {
+        for (k, v) in props {
+            row.insert(format!("{}.{}", pattern.binding, k), v);
+        }
+    } else if let Some(map) = node.properties.as_object() {
+        for (k, v) in map {
+            row.insert(format!("{}.{}", pattern.binding, k), v.clone());
+        }
+    }
+    row
+}
+
+/// Run rows through WITH (or implicit-aggregate) -> ORDER BY -> SKIP -> LIMIT.
+fn run_pipeline(
+    rows: Vec<serde_json::Map<String, Value>>,
+    parsed: &ParsedCypher,
+) -> Vec<serde_json::Map<String, Value>> {
+    let mut current = rows;
+
+    if let Some(with) = &parsed.with_clause {
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut aggs: Vec<planner::AggregateOutput> = Vec::new();
+        for item in &with.items {
+            match item {
+                WithItem::Field { alias, .. } => group_keys.push(alias.clone()),
+                WithItem::Aggregate {
+                    op,
+                    key,
+                    alias,
+                    binding,
+                } => {
+                    let source = key.as_ref().map(|k| match binding {
+                        Some(b) => format!("{b}.{k}"),
+                        None => k.clone(),
+                    });
+                    aggs.push(planner::AggregateOutput {
+                        alias: alias.clone(),
+                        op: *op,
+                        source_key: source,
+                    });
+                }
+            }
+        }
+        // Pre-project: emit Field aliases (renamed columns) and preserve
+        // source columns the aggregator needs.
+        let projected: Vec<serde_json::Map<String, Value>> = current
+            .iter()
+            .map(|row| {
+                let mut out = serde_json::Map::new();
+                for item in &with.items {
+                    match item {
+                        WithItem::Field {
+                            binding,
+                            key,
+                            alias,
+                        } => {
+                            let src_key = match key {
+                                Some(k) => format!("{binding}.{k}"),
+                                None => binding.clone(),
+                            };
+                            out.insert(
+                                alias.clone(),
+                                row.get(&src_key).cloned().unwrap_or(Value::Null),
+                            );
+                        }
+                        WithItem::Aggregate { binding, key, .. } => {
+                            if let (Some(b), Some(k)) = (binding, key) {
+                                let src_key = format!("{b}.{k}");
+                                out.insert(
+                                    src_key.clone(),
+                                    row.get(&src_key).cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        current = planner::aggregate(&projected, &planner::AggregateSpec { group_keys, aggs });
+
+        // After aggregation the rows expose WITH aliases (group keys + agg aliases).
+        // Final RETURN projection keeps only the columns the user asked for.
+        let mut final_rows: Vec<serde_json::Map<String, Value>> = Vec::with_capacity(current.len());
+        for row in current {
+            let mut out = serde_json::Map::new();
+            for item in &parsed.returns {
+                match item {
+                    ReturnItem::Variable(name) => {
+                        if let Some(v) = row.get(name) {
+                            out.insert(name.clone(), v.clone());
+                        }
+                    }
+                    ReturnItem::Property { expression, .. } => {
+                        if let Some(v) = row.get(expression) {
+                            out.insert(expression.clone(), v.clone());
+                        }
+                    }
+                    ReturnItem::Count { expression, .. }
+                    | ReturnItem::Aggregate { expression, .. }
+                    | ReturnItem::Path { expression, .. } => {
+                        if let Some(v) = row.get(expression) {
+                            out.insert(expression.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            final_rows.push(out);
+        }
+        current = final_rows;
+    } else if returns_have_aggregate(&parsed.returns) {
+        // Implicit aggregation: no WITH, but RETURN has SUM/AVG/MIN/MAX.
+        // The whole match set is one group; emit one row keyed by expression.
+        let mut aggs: Vec<planner::AggregateOutput> = Vec::new();
+        for item in &parsed.returns {
+            if let ReturnItem::Aggregate {
+                op,
+                binding,
+                key,
+                expression,
+            } = item
+            {
+                let source = key.as_ref().map(|k| match binding {
+                    Some(b) => format!("{b}.{k}"),
+                    None => k.clone(),
+                });
+                aggs.push(planner::AggregateOutput {
+                    alias: expression.clone(),
+                    op: *op,
+                    source_key: source,
+                });
+            }
+        }
+        current = planner::aggregate(
+            &current,
+            &planner::AggregateSpec {
+                group_keys: Vec::new(),
+                aggs,
+            },
+        );
+    }
+
+    planner::sort_rows(&mut current, &parsed.order_by);
+    if let Some(skip) = parsed.skip {
+        current = planner::skip_rows(current, skip);
+    }
+    if parsed.limit > 0 && current.len() > parsed.limit {
+        current.truncate(parsed.limit);
+    }
+    // Aggregate-emitted Sum can be float-with-fract-0 when divided by f64;
+    // serde-json keeps the format we emit, so no normalization needed here.
+    let _ = AggOp::Count; // ensure import resolves under #[allow(dead_code)] flow
+    current
 }
 
 fn parse_tx_create_mutation(
@@ -1725,7 +1930,9 @@ fn project_node_row(
             ReturnItem::Path { binding, .. } => {
                 return Err(QuerySurfaceError::unsupported(
                     "path_projection_on_node",
-                    format!("RETURN path {binding} is only meaningful for chain or var-length patterns"),
+                    format!(
+                        "RETURN path {binding} is only meaningful for chain or var-length patterns"
+                    ),
                 ));
             }
         }
@@ -1780,7 +1987,9 @@ fn project_edge_row(
             ReturnItem::Path { binding, .. } => {
                 return Err(QuerySurfaceError::unsupported(
                     "path_projection_on_edge",
-                    format!("RETURN path {binding} is only meaningful for chain or var-length patterns"),
+                    format!(
+                        "RETURN path {binding} is only meaningful for chain or var-length patterns"
+                    ),
                 ));
             }
         }
@@ -2034,6 +2243,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -2092,7 +2307,7 @@ mod tests {
 
     #[test]
     fn public_query_supports_node_match_and_neighbors() {
-        let mut store = graph_store();
+        let store = graph_store();
 
         let node_match = execute_public_query(
             &store,
@@ -2170,6 +2385,105 @@ mod tests {
         assert_eq!(response["rows"][0]["COUNT(n)"], 1);
     }
 
+    fn doc_store() -> TenantGraphStore {
+        let mut store = graph_store();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:a",
+                ["Doc"],
+                json!({ "category": "blue", "score": 5 }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:b",
+                ["Doc"],
+                json!({ "category": "blue", "score": 7 }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:c",
+                ["Doc"],
+                json!({ "category": "red", "score": 3 }),
+            ))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn cypher_sum_aggregates_across_match_set() {
+        let mut store = doc_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:Doc) RETURN sum(n.score)".to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+        assert_eq!(response["row_count"], 1);
+        assert_eq!(response["rows"][0]["sum(n.score)"], 15);
+        assert_eq!(
+            response["stats"]["plan_operation"],
+            "node_implicit_aggregate"
+        );
+    }
+
+    #[test]
+    fn cypher_with_clause_groups_count_and_orders_desc() {
+        let mut store = doc_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query:
+                "MATCH (n:Doc) WITH n.category AS cat, count(n) AS c RETURN cat, c ORDER BY c DESC LIMIT 10"
+                    .to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+        let rows = response["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        // ORDER BY c DESC: blue=2 first, red=1 second.
+        assert_eq!(rows[0]["cat"], "blue");
+        assert_eq!(rows[0]["c"], 2);
+        assert_eq!(rows[1]["cat"], "red");
+        assert_eq!(rows[1]["c"], 1);
+        assert_eq!(response["stats"]["plan_operation"], "node_with_aggregate");
+    }
+
+    #[test]
+    fn cypher_order_by_desc_without_with_still_pipelines() {
+        let mut store = doc_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:Doc) RETURN n ORDER BY n.score DESC LIMIT 2".to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+        let rows = response["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["n"]["id"], "doc:b");
+        assert_eq!(rows[1]["n"]["id"], "doc:a");
+    }
+
+    #[test]
+    fn cypher_skip_drops_leading_rows() {
+        let mut store = doc_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (n:Doc) RETURN n ORDER BY n.score ASC SKIP 1 LIMIT 5".to_string(),
+            params: BTreeMap::new(),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+        let rows = response["rows"].as_array().expect("rows");
+        // 3 Doc rows ordered ASC by score = [3, 5, 7]; SKIP 1 drops 3.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["n"]["properties"]["score"], 5);
+        assert_eq!(rows[1]["n"]["properties"]["score"], 7);
+    }
+
     #[test]
     fn cypher_subset_executes_node_match_with_where() {
         let mut store = graph_store();
@@ -2205,6 +2519,27 @@ mod tests {
     }
 
     #[test]
+    fn cypher_subset_executes_variable_length_path_projection() {
+        let mut store = graph_store();
+        let body = PublicCypherBody {
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH p = (a:File {path: $path})-[:IMPORTS*1..2]->(b:File) RETURN p LIMIT 10"
+                .to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+            tx_id: None,
+        };
+
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+
+        assert_eq!(response["row_count"], 1);
+        assert_eq!(
+            response["stats"]["plan_operation"],
+            "variable_length_expand"
+        );
+        assert_eq!(response["rows"][0]["p"], json!(["file:lib", "file:main"]));
+    }
+
+    #[test]
     fn cypher_explain_includes_compatibility_matrix() {
         let body = PublicCypherBody {
             tenant_id: Some("demo".to_string()),
@@ -2226,11 +2561,7 @@ mod tests {
     fn cypher_subset_parses_writes_and_var_expands() {
         // §P3-A landed: CREATE without an `id` property still errors, but on
         // compile rather than the pre-check. We just assert parse succeeds.
-        let parsed_write = parse_cypher(
-            "CREATE (n:File {id: 'a'})",
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let parsed_write = parse_cypher("CREATE (n:File {id: 'a'})", &BTreeMap::new()).unwrap();
         assert_eq!(parsed_write.writes.len(), 1);
 
         // Var-length expand now parses (§P2-B grammar landed).
@@ -2245,12 +2576,12 @@ mod tests {
         ));
 
         // REMOVE remains unsupported.
-        let remove_error = parse_cypher(
-            "MATCH (n:File {id: 'a'}) REMOVE n.path",
-            &BTreeMap::new(),
-        )
-        .unwrap_err();
-        assert_eq!(remove_error.payload()["error"], "unsupported_cypher_feature");
+        let remove_error =
+            parse_cypher("MATCH (n:File {id: 'a'}) REMOVE n.path", &BTreeMap::new()).unwrap_err();
+        assert_eq!(
+            remove_error.payload()["error"],
+            "unsupported_cypher_feature"
+        );
     }
 
     #[test]
@@ -2308,9 +2639,14 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_matrix_lists_pending_work() {
+    fn compatibility_matrix_lists_supported_var_length_and_pending_sorting() {
         let matrix = cypher_compatibility_matrix();
 
-        assert_eq!(matrix["pending"][0], "bounded variable-length expand");
+        assert!(matrix["supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.as_str().unwrap_or("").contains("*1..3")));
+        assert_eq!(matrix["pending"][0], "sorting and aggregation");
     }
 }

@@ -64,7 +64,9 @@ pub fn aggregate(rows: &[Map<String, Value>], spec: &AggregateSpec) -> Vec<Map<S
     for (_, (group_row, accs)) in groups {
         let mut row = group_row;
         for out in &spec.aggs {
-            let acc = accs.get(&out.alias).expect("accumulator present at finalize");
+            let acc = accs
+                .get(&out.alias)
+                .expect("accumulator present at finalize");
             row.insert(out.alias.clone(), acc.finalize(out.op));
         }
         out_rows.push(row);
@@ -82,7 +84,11 @@ pub fn sort_rows(rows: &mut [Map<String, Value>], order: &[OrderBy]) {
             let bv = b.get(&clause.expression).cloned().unwrap_or(Value::Null);
             let ord = value_cmp(&av, &bv);
             if ord != std::cmp::Ordering::Equal {
-                return if clause.descending { ord.reverse() } else { ord };
+                return if clause.descending {
+                    ord.reverse()
+                } else {
+                    ord
+                };
             }
         }
         std::cmp::Ordering::Equal
@@ -115,41 +121,43 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 fn make_group_key(keys: &[String], row: &Map<String, Value>) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(keys.len());
     for k in keys {
-        parts.push(format!("{}={}", k, row.get(k).cloned().unwrap_or(Value::Null)));
+        parts.push(format!(
+            "{}={}",
+            k,
+            row.get(k).cloned().unwrap_or(Value::Null)
+        ));
     }
     parts.join("|")
 }
 
 #[derive(Debug, Clone, Default)]
 struct AggAccumulator {
-    count: u64,
+    /// Total rows observed; this is what COUNT emits.
+    row_count: u64,
+    /// Count of rows whose source value parsed as a finite f64; AVG divides by this.
+    numeric_count: u64,
     sum: f64,
     min: Option<f64>,
     max: Option<f64>,
 }
 
 impl AggAccumulator {
-    fn observe(&mut self, op: AggOp, v: &Value) {
+    fn observe(&mut self, _op: AggOp, v: &Value) {
+        // Every observed row contributes to the row count. COUNT(*) and
+        // count(n) both reach this path with v = Null because no source column
+        // is attached, but the matched row itself is what's being counted.
+        self.row_count += 1;
         if let Some(num) = v.as_f64() {
             self.sum += num;
+            self.numeric_count += 1;
             self.min = Some(self.min.map_or(num, |m| m.min(num)));
             self.max = Some(self.max.map_or(num, |m| m.max(num)));
-        }
-        match op {
-            AggOp::Count => {
-                if !v.is_null() {
-                    self.count += 1;
-                }
-            }
-            _ => {
-                self.count += 1;
-            }
         }
     }
 
     fn finalize(&self, op: AggOp) -> Value {
         match op {
-            AggOp::Count => json!(self.count),
+            AggOp::Count => json!(self.row_count),
             AggOp::Sum => {
                 // Emit integer JSON when the running sum is a whole number; this
                 // keeps `sum(integer_column)` round-tripping cleanly in JSON.
@@ -160,10 +168,10 @@ impl AggAccumulator {
                 }
             }
             AggOp::Avg => {
-                if self.count == 0 {
+                if self.numeric_count == 0 {
                     Value::Null
                 } else {
-                    json!(self.sum / self.count as f64)
+                    json!(self.sum / self.numeric_count as f64)
                 }
             }
             AggOp::Min => self.min.map(|v| json!(v)).unwrap_or(Value::Null),
