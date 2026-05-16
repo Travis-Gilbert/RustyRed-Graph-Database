@@ -732,13 +732,13 @@ async fn public_cypher(
         }))
         .into_response();
     }
-    let store = match state.tenant_graph_store(&tenant_id) {
+    let mut store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
     };
     state.observability.record_cypher();
     let start = std::time::Instant::now();
-    let outcome = execute_cypher_query(&store, &tenant_id, &body);
+    let outcome = execute_cypher_query(&mut store, &tenant_id, &body);
     let nanos = start.elapsed().as_nanos() as u64;
     state.observability.record_query_timing(
         "cypher",
@@ -3457,6 +3457,71 @@ mod tests {
         .into_response();
         let payload = response_payload_json(response).await;
         assert_eq!(payload["inserted"], 1);
+    }
+
+    // ===== Phase 3-A: auto-tx write Cypher tests =====
+
+    #[tokio::test]
+    async fn public_cypher_create_auto_opens_and_commits_transaction() {
+        let state = memory_product_state();
+        let response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                tenant_id: Some("tenant-w".to_string()),
+                query: "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})".to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let store = state.tenant_graph_store("tenant-w").unwrap();
+        let node = store.get_node("a").unwrap().unwrap();
+        assert_eq!(node.id, "a");
+        assert!(node.labels.contains(&"Doc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn public_cypher_merge_is_idempotent_with_on_create_then_on_match() {
+        let state = memory_product_state();
+        let first = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                tenant_id: Some("tenant-merge".to_string()),
+                query:
+                    "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"
+                        .to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                tenant_id: Some("tenant-merge".to_string()),
+                query:
+                    "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"
+                        .to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let store = state.tenant_graph_store("tenant-merge").unwrap();
+        let node = store.get_node("a").unwrap().unwrap();
+        assert_eq!(node.properties["seen"].as_i64(), Some(2));
     }
 
     #[tokio::test]

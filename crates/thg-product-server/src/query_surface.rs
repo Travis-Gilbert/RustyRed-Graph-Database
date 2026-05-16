@@ -230,11 +230,14 @@ pub fn explain_public_query(tenant: &str, body: &Value) -> Result<Value, QuerySu
 }
 
 pub fn execute_cypher_query(
-    store: &TenantGraphStore,
+    store: &mut TenantGraphStore,
     tenant: &str,
     body: &PublicCypherBody,
 ) -> Result<Value, QuerySurfaceError> {
     let parsed = parse_cypher(&body.query, &body.params)?;
+    if !parsed.writes.is_empty() {
+        return execute_write_cypher(store, tenant, &parsed);
+    }
     let explain = explain_cypher_query(tenant, body)?;
     match &parsed.pattern {
         CypherPattern::Node(node_pattern) => {
@@ -760,6 +763,201 @@ fn project_var_length_row(
     Ok(Value::Object(row))
 }
 
+fn execute_write_cypher(
+    store: &mut TenantGraphStore,
+    tenant: &str,
+    parsed: &ParsedCypher,
+) -> Result<Value, QuerySurfaceError> {
+    use crate::cypher::ast::WriteClause;
+
+    let mut batch = crate::cypher::compile::compile_writes(&parsed.writes)?;
+
+    for write in &parsed.writes {
+        match write {
+            WriteClause::CreateNode { .. } | WriteClause::CreateEdge { .. } => {
+                // Already compiled by compile_writes.
+            }
+            WriteClause::Merge {
+                node,
+                on_create,
+                on_match,
+            } => {
+                let id = node
+                    .properties
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "missing_merge_id",
+                            "MERGE node requires `id` property",
+                        )
+                    })?;
+                let existing = store.get_node(id)?;
+                let mut props: serde_json::Map<String, Value> = match &existing {
+                    Some(existing_node) => match existing_node.properties.clone() {
+                        Value::Object(map) => map,
+                        _ => serde_json::Map::new(),
+                    },
+                    None => {
+                        let mut map = serde_json::Map::new();
+                        for (k, v) in node.properties.iter() {
+                            map.insert(k.clone(), v.clone());
+                        }
+                        map
+                    }
+                };
+                let branch = if existing.is_some() {
+                    on_match.as_ref()
+                } else {
+                    on_create.as_ref()
+                };
+                if let Some(branch) = branch {
+                    for (set_binding, key, expr) in &branch.sets {
+                        if set_binding != &node.binding {
+                            return Err(QuerySurfaceError::invalid(
+                                "set_binding_mismatch",
+                                format!(
+                                    "SET binding {set_binding} does not match MERGE binding {}",
+                                    node.binding
+                                ),
+                            ));
+                        }
+                        let resolved = resolve_set_expr(expr, &props)?;
+                        props.insert(key.clone(), resolved);
+                    }
+                }
+                let labels = node
+                    .label
+                    .as_ref()
+                    .map(|l| vec![l.clone()])
+                    .unwrap_or_default();
+                let record = thg_core::NodeRecord::new(
+                    id.to_string(),
+                    labels,
+                    Value::Object(props),
+                );
+                batch
+                    .mutations
+                    .push(thg_core::GraphMutation::NodeUpsert(record));
+            }
+            WriteClause::Set {
+                binding,
+                key,
+                value,
+            } => {
+                let pattern_node = match &parsed.pattern {
+                    CypherPattern::Node(n) if n.binding == *binding => n,
+                    other => {
+                        return Err(QuerySurfaceError::invalid(
+                            "set_binding_unresolved",
+                            format!(
+                                "SET binding {binding} not bound by MATCH pattern: {other:?}"
+                            ),
+                        ));
+                    }
+                };
+                let where_filter = parsed
+                    .where_filter
+                    .as_ref()
+                    .filter(|f| f.binding == *binding);
+                let query = node_query_for_pattern(pattern_node, where_filter, MAX_LIMIT)?;
+                let nodes = store.query_nodes(query)?;
+                for mut node in nodes {
+                    let mut props: serde_json::Map<String, Value> = match node.properties.clone() {
+                        Value::Object(map) => map,
+                        _ => serde_json::Map::new(),
+                    };
+                    let resolved = resolve_set_expr(value, &props)?;
+                    props.insert(key.clone(), resolved);
+                    node.properties = Value::Object(props);
+                    batch
+                        .mutations
+                        .push(thg_core::GraphMutation::NodeUpsert(node));
+                }
+            }
+            WriteClause::Delete { binding, detach } => {
+                let pattern_node = match &parsed.pattern {
+                    CypherPattern::Node(n) if n.binding == *binding => n,
+                    other => {
+                        return Err(QuerySurfaceError::invalid(
+                            "delete_binding_unresolved",
+                            format!(
+                                "DELETE binding {binding} not bound by MATCH: {other:?}"
+                            ),
+                        ));
+                    }
+                };
+                let where_filter = parsed
+                    .where_filter
+                    .as_ref()
+                    .filter(|f| f.binding == *binding);
+                let query = node_query_for_pattern(pattern_node, where_filter, MAX_LIMIT)?;
+                let nodes = store.query_nodes(query)?;
+                for node in nodes {
+                    if *detach {
+                        for direction in [Direction::Out, Direction::In] {
+                            let hits = store.neighbors(NeighborQuery {
+                                node_id: node.id.clone(),
+                                direction,
+                                edge_type: None,
+                            })?;
+                            for hit in hits {
+                                if let Some(edge) = store.get_edge(&hit.edge_id)? {
+                                    let mut tombstoned = edge.clone();
+                                    tombstoned.tombstone = true;
+                                    batch
+                                        .mutations
+                                        .push(thg_core::GraphMutation::EdgeUpsert(tombstoned));
+                                }
+                            }
+                        }
+                    }
+                    let mut tombstoned = node.clone();
+                    tombstoned.tombstone = true;
+                    batch
+                        .mutations
+                        .push(thg_core::GraphMutation::NodeUpsert(tombstoned));
+                }
+            }
+        }
+    }
+
+    let transaction = store.commit_batch(batch)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant,
+        "query": parsed.normalized,
+        "subset": "opencypher_v0_1_read_write",
+        "transaction": {
+            "graph_version": transaction.graph_version,
+            "writes": transaction.writes,
+        },
+    }))
+}
+
+fn resolve_set_expr(
+    expr: &crate::cypher::ast::SetExpr,
+    current_props: &serde_json::Map<String, Value>,
+) -> Result<Value, QuerySurfaceError> {
+    use crate::cypher::ast::SetExpr;
+    match expr {
+        SetExpr::Literal(value) => Ok(value.clone()),
+        SetExpr::Increment {
+            base_binding: _,
+            base_key,
+            delta,
+        } => {
+            let current = current_props
+                .get(base_key)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let current_int = current.as_i64().unwrap_or(0);
+            let delta_int = delta.as_i64().unwrap_or(0);
+            Ok(json!(current_int + delta_int))
+        }
+    }
+}
+
 pub fn parse_tx_cypher_mutations(
     query: &str,
     params: &BTreeMap<String, Value>,
@@ -1072,20 +1270,14 @@ fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
         return Ok(());
     }
     let upper = normalized.to_ascii_uppercase();
-    for keyword in [
-        "CREATE ",
-        "MERGE ",
-        "DELETE ",
-        "DETACH DELETE ",
-        "SET ",
-        "REMOVE ",
-    ] {
-        if upper.starts_with(keyword) || upper.contains(&format!(" {keyword}")) {
-            return Err(QuerySurfaceError::unsupported(
-                keyword.trim(),
-                "write clauses are not implemented in the first /v1/cypher subset",
-            ));
-        }
+    // CREATE / MERGE / SET / DELETE / DETACH DELETE are now supported by the
+    // pest grammar (§P3-A pa3.1.2 + pa3.1.3) and the auto-tx executor
+    // (§P3-A pa3.3.1). REMOVE remains unsupported.
+    if upper.starts_with("REMOVE ") || upper.contains(" REMOVE ") {
+        return Err(QuerySurfaceError::unsupported(
+            "REMOVE",
+            "REMOVE clauses are not implemented yet",
+        ));
     }
     if upper.starts_with("EXPLAIN ") || upper.starts_with("PROFILE ") {
         return Err(QuerySurfaceError::unsupported(
@@ -1866,7 +2058,7 @@ mod tests {
 
     #[test]
     fn public_query_supports_node_match_and_neighbors() {
-        let store = graph_store();
+        let mut store = graph_store();
 
         let node_match = execute_public_query(
             &store,
@@ -1917,14 +2109,14 @@ mod tests {
 
     #[test]
     fn cypher_count_star_aggregates_to_scalar() {
-        let store = graph_store();
+        let mut store = graph_store();
         let body = PublicCypherBody {
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) RETURN COUNT(*)".to_string(),
             params: BTreeMap::new(),
             tx_id: None,
         };
-        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
         assert_eq!(response["row_count"], 1);
         assert_eq!(response["rows"][0]["COUNT(*)"], 2);
         assert_eq!(response["stats"]["plan_operation"], "aggregate_count");
@@ -1932,21 +2124,21 @@ mod tests {
 
     #[test]
     fn cypher_count_binding_aggregates_filtered_rows() {
-        let store = graph_store();
+        let mut store = graph_store();
         let body = PublicCypherBody {
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:Symbol) RETURN COUNT(n)".to_string(),
             params: BTreeMap::new(),
             tx_id: None,
         };
-        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
         assert_eq!(response["row_count"], 1);
         assert_eq!(response["rows"][0]["COUNT(n)"], 1);
     }
 
     #[test]
     fn cypher_subset_executes_node_match_with_where() {
-        let store = graph_store();
+        let mut store = graph_store();
         let body = PublicCypherBody {
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) WHERE n.path = $path RETURN n LIMIT 5".to_string(),
@@ -1954,7 +2146,7 @@ mod tests {
             tx_id: None,
         };
 
-        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
 
         assert_eq!(response["row_count"], 1);
         assert_eq!(response["rows"][0]["n"]["id"], "file:lib");
@@ -1962,7 +2154,7 @@ mod tests {
 
     #[test]
     fn cypher_subset_executes_relationship_projection() {
-        let store = graph_store();
+        let mut store = graph_store();
         let body = PublicCypherBody {
             tenant_id: Some("demo".to_string()),
             query:
@@ -1972,7 +2164,7 @@ mod tests {
             tx_id: None,
         };
 
-        let response = execute_cypher_query(&store, "demo", &body).unwrap();
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
 
         assert_eq!(response["rows"][0]["a.path"], "src/lib.rs");
         assert_eq!(response["rows"][0]["b.path"], "src/main.rs");
@@ -1997,16 +2189,17 @@ mod tests {
     }
 
     #[test]
-    fn cypher_subset_rejects_writes_and_parses_var_expands() {
-        // Writes remain unsupported until §P3-A (Stage 04) wires CREATE / MERGE
-        // / SET / DELETE through the pest grammar.
-        let write_error = parse_cypher("CREATE (:File)", &BTreeMap::new()).unwrap_err();
-        assert_eq!(write_error.payload()["error"], "unsupported_cypher_feature");
+    fn cypher_subset_parses_writes_and_var_expands() {
+        // §P3-A landed: CREATE without an `id` property still errors, but on
+        // compile rather than the pre-check. We just assert parse succeeds.
+        let parsed_write = parse_cypher(
+            "CREATE (n:File {id: 'a'})",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(parsed_write.writes.len(), 1);
 
-        // Var-length expand now parses (§P2-B grammar landed). The executor
-        // still rejects it with `multi_hop_execution` until pb.2.3 wires the
-        // expand path; the assertion here is that parsing itself succeeds and
-        // produces an EdgeVarLength pattern.
+        // Var-length expand now parses (§P2-B grammar landed).
         let parsed = parse_cypher(
             "MATCH p = (a:File)-[:IMPORTS*1..2]->(b:File) RETURN p",
             &BTreeMap::new(),
@@ -2016,6 +2209,14 @@ mod tests {
             parsed.pattern,
             crate::cypher::ast::CypherPattern::EdgeVarLength(_)
         ));
+
+        // REMOVE remains unsupported.
+        let remove_error = parse_cypher(
+            "MATCH (n:File {id: 'a'}) REMOVE n.path",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(remove_error.payload()["error"], "unsupported_cypher_feature");
     }
 
     #[test]
