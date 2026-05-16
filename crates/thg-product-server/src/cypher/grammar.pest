@@ -2,12 +2,14 @@
 // Read shapes: single-hop, multi-hop chain, variable-length expand.
 // Write shapes (§P3-A): CREATE, MERGE with ON CREATE/ON MATCH branches,
 // MATCH ... SET, MATCH ... DELETE, MATCH ... DETACH DELETE.
+// Pipeline (§P2-C): WITH ... AS ..., ORDER BY ... ASC|DESC, SKIP n.
+// Aggregations: COUNT/SUM/AVG/MIN/MAX over property paths or bindings.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query        = { SOI ~ (write_query | read_query) ~ EOI }
 
-read_query   = { match_clause ~ where_clause? ~ return_clause ~ limit_clause? }
+read_query   = { match_clause ~ where_clause? ~ with_clause? ~ return_clause ~ order_clause? ~ skip_clause? ~ limit_clause? }
 
 write_query  = {
     create_node_only
@@ -15,6 +17,18 @@ write_query  = {
     | match_with_set
     | match_with_delete
 }
+
+with_clause  = { ^"WITH" ~ with_items }
+with_items   = { with_item ~ ("," ~ with_item)* }
+with_item    = { (aggregate_call | property_path | ident) ~ ^"AS" ~ ident }
+
+order_clause = { ^"ORDER" ~ ^"BY" ~ order_items }
+order_items  = { order_item ~ ("," ~ order_item)* }
+order_item   = { order_expr ~ order_dir? }
+order_expr   = { property_path | ident }
+order_dir    = { ^"ASC" | ^"DESC" }
+
+skip_clause  = { ^"SKIP" ~ integer }
 
 create_node_only = { ^"CREATE" ~ create_target }
 create_target    = { create_edge_form | node_pattern }
@@ -58,7 +72,10 @@ where_expr     = { property_path ~ "=" ~ value }
 property_path  = { ident ~ "." ~ ident }
 
 return_items   = { return_item ~ ("," ~ return_item)* }
-return_item    = { count_call | property_path | ident }
+return_item    = { aggregate_call | property_path | ident }
+aggregate_call = { agg_op ~ "(" ~ agg_arg ~ ")" }
+agg_op         = { ^"COUNT" | ^"SUM" | ^"AVG" | ^"MIN" | ^"MAX" }
+agg_arg        = { "*" | property_path | ident }
 count_call     = { ^"COUNT" ~ "(" ~ count_arg ~ ")" }
 count_arg      = { "*" | ident }
 

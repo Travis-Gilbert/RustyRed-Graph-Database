@@ -30,10 +30,7 @@ pub fn parse_cypher_pest(
     }
 
     let mut pairs = CypherPestParser::parse(Rule::query, &normalized).map_err(|err| {
-        QuerySurfaceError::invalid(
-            "invalid_cypher_query",
-            format!("pest parse error: {err}"),
-        )
+        QuerySurfaceError::invalid("invalid_cypher_query", format!("pest parse error: {err}"))
     })?;
     let query_pair = pairs
         .next()
@@ -42,9 +39,7 @@ pub fn parse_cypher_pest(
     let body_pair = query_pair
         .into_inner()
         .find(|p| matches!(p.as_rule(), Rule::read_query | Rule::write_query))
-        .ok_or_else(|| {
-            QuerySurfaceError::invalid("invalid_cypher_query", "missing query body")
-        })?;
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "missing query body"))?;
     // Clone the normalized string before passing the body pair onward. The
     // pest Pair holds `&str` slices into `normalized`, so we cannot move the
     // String while the Pair is still in scope.
@@ -160,18 +155,12 @@ fn parse_create_node_only(
     pair: Pair<Rule>,
     params: &BTreeMap<String, Value>,
 ) -> Result<ParsedCypher, QuerySurfaceError> {
-    let create_target = pair
-        .into_inner()
-        .next()
-        .ok_or_else(|| {
-            QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target")
-        })?;
-    let target_inner = create_target
-        .into_inner()
-        .next()
-        .ok_or_else(|| {
-            QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target inner")
-        })?;
+    let create_target = pair.into_inner().next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target")
+    })?;
+    let target_inner = create_target.into_inner().next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target inner")
+    })?;
     match target_inner.as_rule() {
         Rule::node_pattern => {
             let node = parse_node_pattern(target_inner, params)?;
@@ -189,14 +178,9 @@ fn parse_create_node_only(
         }
         Rule::create_edge_form => {
             let mut iter = target_inner.into_inner();
-            let left_pair = iter
-                .next()
-                .ok_or_else(|| {
-                    QuerySurfaceError::invalid(
-                        "invalid_cypher_query",
-                        "CREATE edge missing left node",
-                    )
-                })?;
+            let left_pair = iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "CREATE edge missing left node")
+            })?;
             let left = parse_node_pattern(left_pair, params)?;
             let continuation = iter.next().ok_or_else(|| {
                 QuerySurfaceError::invalid("invalid_cypher_query", "CREATE edge missing relation")
@@ -251,14 +235,9 @@ fn parse_merge_clause(
                 let raw = child.as_str();
                 let is_on_create = raw.to_ascii_uppercase().contains("ON CREATE");
                 let mut sub = child.into_inner();
-                let set_list = sub
-                    .next()
-                    .ok_or_else(|| {
-                        QuerySurfaceError::invalid(
-                            "invalid_cypher_query",
-                            "MERGE branch missing SET",
-                        )
-                    })?;
+                let set_list = sub.next().ok_or_else(|| {
+                    QuerySurfaceError::invalid("invalid_cypher_query", "MERGE branch missing SET")
+                })?;
                 let branch = parse_set_list(set_list, params)?;
                 if is_on_create {
                     on_create = Some(branch);
@@ -308,14 +287,17 @@ fn parse_match_with_set(
     let pattern = pattern.ok_or_else(|| {
         QuerySurfaceError::invalid("invalid_cypher_query", "SET requires MATCH clause")
     })?;
-    let set_list = set_list_pair.ok_or_else(|| {
-        QuerySurfaceError::invalid("invalid_cypher_query", "missing SET list")
-    })?;
+    let set_list = set_list_pair
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "missing SET list"))?;
     let branch = parse_set_list(set_list, params)?;
     let writes: Vec<WriteClause> = branch
         .sets
         .into_iter()
-        .map(|(binding, key, value)| WriteClause::Set { binding, key, value })
+        .map(|(binding, key, value)| WriteClause::Set {
+            binding,
+            key,
+            value,
+        })
         .collect();
     Ok(ParsedCypher {
         normalized,
@@ -426,44 +408,33 @@ fn parse_set_value_expr(
     pair: Pair<Rule>,
     params: &BTreeMap<String, Value>,
 ) -> Result<SetExpr, QuerySurfaceError> {
-    let inner = pair.into_inner().next().ok_or_else(|| {
-        QuerySurfaceError::invalid("invalid_cypher_query", "empty SET value")
-    })?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty SET value"))?;
     match inner.as_rule() {
         Rule::increment_expr => {
             let mut iter = inner.into_inner();
             let path_pair = iter.next().ok_or_else(|| {
-                QuerySurfaceError::invalid(
-                    "invalid_cypher_query",
-                    "increment missing base path",
-                )
+                QuerySurfaceError::invalid("invalid_cypher_query", "increment missing base path")
             })?;
             let mut idents = path_pair.into_inner();
             let base_binding = idents
                 .next()
                 .ok_or_else(|| {
-                    QuerySurfaceError::invalid(
-                        "invalid_cypher_query",
-                        "increment missing binding",
-                    )
+                    QuerySurfaceError::invalid("invalid_cypher_query", "increment missing binding")
                 })?
                 .as_str()
                 .to_string();
             let base_key = idents
                 .next()
                 .ok_or_else(|| {
-                    QuerySurfaceError::invalid(
-                        "invalid_cypher_query",
-                        "increment missing key",
-                    )
+                    QuerySurfaceError::invalid("invalid_cypher_query", "increment missing key")
                 })?
                 .as_str()
                 .to_string();
             let delta_pair = iter.next().ok_or_else(|| {
-                QuerySurfaceError::invalid(
-                    "invalid_cypher_query",
-                    "increment missing delta",
-                )
+                QuerySurfaceError::invalid("invalid_cypher_query", "increment missing delta")
             })?;
             let delta = parse_value(delta_pair, params)?;
             Ok(SetExpr::Increment {
@@ -507,9 +478,10 @@ fn parse_match(
         QuerySurfaceError::invalid("invalid_cypher_query", "MATCH pattern missing")
     })?;
 
-    let inner_pair = pattern_pair.into_inner().next().ok_or_else(|| {
-        QuerySurfaceError::invalid("invalid_cypher_query", "empty MATCH pattern")
-    })?;
+    let inner_pair = pattern_pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty MATCH pattern"))?;
     match inner_pair.as_rule() {
         Rule::node_pattern => {
             let node = parse_node_pattern(inner_pair, params)?;
@@ -530,9 +502,9 @@ fn parse_edge_chain_pattern(
     path_binding: Option<String>,
 ) -> Result<CypherPattern, QuerySurfaceError> {
     let mut iter = pair.into_inner();
-    let start_pair = iter.next().ok_or_else(|| {
-        QuerySurfaceError::invalid("invalid_cypher_query", "missing chain start")
-    })?;
+    let start_pair = iter
+        .next()
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "missing chain start"))?;
     let start = parse_node_pattern(start_pair, params)?;
     let mut steps: Vec<EdgeStep> = Vec::new();
     for cont in iter {
@@ -835,23 +807,33 @@ fn parse_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>, QuerySurfaceE
             let raw = item_pair.as_str().to_string();
             let mut sub_iter = item_pair.into_inner();
             let inner_pair = sub_iter.next().ok_or_else(|| {
-                QuerySurfaceError::invalid(
-                    "invalid_return_clause",
-                    "empty return item",
-                )
+                QuerySurfaceError::invalid("invalid_return_clause", "empty return item")
             })?;
             match inner_pair.as_rule() {
-                Rule::count_call => {
-                    let arg = inner_pair
-                        .into_inner()
-                        .next()
-                        .ok_or_else(|| {
-                            QuerySurfaceError::invalid(
-                                "invalid_count",
-                                "COUNT missing argument",
-                            )
-                        })?;
-                    let text = arg.as_str().trim();
+                Rule::aggregate_call => {
+                    let mut agg_iter = inner_pair.into_inner();
+                    let op_pair = agg_iter.next().ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_return_clause",
+                            "aggregate missing operator",
+                        )
+                    })?;
+                    let op_text = op_pair.as_str().to_ascii_uppercase();
+                    let arg_pair = agg_iter.next().ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_return_clause",
+                            "aggregate missing argument",
+                        )
+                    })?;
+                    if op_text != "COUNT" {
+                        return Err(QuerySurfaceError::invalid(
+                            "invalid_aggregate_op",
+                            format!(
+                                "aggregate operator not yet wired through parser: {op_text}"
+                            ),
+                        ));
+                    }
+                    let text = arg_pair.as_str().trim();
                     if text == "*" {
                         items.push(ReturnItem::Count {
                             binding: None,
@@ -930,24 +912,24 @@ mod tests {
 
     #[test]
     fn grammar_parses_simple_node_match() {
-        let pairs =
-            CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN n LIMIT 10");
-        assert!(pairs.is_ok(), "expected MATCH (n:Doc) RETURN n LIMIT 10 to parse: {:?}", pairs);
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN n LIMIT 10");
+        assert!(
+            pairs.is_ok(),
+            "expected MATCH (n:Doc) RETURN n LIMIT 10 to parse: {:?}",
+            pairs
+        );
     }
 
     #[test]
     fn grammar_parses_where_filter() {
-        let pairs = CypherPestParser::parse(
-            Rule::query,
-            "MATCH (n:Doc) WHERE n.path = $value RETURN n",
-        );
+        let pairs =
+            CypherPestParser::parse(Rule::query, "MATCH (n:Doc) WHERE n.path = $value RETURN n");
         assert!(pairs.is_ok(), "expected WHERE filter to parse: {:?}", pairs);
     }
 
     #[test]
     fn grammar_parses_count_star() {
-        let pairs =
-            CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN count(n)");
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN count(n)");
         assert!(pairs.is_ok(), "expected COUNT to parse: {:?}", pairs);
     }
 
@@ -957,7 +939,11 @@ mod tests {
             Rule::query,
             "MATCH (a:Doc)-[:CITES]->(b:Doc) RETURN a, b LIMIT 5",
         );
-        assert!(pairs.is_ok(), "expected single-hop edge to parse: {:?}", pairs);
+        assert!(
+            pairs.is_ok(),
+            "expected single-hop edge to parse: {:?}",
+            pairs
+        );
     }
 }
 
@@ -983,8 +969,7 @@ mod parse_to_ast_tests {
 
     #[test]
     fn parse_default_limit_when_omitted() {
-        let parsed =
-            parse_cypher_pest("MATCH (n:Doc) RETURN n", &BTreeMap::new()).unwrap();
+        let parsed = parse_cypher_pest("MATCH (n:Doc) RETURN n", &BTreeMap::new()).unwrap();
         assert_eq!(parsed.limit, 100);
     }
 
@@ -992,11 +977,8 @@ mod parse_to_ast_tests {
     fn parse_where_property_eq_param() {
         let mut params = BTreeMap::new();
         params.insert("value".to_string(), serde_json::json!("src/lib.rs"));
-        let parsed = parse_cypher_pest(
-            "MATCH (n:File) WHERE n.path = $value RETURN n",
-            &params,
-        )
-        .unwrap();
+        let parsed =
+            parse_cypher_pest("MATCH (n:File) WHERE n.path = $value RETURN n", &params).unwrap();
         let filter = parsed.where_filter.expect("expected WHERE filter");
         assert_eq!(filter.binding, "n");
         assert_eq!(filter.key, "path");
@@ -1005,10 +987,13 @@ mod parse_to_ast_tests {
 
     #[test]
     fn parse_count_star_into_count_item() {
-        let parsed =
-            parse_cypher_pest("MATCH (n:Doc) RETURN count(n)", &BTreeMap::new()).unwrap();
+        let parsed = parse_cypher_pest("MATCH (n:Doc) RETURN count(n)", &BTreeMap::new()).unwrap();
         assert_eq!(parsed.returns.len(), 1);
-        let ReturnItem::Count { binding, expression } = &parsed.returns[0] else {
+        let ReturnItem::Count {
+            binding,
+            expression,
+        } = &parsed.returns[0]
+        else {
             panic!("expected count return item, got {:?}", parsed.returns[0]);
         };
         assert_eq!(binding.as_deref(), Some("n"));
@@ -1080,11 +1065,8 @@ mod parse_to_ast_tests {
 
     #[test]
     fn parse_unbounded_var_length_returns_max_none() {
-        let parsed = parse_cypher_pest(
-            "MATCH (a:Doc)-[:T*]->(b:Doc) RETURN b",
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let parsed =
+            parse_cypher_pest("MATCH (a:Doc)-[:T*]->(b:Doc) RETURN b", &BTreeMap::new()).unwrap();
         let CypherPattern::EdgeVarLength(var) = &parsed.pattern else {
             panic!("expected EdgeVarLength pattern");
         };
@@ -1183,11 +1165,8 @@ mod parse_to_ast_tests {
 
     #[test]
     fn parse_match_detach_delete_emits_detach_flag() {
-        let parsed = parse_cypher_pest(
-            "MATCH (n:Doc {id: 'a'}) DETACH DELETE n",
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let parsed =
+            parse_cypher_pest("MATCH (n:Doc {id: 'a'}) DETACH DELETE n", &BTreeMap::new()).unwrap();
         let WriteClause::Delete { detach, .. } = &parsed.writes[0] else {
             panic!("expected Delete write clause");
         };
@@ -1201,10 +1180,8 @@ mod write_grammar_tests {
 
     #[test]
     fn grammar_parses_create_node() {
-        let pairs = CypherPestParser::parse(
-            Rule::query,
-            "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})",
-        );
+        let pairs =
+            CypherPestParser::parse(Rule::query, "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})");
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
 
@@ -1219,27 +1196,67 @@ mod write_grammar_tests {
 
     #[test]
     fn grammar_parses_match_set() {
-        let pairs = CypherPestParser::parse(
-            Rule::query,
-            "MATCH (n:Doc {id: 'a'}) SET n.flag = true",
-        );
+        let pairs =
+            CypherPestParser::parse(Rule::query, "MATCH (n:Doc {id: 'a'}) SET n.flag = true");
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
 
     #[test]
     fn grammar_parses_match_delete() {
-        let pairs = CypherPestParser::parse(
-            Rule::query,
-            "MATCH (n:Doc {id: 'a'}) DELETE n",
-        );
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc {id: 'a'}) DELETE n");
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
 
     #[test]
     fn grammar_parses_match_detach_delete() {
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc {id: 'a'}) DETACH DELETE n");
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+}
+
+#[cfg(test)]
+mod aggregation_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn grammar_parses_sum_aggregation() {
+        let pairs =
+            CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN sum(n.score)");
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_with_clause() {
         let pairs = CypherPestParser::parse(
             Rule::query,
-            "MATCH (n:Doc {id: 'a'}) DETACH DELETE n",
+            "MATCH (n:Doc) WITH n.category AS cat, count(n) AS c RETURN cat, c",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_order_by_desc() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc) RETURN n ORDER BY n.created DESC LIMIT 5",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_skip() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc) RETURN n SKIP 10 LIMIT 5",
+        );
+        assert!(pairs.is_ok(), "{:?}", pairs);
+    }
+
+    #[test]
+    fn grammar_parses_full_with_pipeline() {
+        let pairs = CypherPestParser::parse(
+            Rule::query,
+            "MATCH (n:Doc) WITH n.category AS cat, count(n) AS c RETURN cat, c ORDER BY c DESC LIMIT 10",
         );
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
