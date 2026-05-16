@@ -1331,15 +1331,34 @@ pub struct RedCoreStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct RedCoreManifest {
-    version: u32,
-    graph_version: u64,
-    last_txn_id: u64,
-    snapshot_txn_id: u64,
-    durability: RedCoreDurability,
-    snapshot_file: String,
-    aof_file: String,
-    updated_at_unix_ms: u128,
+pub struct RedCoreManifest {
+    pub version: u32,
+    pub graph_version: u64,
+    pub last_txn_id: u64,
+    pub snapshot_txn_id: u64,
+    pub durability: RedCoreDurability,
+    pub snapshot_file: String,
+    pub aof_file: String,
+    pub updated_at_unix_ms: u128,
+    #[serde(default = "default_format_kind")]
+    pub format_kind: String,
+    #[serde(default)]
+    pub crate_version: String,
+    #[serde(default)]
+    pub created_at_unix_ms: u128,
+}
+
+fn default_format_kind() -> String {
+    "redcore".to_string()
+}
+
+/// Maximum manifest format version this build is willing to load.
+/// Bump when introducing a breaking on-disk format change.
+pub const CURRENT_FORMAT_VERSION: u32 = REDCORE_MANIFEST_VERSION;
+
+/// Returns true if a snapshot at `version` can be loaded directly without migration.
+pub fn manifest_version_compatible(version: u32) -> bool {
+    version <= CURRENT_FORMAT_VERSION
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1684,7 +1703,18 @@ impl RedCoreGraphStore {
         let Some(data_dir) = self.data_dir.clone() else {
             return Ok(());
         };
-        let _manifest = read_manifest(&data_dir)?;
+        if let Some(manifest) = read_manifest(&data_dir)? {
+            if !manifest_version_compatible(manifest.version) {
+                return Err(GraphStoreError::new(
+                    "redcore_format_too_new",
+                    format!(
+                        "On-disk RedCore manifest version is {}, this build supports up to {}. \
+                         Upgrade the binary or run thg-upgrade-format.",
+                        manifest.version, CURRENT_FORMAT_VERSION
+                    ),
+                ));
+            }
+        }
         if let Some(envelope) = read_latest_valid_snapshot(&data_dir)? {
             self.snapshot_txn_id = envelope.txn_id;
             self.last_txn_id = self.last_txn_id.max(envelope.txn_id);
@@ -1911,6 +1941,7 @@ impl RedCoreGraphStore {
         let Some(data_dir) = self.data_dir.as_ref() else {
             return Ok(());
         };
+        let now = unix_ms();
         let manifest = RedCoreManifest {
             version: REDCORE_MANIFEST_VERSION,
             graph_version,
@@ -1919,7 +1950,10 @@ impl RedCoreGraphStore {
             durability: self.options.durability,
             snapshot_file: REDCORE_SNAPSHOT_FILE.to_string(),
             aof_file: REDCORE_AOF_FILE.to_string(),
-            updated_at_unix_ms: unix_ms(),
+            updated_at_unix_ms: now,
+            format_kind: default_format_kind(),
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at_unix_ms: now,
         };
         let raw = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| GraphStoreError::io("encode RedCore manifest", err))?;
@@ -2104,7 +2138,7 @@ fn sync_directory(data_dir: &Path, action: impl AsRef<str>) -> GraphStoreResult<
         .map_err(|err| GraphStoreError::io(action.as_ref(), err))
 }
 
-fn read_manifest(data_dir: &Path) -> GraphStoreResult<Option<RedCoreManifest>> {
+pub fn read_manifest(data_dir: &Path) -> GraphStoreResult<Option<RedCoreManifest>> {
     let path = data_dir.join(REDCORE_MANIFEST_FILE);
     if !path.exists() {
         return Ok(None);
@@ -4457,6 +4491,97 @@ mod tests {
             keyspace.events(),
             "rrgdb:{tenant:TenantOne}:graph:v1:events"
         );
+    }
+
+    #[test]
+    fn redcore_manifest_records_format_kind_and_crate_version() {
+        let data_dir = unique_test_dir("redcore-manifest-format");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        let mut store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let node = NodeRecord::new("n1", ["Doc"], json!({"title": "x"}));
+        store.upsert_node(node).unwrap();
+        store.snapshot_now().unwrap();
+        drop(store);
+
+        let manifest = super::read_manifest(&data_dir).unwrap().unwrap();
+        assert_eq!(manifest.version, super::CURRENT_FORMAT_VERSION);
+        assert_eq!(manifest.format_kind, "redcore");
+        assert!(!manifest.crate_version.is_empty());
+        assert!(manifest.created_at_unix_ms > 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_refuses_too_new_manifest() {
+        let data_dir = unique_test_dir("redcore-manifest-too-new");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let manifest_path = data_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+                "version": 9999,
+                "graph_version": 0,
+                "last_txn_id": 0,
+                "snapshot_txn_id": 0,
+                "durability": "none",
+                "snapshot_file": "graph.snapshot.current",
+                "aof_file": "graph.aof",
+                "updated_at_unix_ms": 0
+            }"#,
+        )
+        .unwrap();
+
+        let result = RedCoreGraphStore::open(
+            &data_dir,
+            RedCoreOptions {
+                durability: RedCoreDurability::None,
+                snapshot_interval_writes: 0,
+                strict_acid: false,
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "redcore_format_too_new");
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_legacy_manifest_without_format_kind_loads() {
+        let data_dir = unique_test_dir("redcore-manifest-legacy");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let manifest_path = data_dir.join("manifest.json");
+        // Legacy: no format_kind, crate_version, created_at_unix_ms.
+        std::fs::write(
+            &manifest_path,
+            r#"{
+                "version": 1,
+                "graph_version": 0,
+                "last_txn_id": 0,
+                "snapshot_txn_id": 0,
+                "durability": "none",
+                "snapshot_file": "graph.snapshot.current",
+                "aof_file": "graph.aof",
+                "updated_at_unix_ms": 0
+            }"#,
+        )
+        .unwrap();
+
+        let store = RedCoreGraphStore::open(
+            &data_dir,
+            RedCoreOptions {
+                durability: RedCoreDurability::None,
+                snapshot_interval_writes: 0,
+                strict_acid: false,
+            },
+        )
+        .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[cfg(feature = "redis-store")]

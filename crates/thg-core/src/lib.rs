@@ -19,12 +19,13 @@ pub use graph::{
     expand_bounded, expand_bounded_weighted, paths_shortest, paths_shortest_weighted, EdgeTuple,
 };
 pub use graph_store::{
-    sanitize_tenant_segment, Direction, EdgeRecord, EpistemicType, GraphMutation,
-    GraphMutationBatch, GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
-    GraphStoreResult, GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, Provenance, RedCoreDurability, RedCoreGraphStore,
-    RedCoreOptions, RedCoreStatus, VectorDesignation, VectorIndex, VectorPoint, VerifyProblem,
-    VerifyReport,
+    manifest_version_compatible, read_manifest, sanitize_tenant_segment, Direction, EdgeRecord,
+    EpistemicType, GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphSnapshot,
+    GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphTransaction, GraphWriteResult,
+    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, Provenance,
+    RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions, RedCoreStatus,
+    VectorDesignation, VectorIndex, VectorPoint, VerifyProblem, VerifyReport,
+    CURRENT_FORMAT_VERSION,
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
