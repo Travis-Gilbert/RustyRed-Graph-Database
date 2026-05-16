@@ -25,6 +25,10 @@ use crate::auth::require_scope;
 use crate::graph_cache::{
     GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
 };
+use crate::observability::{
+    KIND_ALGO_COMMUNITIES, KIND_ALGO_COMPONENTS, KIND_ALGO_PAGERANK, KIND_ALGO_PPR, KIND_CYPHER,
+    KIND_FULLTEXT_SEARCH, KIND_VECTOR_SEARCH,
+};
 use crate::query_surface::{
     execute_cypher_query, execute_public_query, explain_cypher_query, parse_tx_cypher_mutations,
     resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
@@ -740,13 +744,10 @@ async fn public_cypher(
     let start = std::time::Instant::now();
     let outcome = execute_cypher_query(&mut store, &tenant_id, &body);
     let nanos = start.elapsed().as_nanos() as u64;
-    state.observability.record_query_timing(
-        "cypher",
-        body.query.chars().take(120).collect::<String>().as_str(),
-        nanos,
-        0,
-        0,
-    );
+    let detail = body.query.chars().take(120).collect::<String>();
+    state
+        .observability
+        .record_query_timing(KIND_CYPHER, &detail, nanos, 0, 0);
     match outcome {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => {
@@ -998,7 +999,18 @@ async fn graph_vector_search(
 
     state.observability.record_vector_search();
     let label_ref = body.label.as_deref();
-    match store.vector_search(label_ref, &body.property, &body.query, body.k) {
+    let detail = format!(
+        "label={} property={}",
+        label_ref.unwrap_or("*"),
+        body.property
+    );
+    let start = std::time::Instant::now();
+    let outcome = store.vector_search(label_ref, &body.property, &body.query, body.k);
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_VECTOR_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
         Ok(results) => {
             let items: Vec<Value> = results
                 .into_iter()
@@ -1038,6 +1050,11 @@ async fn graph_vector_hybrid(
 
     state.observability.record_vector_search();
     let label_ref = body.label.as_deref();
+    let detail = format!(
+        "label={} property={}",
+        label_ref.unwrap_or("*"),
+        body.property
+    );
     let mut scoring = state.config.tenant_config(&tenant_id).hybrid_scoring;
     if let Some(alpha) = body.alpha {
         scoring = scoring.with_alpha(alpha);
@@ -1048,7 +1065,8 @@ async fn graph_vector_hybrid(
     if let Some(edge_type_weights) = body.edge_type_weights {
         scoring.edge_type_weights = edge_type_weights;
     }
-    match store.hybrid_search_with_config(
+    let start = std::time::Instant::now();
+    let outcome = store.hybrid_search_with_config(
         label_ref,
         &body.property,
         &body.query,
@@ -1056,7 +1074,12 @@ async fn graph_vector_hybrid(
         &body.graph_seeds,
         body.max_hops,
         &scoring,
-    ) {
+    );
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_VECTOR_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
         Ok(results) => {
             let items: Vec<Value> = results
                 .into_iter()
@@ -2198,49 +2221,56 @@ async fn graph_algorithm_ppr(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
-    let edges = match store.list_edges() {
-        Ok(e) => e,
-        Err(error) => return graph_store_error_response(error),
-    };
-    let mut adjacency: std::collections::HashMap<String, Vec<(String, f64)>> =
-        std::collections::HashMap::new();
-    for edge in edges.iter() {
-        if edge.tombstone {
-            continue;
-        }
-        adjacency
-            .entry(edge.from_id.clone())
-            .or_default()
-            .push((edge.to_id.clone(), edge.effective_confidence()));
-    }
     state.observability.record_ppr();
-    let scores = thg_core::personalized_pagerank(
-        &adjacency,
-        &body.seeds,
-        body.alpha,
-        body.epsilon,
-        body.max_pushes,
-    );
-    let mut entries: Vec<(String, f64)> = scores.into_iter().collect();
-    entries.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    if let Some(k) = body.top_k {
-        entries.truncate(k);
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let mut adjacency: std::collections::HashMap<String, Vec<(String, f64)>> =
+            std::collections::HashMap::new();
+        for edge in edges.iter() {
+            if edge.tombstone {
+                continue;
+            }
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push((edge.to_id.clone(), edge.effective_confidence()));
+        }
+        let scores = thg_core::personalized_pagerank(
+            &adjacency,
+            &body.seeds,
+            body.alpha,
+            body.epsilon,
+            body.max_pushes,
+        );
+        let mut entries: Vec<(String, f64)> = scores.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some(k) = body.top_k {
+            entries.truncate(k);
+        }
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "alpha": body.alpha,
+            "epsilon": body.epsilon,
+            "scores": entries
+                .into_iter()
+                .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+                .collect::<Vec<_>>(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_PPR, "ppr", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
     }
-    Json(json!({
-        "ok": true,
-        "tenant": tenant_id,
-        "alpha": body.alpha,
-        "epsilon": body.epsilon,
-        "scores": entries
-            .into_iter()
-            .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
-            .collect::<Vec<_>>(),
-    }))
-    .into_response()
 }
 
 async fn graph_algorithm_components(
@@ -2261,20 +2291,27 @@ async fn graph_algorithm_components(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
-    let edges = match store.list_edges() {
-        Ok(e) => e,
-        Err(error) => return graph_store_error_response(error),
-    };
     state.observability.record_components();
-    let components = thg_core::connected_components(&edges, body.directed);
-    Json(json!({
-        "ok": true,
-        "tenant": tenant_id,
-        "directed": body.directed,
-        "components": components,
-        "count": components.len(),
-    }))
-    .into_response()
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let components = thg_core::connected_components(&edges, body.directed);
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "directed": body.directed,
+            "components": components,
+            "count": components.len(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_COMPONENTS, "components", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
 }
 
 async fn graph_algorithm_pagerank(
@@ -2295,31 +2332,38 @@ async fn graph_algorithm_pagerank(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
-    let edges = match store.list_edges() {
-        Ok(e) => e,
-        Err(error) => return graph_store_error_response(error),
-    };
     state.observability.record_pagerank();
-    let rank = thg_core::pagerank(&edges, body.damping, body.max_iter, body.tolerance);
-    let mut entries: Vec<(String, f64)> = rank.into_iter().collect();
-    entries.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    if let Some(k) = body.top_k {
-        entries.truncate(k);
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let rank = thg_core::pagerank(&edges, body.damping, body.max_iter, body.tolerance);
+        let mut entries: Vec<(String, f64)> = rank.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some(k) = body.top_k {
+            entries.truncate(k);
+        }
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "damping": body.damping,
+            "scores": entries
+                .into_iter()
+                .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+                .collect::<Vec<_>>(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_PAGERANK, "pagerank", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
     }
-    Json(json!({
-        "ok": true,
-        "tenant": tenant_id,
-        "damping": body.damping,
-        "scores": entries
-            .into_iter()
-            .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
-            .collect::<Vec<_>>(),
-    }))
-    .into_response()
 }
 
 // ===== Phase 3: Bulk loader =====
@@ -2827,13 +2871,24 @@ async fn graph_fulltext_search(
         return status.into_response();
     }
     state.observability.record_fulltext_search();
-    match state.fulltext_search(
+    let detail = format!(
+        "label={} property={}",
+        body.label.as_deref().unwrap_or("*"),
+        body.property
+    );
+    let start = std::time::Instant::now();
+    let outcome = state.fulltext_search(
         &tenant_id,
         body.label.as_deref(),
         &body.property,
         &body.query,
         body.k,
-    ) {
+    );
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_FULLTEXT_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
         Ok(results) => {
             let items: Vec<Value> = results
                 .into_iter()
@@ -3012,30 +3067,37 @@ async fn graph_algorithm_communities(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
-    let edges = match store.list_edges() {
-        Ok(e) => e,
-        Err(error) => return graph_store_error_response(error),
-    };
     state.observability.record_communities();
-    let (community, modularity) = thg_core::label_propagation_communities(&edges);
-    let mut entries: Vec<Value> = community
-        .into_iter()
-        .map(|(node_id, c)| json!({ "node_id": node_id, "community_id": c }))
-        .collect();
-    entries.sort_by(|a, b| {
-        a["node_id"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["node_id"].as_str().unwrap_or(""))
-    });
-    Json(json!({
-        "ok": true,
-        "tenant": tenant_id,
-        "algorithm": "label_propagation",
-        "communities": entries,
-        "modularity": modularity,
-    }))
-    .into_response()
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let (community, modularity) = thg_core::label_propagation_communities(&edges);
+        let mut entries: Vec<Value> = community
+            .into_iter()
+            .map(|(node_id, c)| json!({ "node_id": node_id, "community_id": c }))
+            .collect();
+        entries.sort_by(|a, b| {
+            a["node_id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["node_id"].as_str().unwrap_or(""))
+        });
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "algorithm": "label_propagation",
+            "communities": entries,
+            "modularity": modularity,
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_COMMUNITIES, "communities", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
 }
 
 #[cfg(test)]
@@ -3049,12 +3111,16 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_vector_hybrid,
-        is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
-        required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
-        BulkQuery, HybridSearchBody, PublicCypherBody, TransactionBeginBody,
-        TransactionMutationBody,
+        default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes, default_pr_damping,
+        default_pr_max_iter, default_pr_tolerance, execute_graph_store_command,
+        execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
+        graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
+        graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
+        graph_vector_hybrid, graph_vector_search, is_cache_command, is_graph_command,
+        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
+        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
+        FullTextSearchBody, HybridSearchBody, PageRankBody, PprBody, PublicCypherBody,
+        TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
@@ -3373,6 +3439,152 @@ mod tests {
         );
         assert_eq!(payload["scoring"]["edge_type_weights"]["CONTRADICTS"], -2.0);
         assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn route_metrics_include_vector_fulltext_and_algorithm_histograms() {
+        let state = memory_product_state();
+        let tenant_id = "tenant-metrics".to_string();
+        let mut store = state.tenant_graph_store(&tenant_id).unwrap();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        store
+            .upsert_node(thg_core::NodeRecord::new(
+                "node:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0], "text": "alpha document" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(thg_core::NodeRecord::new(
+                "node:b",
+                ["Doc"],
+                json!({ "embedding": [0.8, 0.2], "text": "beta document" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(thg_core::EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "REL",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+        drop(store);
+        state
+            .designate_fulltext_property(&tenant_id, "Doc", "text")
+            .unwrap();
+
+        let vector_response = graph_vector_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(VectorSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(vector_response.status(), StatusCode::OK);
+
+        let hybrid_response = graph_vector_hybrid(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(HybridSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+                graph_seeds: vec!["node:a".to_string()],
+                max_hops: 2,
+                alpha: None,
+                confidence_weighted_graph_distance: None,
+                edge_type_weights: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(hybrid_response.status(), StatusCode::OK);
+
+        let fulltext_response = graph_fulltext_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(FullTextSearchBody {
+                label: Some("Doc".to_string()),
+                property: "text".to_string(),
+                query: "alpha".to_string(),
+                k: 2,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(fulltext_response.status(), StatusCode::OK);
+
+        let ppr_response = graph_algorithm_ppr(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(PprBody {
+                seeds: std::collections::HashMap::from([("node:a".to_string(), 1.0)]),
+                alpha: default_ppr_alpha(),
+                epsilon: default_ppr_epsilon(),
+                max_pushes: default_ppr_max_pushes(),
+                top_k: Some(2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ppr_response.status(), StatusCode::OK);
+
+        let components_response = graph_algorithm_components(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(ComponentsBody { directed: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(components_response.status(), StatusCode::OK);
+
+        let pagerank_response = graph_algorithm_pagerank(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(PageRankBody {
+                damping: default_pr_damping(),
+                max_iter: default_pr_max_iter(),
+                tolerance: default_pr_tolerance(),
+                top_k: Some(2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(pagerank_response.status(), StatusCode::OK);
+
+        let communities_response = graph_algorithm_communities(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id),
+            HeaderMap::new(),
+            Json(CommunitiesBody::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(communities_response.status(), StatusCode::OK);
+
+        let metrics = state.observability.render_prometheus();
+        assert!(metrics.contains("thg_vector_search_latency_seconds_count 2"));
+        assert!(metrics.contains("thg_fulltext_search_latency_seconds_count 1"));
+        assert!(metrics.contains("thg_algorithm_latency_seconds_ppr_count 1"));
+        assert!(metrics.contains("thg_algorithm_latency_seconds_components_count 1"));
+        assert!(metrics.contains("thg_algorithm_latency_seconds_pagerank_count 1"));
+        assert!(metrics.contains("thg_algorithm_latency_seconds_communities_count 1"));
     }
 
     #[tokio::test]

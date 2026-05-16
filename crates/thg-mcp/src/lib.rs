@@ -209,10 +209,7 @@ pub trait McpGraphBackend {
 
     /// Bulk upsert NodeRecords. Default impl loops `upsert_node` per record;
     /// concrete impls that have a faster batch primitive can override.
-    fn bulk_upsert_nodes(
-        &mut self,
-        records: Vec<NodeRecord>,
-    ) -> GraphStoreResult<(usize, usize)> {
+    fn bulk_upsert_nodes(&mut self, records: Vec<NodeRecord>) -> GraphStoreResult<(usize, usize)> {
         let mut inserted = 0usize;
         let mut failed = 0usize;
         for record in records {
@@ -225,10 +222,7 @@ pub trait McpGraphBackend {
     }
 
     /// Bulk upsert EdgeRecords. Default impl loops `upsert_edge` per record.
-    fn bulk_upsert_edges(
-        &mut self,
-        records: Vec<EdgeRecord>,
-    ) -> GraphStoreResult<(usize, usize)> {
+    fn bulk_upsert_edges(&mut self, records: Vec<EdgeRecord>) -> GraphStoreResult<(usize, usize)> {
         let mut inserted = 0usize;
         let mut failed = 0usize;
         for record in records {
@@ -2635,10 +2629,18 @@ mod tests {
         // `connected_components` ignores nodes that don't appear in any edge,
         // so a dangling node won't form its own component.
         let mut store = InMemoryGraphStore::default();
-        store.upsert_node(NodeRecord::new("a", ["Doc"], json!({}))).unwrap();
-        store.upsert_node(NodeRecord::new("b", ["Doc"], json!({}))).unwrap();
-        store.upsert_node(NodeRecord::new("c", ["Doc"], json!({}))).unwrap();
-        store.upsert_node(NodeRecord::new("d", ["Doc"], json!({}))).unwrap();
+        store
+            .upsert_node(NodeRecord::new("a", ["Doc"], json!({})))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("b", ["Doc"], json!({})))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("c", ["Doc"], json!({})))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("d", ["Doc"], json!({})))
+            .unwrap();
         store
             .upsert_edge(EdgeRecord::new("e1", "a", "T", "b", json!({})))
             .unwrap();

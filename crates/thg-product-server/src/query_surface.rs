@@ -1333,12 +1333,7 @@ fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
     // WITH, ORDER BY, SKIP are now supported by §P2-C (pc.2.1..pc.3.1) along
     // with SUM/AVG/MIN/MAX aggregations. OPTIONAL MATCH, UNION, CALL, and
     // DISTINCT remain unsupported.
-    for keyword in [
-        " OPTIONAL MATCH ",
-        " UNION ",
-        " CALL ",
-        " DISTINCT ",
-    ] {
+    for keyword in [" OPTIONAL MATCH ", " UNION ", " CALL ", " DISTINCT "] {
         if upper.contains(keyword) {
             return Err(QuerySurfaceError::unsupported(
                 keyword.trim(),

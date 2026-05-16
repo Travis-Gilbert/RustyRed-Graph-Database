@@ -700,7 +700,11 @@ mod tests {
         let h = Histogram::new(LATENCY_BUCKETS_SECONDS);
         h.observe_nanos(3_000_000); // 3 ms
         let mut out = String::new();
-        h.render(&mut out, "thg_test_latency_seconds", "test latency histogram");
+        h.render(
+            &mut out,
+            "thg_test_latency_seconds",
+            "test latency histogram",
+        );
         assert!(out.contains("thg_test_latency_seconds_bucket{le=\"0.005\"}"));
         assert!(out.contains("thg_test_latency_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(out.contains("thg_test_latency_seconds_sum "));
