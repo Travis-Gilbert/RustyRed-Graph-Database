@@ -3,6 +3,7 @@
 //! Entry point: `parse_cypher_pest`. Returns the same `ParsedCypher` the
 //! executor consumed before the migration.
 
+pub mod ast;
 pub mod parse;
 
 #[cfg(test)]
