@@ -501,6 +501,12 @@ fn normalize_kind(kind: &str) -> Result<String, GraphStoreError> {
         "retrieval" | "retrieval_plan" => "retrieval_plan",
         "semantic_answer" | "semantic_answer_candidate" => "semantic_answer_candidate",
         "modal_parse" | "modal_parse_result" => "modal_parse_result",
+        // §P6-A pa6.2: explicit normalization for the two cache kinds the SPEC
+        // requires participate in graph_version invalidation. Without these
+        // arms, both kinds dropped through to the empty-string fallthrough and
+        // were rejected as `unsupported_graph_cache_kind`.
+        "vector_search" | "vector_search_result" => "vector_search_result",
+        "epistemic" | "epistemic_traversal" => "epistemic_traversal",
         _ => "",
     };
     if normalized.is_empty() || !SUPPORTED_CACHE_KINDS.contains(&normalized) {
@@ -686,5 +692,128 @@ mod tests {
         assert_eq!(result.removed, 1);
         assert_eq!(result.remaining, 0);
         assert_eq!(cache.stats(9).unwrap().invalidations, 1);
+    }
+
+    // §P6-A pa6.2: confirm `vector_search_result` and `epistemic_traversal`
+    // cache kinds participate in the same `graph_version` invalidation flow
+    // that powers every other supported kind.
+    #[test]
+    fn vector_search_result_cache_kind_invalidates_on_graph_version() {
+        let cache = GraphCacheTenant::default();
+        cache
+            .put(
+                GraphCachePutBody {
+                    tenant_id: None,
+                    kind: "vector_search_result".to_string(),
+                    key: json!({ "label": "Doc", "query": "lorem" }),
+                    value: json!({ "results": ["node:a"] }),
+                    metadata: json!({ "operation": "vector_search" }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                5,
+            )
+            .unwrap();
+
+        // Same graph_version: fresh hit.
+        let fresh = cache
+            .get(
+                GraphCacheLookupBody {
+                    tenant_id: None,
+                    kind: "vector_search_result".to_string(),
+                    key: json!({ "label": "Doc", "query": "lorem" }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                5,
+            )
+            .unwrap();
+        assert!(fresh.accepted && !fresh.stale);
+
+        // Bump graph_version: cache must mark the entry stale.
+        let stale = cache
+            .get(
+                GraphCacheLookupBody {
+                    tenant_id: None,
+                    kind: "vector_search_result".to_string(),
+                    key: json!({ "label": "Doc", "query": "lorem" }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                6,
+            )
+            .unwrap();
+        assert!(
+            stale.stale,
+            "vector_search_result entry must become stale at the next graph_version",
+        );
+    }
+
+    #[test]
+    fn epistemic_traversal_cache_kind_invalidates_on_graph_version() {
+        let cache = GraphCacheTenant::default();
+        cache
+            .put(
+                GraphCachePutBody {
+                    tenant_id: None,
+                    kind: "epistemic_traversal".to_string(),
+                    key: json!({ "node_id": "node:root", "max_depth": 2 }),
+                    value: json!({ "hits": ["node:leaf"] }),
+                    metadata: json!({ "operation": "epistemic_neighbors" }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                12,
+            )
+            .unwrap();
+
+        let fresh = cache
+            .get(
+                GraphCacheLookupBody {
+                    tenant_id: None,
+                    kind: "epistemic_traversal".to_string(),
+                    key: json!({ "node_id": "node:root", "max_depth": 2 }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                12,
+            )
+            .unwrap();
+        assert!(fresh.accepted && !fresh.stale);
+
+        let stale = cache
+            .get(
+                GraphCacheLookupBody {
+                    tenant_id: None,
+                    kind: "epistemic_traversal".to_string(),
+                    key: json!({ "node_id": "node:root", "max_depth": 2 }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                13,
+            )
+            .unwrap();
+        assert!(
+            stale.stale,
+            "epistemic_traversal entry must become stale at the next graph_version",
+        );
     }
 }
