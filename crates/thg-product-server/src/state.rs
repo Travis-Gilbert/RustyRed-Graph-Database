@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use thg_core::store::RedisThgStore;
 use thg_core::{
-    sanitize_tenant_segment, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction,
-    GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialDesignation, SpatialIndex,
-    VectorDesignation, VerifyReport,
+    sanitize_tenant_segment, EdgeRecord, EpistemicType, FullTextDesignation, FullTextIndex,
+    GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphStats, GraphStoreError,
+    GraphStoreResult, GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
+    SpatialDesignation, SpatialIndex, VectorDesignation, VerifyReport,
 };
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
@@ -35,6 +35,10 @@ struct GraphTransactionContext {
 /// (label, lat_property, lon_property).
 type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), SpatialIndex>>;
 
+/// Per-tenant Phase 5 full-text indexes. Keyed by tenant_id then by
+/// (label, property).
+type FullTextIndexes = BTreeMap<String, BTreeMap<(String, String), FullTextIndex>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -44,6 +48,7 @@ pub struct AppState {
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
+    fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
 }
 
 impl AppState {
@@ -56,7 +61,115 @@ impl AppState {
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    // ===== Phase 5: full-text designation + indexing =====
+
+    pub fn designate_fulltext_property(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        property: &str,
+    ) -> Result<(), StoreAccessError> {
+        let store = self.tenant_graph_store(tenant_id)?;
+        let designation = FullTextDesignation {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        let mut index = FullTextIndex::for_designation(designation);
+        // Bulk-index any existing nodes for the label.
+        let nodes = store
+            .query_nodes(NodeQuery {
+                label: Some(label.to_string()),
+                ..NodeQuery::default()
+            })
+            .map_err(StoreAccessError::from)?;
+        for node in nodes {
+            if let Some(text) = node.properties.get(property).and_then(|v| v.as_str()) {
+                index.upsert(&node.id, text);
+            }
+        }
+        let mut indexes = self
+            .fulltext_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("fulltext index lock poisoned"))?;
+        indexes
+            .entry(tenant_id.to_string())
+            .or_default()
+            .insert((label.to_string(), property.to_string()), index);
+        Ok(())
+    }
+
+    pub fn maybe_index_node_fulltext(&self, tenant_id: &str, node: &NodeRecord) {
+        let Ok(mut indexes) = self.fulltext_indexes.lock() else {
+            return;
+        };
+        let Some(tenant_map) = indexes.get_mut(tenant_id) else {
+            return;
+        };
+        for ((label, property), index) in tenant_map.iter_mut() {
+            if !node.labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if let Some(text) = node.properties.get(property).and_then(|v| v.as_str()) {
+                index.upsert(&node.id, text);
+            } else {
+                index.remove(&node.id);
+            }
+        }
+    }
+
+    pub fn fulltext_search(
+        &self,
+        tenant_id: &str,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, StoreAccessError> {
+        let indexes = self
+            .fulltext_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("fulltext index lock poisoned"))?;
+        let Some(tenant_map) = indexes.get(tenant_id) else {
+            return Err(StoreAccessError::unsupported(
+                "no fulltext designations for this tenant",
+            ));
+        };
+        // If label given, search just that (label, property). Otherwise union
+        // over every label that has this property indexed.
+        let mut combined: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for ((idx_label, idx_property), index) in tenant_map.iter() {
+            if idx_property != property {
+                continue;
+            }
+            if let Some(label_filter) = label {
+                if idx_label != label_filter {
+                    continue;
+                }
+            }
+            for (id, score) in index.search(query, k) {
+                let slot = combined.entry(id).or_insert(0.0);
+                if score > *slot {
+                    *slot = score;
+                }
+            }
+        }
+        if combined.is_empty() {
+            return Err(StoreAccessError::unsupported(
+                "no matching fulltext designation; call /fulltext/designate first",
+            ));
+        }
+        let mut entries: Vec<(String, f32)> = combined.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        entries.truncate(k);
+        Ok(entries)
     }
 
     // ===== Phase 8: spatial designation + indexing =====

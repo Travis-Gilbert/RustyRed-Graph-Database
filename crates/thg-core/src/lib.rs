@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod errors;
 pub mod executor;
+pub mod fulltext;
 pub mod graph;
 pub mod graph_store;
 pub mod spatial;
@@ -31,5 +32,6 @@ pub use graph_store::{
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
+pub use fulltext::{FullTextDesignation, FullTextIndex};
 pub use spatial::{SpatialDesignation, SpatialError, SpatialIndex};
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};

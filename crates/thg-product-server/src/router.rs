@@ -297,6 +297,14 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/graph/spatial/bbox",
             post(graph_spatial_bbox),
         )
+        .route(
+            "/v1/tenants/:tenant_id/graph/fulltext/designate",
+            post(graph_fulltext_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/fulltext/search",
+            post(graph_fulltext_search),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -1105,11 +1113,12 @@ async fn graph_node_upsert(
         Err(error) => return store_unavailable_response(error),
     };
     let record = body.into_record();
-    let spatial_clone = record.clone();
+    let index_clone = record.clone();
     match store.upsert_node(record) {
         Ok(result) => {
             state.observability.record_mutation();
-            state.maybe_index_node_spatially(&tenant_id, &spatial_clone);
+            state.maybe_index_node_spatially(&tenant_id, &index_clone);
+            state.maybe_index_node_fulltext(&tenant_id, &index_clone);
             Json(json!({ "ok": true, "node": result })).into_response()
         }
         Err(error) => {
@@ -2283,6 +2292,95 @@ async fn graph_algorithm_pagerank(
             .collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+// ===== Phase 5: Full-text endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct FullTextDesignateBody {
+    label: String,
+    property: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FullTextSearchBody {
+    #[serde(default)]
+    label: Option<String>,
+    property: String,
+    query: String,
+    #[serde(default = "default_fulltext_k")]
+    k: usize,
+}
+
+fn default_fulltext_k() -> usize {
+    10
+}
+
+async fn graph_fulltext_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FullTextDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    match state.designate_fulltext_property(&tenant_id, &body.label, &body.property) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "label": body.label,
+            "property": body.property,
+        }))
+        .into_response(),
+        Err(error) => {
+            state.observability.record_error();
+            store_unavailable_response(error)
+        }
+    }
+}
+
+async fn graph_fulltext_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FullTextSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_fulltext_search();
+    match state.fulltext_search(
+        &tenant_id,
+        body.label.as_deref(),
+        &body.property,
+        &body.query,
+        body.k,
+    ) {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(id, score)| json!({ "node_id": id, "score": score }))
+                .collect();
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "results": items,
+            }))
+            .into_response()
+        }
+        Err(error) => store_unavailable_response(error),
+    }
 }
 
 // ===== Phase 8: Spatial endpoints =====
