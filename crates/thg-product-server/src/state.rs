@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, RwLock,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use thg_core::store::RedisThgStore;
@@ -15,11 +19,23 @@ use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
 
+const GRAPH_TRANSACTION_TTL_MS: u64 = 5 * 60 * 1000;
+
+#[derive(Clone, Debug)]
+struct GraphTransactionContext {
+    tenant_id: String,
+    snapshot_version: u64,
+    created_at_ms: u64,
+    mutations: GraphMutationBatch,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     redcore_stores: Arc<Mutex<BTreeMap<String, Arc<RedCoreTenantExecutor>>>>,
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
+    graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
+    next_graph_txn_id: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -28,7 +44,160 @@ impl AppState {
             config: Arc::new(config),
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
+            graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
+            next_graph_txn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn begin_graph_transaction(&self, tenant_id: &str) -> Result<String, StoreAccessError> {
+        self.purge_expired_graph_transactions()?;
+        let store = match self.tenant_graph_store(tenant_id)? {
+            TenantGraphStore::RedCore(store) => store,
+            TenantGraphStore::Redis(_) => {
+                return Err(StoreAccessError::unsupported(
+                    "graph transactions are supported for RedCore-backed tenants only",
+                ));
+            }
+        };
+        let snapshot_version = store.stats().map_err(StoreAccessError::from)?.version;
+        let tx_id = format!(
+            "tx-{}",
+            self.next_graph_txn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let context = GraphTransactionContext {
+            tenant_id: tenant_id.to_string(),
+            snapshot_version,
+            created_at_ms: now_millis(),
+            mutations: GraphMutationBatch::default(),
+        };
+        let mut transactions = self
+            .graph_transactions
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+        transactions.insert(tx_id.clone(), context);
+        Ok(tx_id)
+    }
+
+    pub fn append_graph_transaction_mutations(
+        &self,
+        tenant_id: &str,
+        tx_id: &str,
+        batch: GraphMutationBatch,
+    ) -> Result<usize, StoreAccessError> {
+        self.purge_expired_graph_transactions()?;
+        if batch.mutations.is_empty() {
+            return Err(StoreAccessError::from(GraphStoreError::new(
+                "empty_graph_transaction",
+                "transaction batch must include at least one mutation",
+            )));
+        }
+        let mut transactions = self
+            .graph_transactions
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+        let Some(context) = transactions.get_mut(tx_id) else {
+            return Err(StoreAccessError::unsupported("graph transaction not found"));
+        };
+        if context.tenant_id != tenant_id {
+            return Err(StoreAccessError::unsupported(
+                "graph transaction tenant mismatch",
+            ));
+        }
+        context
+            .mutations
+            .mutations
+            .extend(batch.mutations.into_iter());
+        Ok(context.mutations.mutations.len())
+    }
+
+    pub fn commit_graph_transaction(
+        &self,
+        tenant_id: &str,
+        tx_id: &str,
+    ) -> Result<GraphTransaction, StoreAccessError> {
+        self.purge_expired_graph_transactions()?;
+        let store = match self.tenant_graph_store(tenant_id)? {
+            TenantGraphStore::RedCore(store) => store,
+            TenantGraphStore::Redis(_) => {
+                return Err(StoreAccessError::unsupported(
+                    "graph transactions are supported for RedCore-backed tenants only",
+                ));
+            }
+        };
+        let context = {
+            let transactions = self
+                .graph_transactions
+                .lock()
+                .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+            let context = transactions.get(tx_id).ok_or_else(|| {
+                StoreAccessError::unsupported("graph transaction not found or already committed")
+            })?;
+            if context.tenant_id != tenant_id {
+                return Err(StoreAccessError::unsupported(
+                    "graph transaction tenant mismatch",
+                ));
+            }
+            context.clone()
+        };
+        if context.mutations.mutations.is_empty() {
+            return Err(StoreAccessError::from(GraphStoreError::new(
+                "empty_graph_transaction",
+                "graph transactions must include at least one mutation",
+            )));
+        }
+        let current_version = store.stats().map_err(StoreAccessError::from)?.version;
+        if current_version != context.snapshot_version {
+            return Err(StoreAccessError::unsupported(
+                "graph transaction snapshot conflict",
+            ));
+        }
+        let transaction = store
+            .commit_batch(context.mutations)
+            .map_err(StoreAccessError::from)?;
+        let mut transactions = self
+            .graph_transactions
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+        transactions.remove(tx_id);
+        Ok(transaction)
+    }
+
+    pub fn rollback_graph_transaction(
+        &self,
+        tenant_id: &str,
+        tx_id: &str,
+    ) -> Result<(), StoreAccessError> {
+        self.purge_expired_graph_transactions()?;
+        let mut transactions = self
+            .graph_transactions
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+        let Some(context) = transactions.get(tx_id) else {
+            return Err(StoreAccessError::unsupported("graph transaction not found"));
+        };
+        if context.tenant_id != tenant_id {
+            return Err(StoreAccessError::unsupported(
+                "graph transaction tenant mismatch",
+            ));
+        }
+        transactions.remove(tx_id);
+        Ok(())
+    }
+
+    fn purge_expired_graph_transactions(&self) -> Result<(), StoreAccessError> {
+        let now_ms = now_millis();
+        self.purge_expired_graph_transactions_at(now_ms)
+    }
+
+    fn purge_expired_graph_transactions_at(&self, now_ms: u64) -> Result<(), StoreAccessError> {
+        let mut transactions = self
+            .graph_transactions
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph transaction store lock poisoned"))?;
+        transactions.retain(|_, context| {
+            now_ms.saturating_sub(context.created_at_ms) <= GRAPH_TRANSACTION_TTL_MS
+        });
+        Ok(())
     }
 
     pub fn tenant_store(&self, tenant_id: &str) -> Result<RedisThgStore, StoreAccessError> {
@@ -467,6 +636,13 @@ impl RedCoreTenantExecutor {
     }
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub enum TenantGraphStore {
     RedCore(Arc<RedCoreTenantExecutor>),
@@ -730,7 +906,13 @@ impl McpGraphBackend for TenantGraphStore {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
-        TenantGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth)
+        TenantGraphStore::epistemic_neighbors(
+            self,
+            node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+        )
     }
 }
 
@@ -1028,6 +1210,130 @@ mod tests {
         let stats = executor.stats().unwrap();
 
         assert_eq!(stats.memory_quota_bytes, 128);
+    }
+
+    #[test]
+    fn graph_transactions_expire_after_ttl_interval() {
+        let state = AppState::new(memory_config());
+
+        let tx_id = state.begin_graph_transaction("tenant-a").unwrap();
+        let mut stale_time = super::now_millis();
+        stale_time += super::GRAPH_TRANSACTION_TTL_MS + 1;
+        state
+            .purge_expired_graph_transactions_at(stale_time)
+            .expect("graph transaction expiry check");
+
+        let error = state
+            .append_graph_transaction_mutations(
+                "tenant-a",
+                &tx_id,
+                GraphMutationBatch::new([GraphMutation::NodeUpsert(NodeRecord::new(
+                    "node:ttl",
+                    ["File"],
+                    json!({ "path": "src/ttl.rs" }),
+                ))]),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "store_mode_unsupported");
+        assert_eq!(error.message, "graph transaction not found");
+    }
+
+    #[test]
+    fn graph_transaction_wrong_tenant_commit_preserves_staged_work() {
+        let state = AppState::new(memory_config());
+        let tx_id = state.begin_graph_transaction("tenant-a").unwrap();
+        state
+            .append_graph_transaction_mutations(
+                "tenant-a",
+                &tx_id,
+                GraphMutationBatch::new([GraphMutation::NodeUpsert(NodeRecord::new(
+                    "node:tenant-a",
+                    ["File"],
+                    json!({ "path": "src/lib.rs" }),
+                ))]),
+            )
+            .unwrap();
+
+        let error = state
+            .commit_graph_transaction("tenant-b", &tx_id)
+            .unwrap_err();
+        assert_eq!(error.code, "store_mode_unsupported");
+        assert_eq!(error.message, "graph transaction tenant mismatch");
+
+        let transaction = state.commit_graph_transaction("tenant-a", &tx_id).unwrap();
+        assert_eq!(transaction.writes.len(), 1);
+        let store = state.tenant_graph_store("tenant-a").unwrap();
+        assert!(store.get_node("node:tenant-a").unwrap().is_some());
+    }
+
+    #[test]
+    fn graph_transaction_wrong_tenant_rollback_preserves_staged_work() {
+        let state = AppState::new(memory_config());
+        let tx_id = state.begin_graph_transaction("tenant-a").unwrap();
+
+        let error = state
+            .rollback_graph_transaction("tenant-b", &tx_id)
+            .unwrap_err();
+        assert_eq!(error.code, "store_mode_unsupported");
+        assert_eq!(error.message, "graph transaction tenant mismatch");
+
+        state
+            .rollback_graph_transaction("tenant-a", &tx_id)
+            .expect("owner tenant can still rollback after wrong-tenant attempt");
+        let error = state
+            .rollback_graph_transaction("tenant-a", &tx_id)
+            .unwrap_err();
+        assert_eq!(error.message, "graph transaction not found");
+    }
+
+    #[test]
+    fn graph_transactions_do_not_survive_state_restart() {
+        let config = memory_config();
+        let tx_id = {
+            let active_state = AppState::new(config.clone());
+            active_state.begin_graph_transaction("tenant-a").unwrap()
+        };
+        let fresh_state = AppState::new(config);
+        let error = fresh_state
+            .commit_graph_transaction("tenant-a", &tx_id)
+            .unwrap_err();
+
+        assert_eq!(error.code, "store_mode_unsupported");
+        assert_eq!(
+            error.message,
+            "graph transaction not found or already committed"
+        );
+    }
+
+    fn memory_config() -> Config {
+        Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        }
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {

@@ -901,7 +901,9 @@ impl InMemoryGraphStore {
             .ok_or_else(|| {
                 GraphStoreError::new(
                     "no_vector_designation",
-                    format!("no vector designation covers property {property_name} for node {node_id}"),
+                    format!(
+                        "no vector designation covers property {property_name} for node {node_id}"
+                    ),
                 )
             })?
             .clone();
@@ -910,10 +912,7 @@ impl InMemoryGraphStore {
         if vector.len() != expected_dim {
             return Err(GraphStoreError::new(
                 "dimension_mismatch",
-                format!(
-                    "expected {expected_dim} dimensions, got {}",
-                    vector.len()
-                ),
+                format!("expected {expected_dim} dimensions, got {}", vector.len()),
             ));
         }
         let idx = self
@@ -988,11 +987,7 @@ impl InMemoryGraphStore {
             .filter(|e| !e.tombstone)
             .map(|e| (e.from_id.clone(), e.edge_type.clone(), e.to_id.clone()))
             .collect();
-        let expansion = crate::graph::expand_bounded(
-            all_edges,
-            graph_seeds.to_vec(),
-            max_hops,
-        );
+        let expansion = crate::graph::expand_bounded(all_edges, graph_seeds.to_vec(), max_hops);
         let graph_distances: HashMap<String, usize> = expansion.into_iter().collect();
         let max_vec_dist = vector_results
             .iter()
@@ -3480,7 +3475,6 @@ mod tests {
     use super::{
         Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, InMemoryGraphStore,
         NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
-        VectorDesignation,
     };
 
     #[test]
@@ -4261,11 +4255,7 @@ mod tests {
             ("doc:3", vec![0.7, 0.7, 0.0]),
         ] {
             store
-                .upsert_node(NodeRecord::new(
-                    id,
-                    ["Doc"],
-                    json!({ "embedding": vec }),
-                ))
+                .upsert_node(NodeRecord::new(id, ["Doc"], json!({ "embedding": vec })))
                 .unwrap();
         }
 
@@ -4274,7 +4264,10 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "doc:1");
-        assert!(results[0].1 < 0.01, "exact match should have near-zero distance");
+        assert!(
+            results[0].1 < 0.01,
+            "exact match should have near-zero distance"
+        );
         assert_eq!(results[1].0, "doc:3");
     }
 
@@ -4296,7 +4289,10 @@ mod tests {
             .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 2)
             .unwrap_err();
         let msg = format!("{:?}", err);
-        assert!(msg.contains("dimension"), "error should mention dimension: {msg}");
+        assert!(
+            msg.contains("dimension"),
+            "error should mention dimension: {msg}"
+        );
     }
 
     #[test]

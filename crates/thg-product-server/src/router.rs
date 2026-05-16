@@ -25,8 +25,8 @@ use crate::graph_cache::{
     GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
 };
 use crate::query_surface::{
-    execute_cypher_query, execute_public_query, explain_cypher_query, resolve_tenant_id,
-    PublicCypherBody, QuerySurfaceError,
+    execute_cypher_query, execute_public_query, explain_cypher_query, parse_tx_cypher_mutations,
+    resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
 };
 use crate::state::{AppState, StoreAccessError, TenantGraphStore};
 
@@ -161,6 +161,19 @@ pub struct EpistemicNeighborsBody {
     pub max_depth: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TransactionBeginBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionMutationBody {
+    pub tx_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -188,6 +201,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/query", post(public_query))
         .route("/v1/cypher", post(public_cypher))
         .route("/v1/cypher/explain", post(public_cypher_explain))
+        .route("/v1/transactions/begin", post(transaction_begin))
+        .route("/v1/transactions/commit", post(transaction_commit))
+        .route("/v1/transactions/rollback", post(transaction_rollback))
         .route("/v1/cache/put", post(root_cache_put))
         .route("/v1/cache/get", post(root_cache_get))
         .route("/v1/cache/check", post(root_cache_check))
@@ -614,10 +630,17 @@ async fn public_cypher(
     headers: HeaderMap,
     Json(body): Json<PublicCypherBody>,
 ) -> impl IntoResponse {
+    let write_scope = body.tx_id.is_some();
+    let scope = if write_scope {
+        "graph:write"
+    } else {
+        "graph:read"
+    };
+
     if let Err(status) = require_scope(
         &headers,
         &state.config.api_tokens,
-        "graph:read",
+        scope,
         state.config.require_auth,
     ) {
         return status.into_response();
@@ -630,6 +653,32 @@ async fn public_cypher(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Some(tx_id) = body.tx_id.as_deref() {
+        if tx_id.trim().is_empty() {
+            return query_surface_error_response(QuerySurfaceError::invalid(
+                "missing_tx_id",
+                "tx_id is required when staging transactional Cypher statements",
+            ));
+        }
+        let mutations = match parse_tx_cypher_mutations(&body.query, &body.params) {
+            Ok(mutations) => mutations,
+            Err(error) => return query_surface_error_response(error),
+        };
+        let staged_mutations =
+            match state.append_graph_transaction_mutations(&tenant_id, tx_id, mutations) {
+                Ok(staged_mutations) => staged_mutations,
+                Err(error) => return graph_store_error_response(transaction_state_error(error)),
+            };
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": body.query,
+            "tx_id": tx_id,
+            "subset": "opencypher_v0_1_write_tx",
+            "staged_mutations": staged_mutations,
+        }))
+        .into_response();
+    }
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
@@ -638,6 +687,119 @@ async fn public_cypher(
         Ok(payload) => Json(payload).into_response(),
         Err(error) => query_surface_error_response(error),
     }
+}
+
+async fn transaction_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionBeginBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    let tx_id = match state.begin_graph_transaction(&tenant_id) {
+        Ok(tx_id) => tx_id,
+        Err(error) => return graph_store_error_response(transaction_state_error(error)),
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "tx_id": tx_id,
+    }))
+    .into_response()
+}
+
+async fn transaction_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionMutationBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tx_id = body.tx_id.trim();
+    if tx_id.is_empty() {
+        return query_surface_error_response(QuerySurfaceError::invalid(
+            "missing_tx_id",
+            "tx_id is required for transaction commit",
+        ));
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    let transaction = match state.commit_graph_transaction(&tenant_id, tx_id) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(transaction_state_error(error)),
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "transaction": transaction,
+    }))
+    .into_response()
+}
+
+async fn transaction_rollback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionMutationBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tx_id = body.tx_id.trim();
+    if tx_id.is_empty() {
+        return query_surface_error_response(QuerySurfaceError::invalid(
+            "missing_tx_id",
+            "tx_id is required for transaction rollback",
+        ));
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(error) = state.rollback_graph_transaction(&tenant_id, tx_id) {
+        return graph_store_error_response(transaction_state_error(error));
+    }
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "tx_id": tx_id,
+        "status": "rolled_back",
+    }))
+    .into_response()
 }
 
 async fn public_cypher_explain(
@@ -838,7 +1000,12 @@ async fn graph_epistemic_neighbors(
     };
 
     let types_ref = body.epistemic_types.as_deref();
-    match store.epistemic_neighbors(&body.node_id, types_ref, body.min_confidence, body.max_depth) {
+    match store.epistemic_neighbors(
+        &body.node_id,
+        types_ref,
+        body.min_confidence,
+        body.max_depth,
+    ) {
         Ok(results) => {
             let items: Vec<Value> = results
                 .into_iter()
@@ -1732,6 +1899,14 @@ fn store_unavailable_response(error: StoreAccessError) -> axum::response::Respon
     (StatusCode::SERVICE_UNAVAILABLE, Json(error.as_payload())).into_response()
 }
 
+fn transaction_state_error(error: StoreAccessError) -> GraphStoreError {
+    if error.code == "store_mode_unsupported" {
+        GraphStoreError::new("unsupported_operation", error.message)
+    } else {
+        GraphStoreError::new(error.code, error.message)
+    }
+}
+
 fn graph_store_error_response(error: GraphStoreError) -> axum::response::Response {
     (
         graph_error_status(error.code.as_str()),
@@ -1831,19 +2006,65 @@ fn mcp_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use axum::body::to_bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    use serde_json::json;
+    use axum::response::IntoResponse;
+    use axum::Json;
+    use serde_json::{json, Value};
 
     use super::{
         execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        graph_error_status, is_cache_command, is_graph_command, mcp_origin_allowed,
-        required_scope_for_command,
+        graph_error_status, is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
+        required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
+        PublicCypherBody, TransactionBeginBody, TransactionMutationBody,
     };
     use crate::{
         config::{Config, StorageMode},
         state::AppState,
     };
     use thg_core::RedCoreDurability;
+
+    async fn response_payload_json(response: axum::response::Response) -> Value {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn memory_product_state() -> AppState {
+        AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        })
+    }
 
     #[test]
     fn maps_core_commands_to_product_scopes() {
@@ -1925,33 +2146,7 @@ mod tests {
 
     #[test]
     fn graph_rebuild_command_returns_before_and_after_reports() {
-        let state = AppState::new(Config {
-            host: "127.0.0.1".to_string(),
-            port: 8380,
-            storage_mode: StorageMode::Memory,
-            data_dir: "data/rusty-red".to_string(),
-            require_volume: false,
-            volume_available: false,
-            durability: RedCoreDurability::None,
-            snapshot_interval_writes: 0,
-            strict_acid: false,
-            concurrency: "single_writer".to_string(),
-            txn_isolation: "snapshot".to_string(),
-            tenant_memory_quota_bytes: 0,
-            tenant_memory_quota_config_error: None,
-            redis_url: "not-a-redis-url".to_string(),
-            redis_key_prefix: "rusty-red".to_string(),
-            require_auth: false,
-            allowed_origins: Vec::new(),
-            api_tokens: Vec::new(),
-            service_name: "rusty-red".to_string(),
-            api_title: "Rusty Red".to_string(),
-            public_url: None,
-            mcp_enabled: true,
-            mcp_read_only: true,
-            mcp_allow_admin: false,
-            mcp_default_tenant: "default".to_string(),
-        });
+        let state = memory_product_state();
         let mut store = state.tenant_graph_store("tenant-a").unwrap();
 
         let write = execute_graph_store_command(
@@ -1995,33 +2190,7 @@ mod tests {
 
     #[test]
     fn cache_command_reports_stale_after_graph_write_advances_version() {
-        let state = AppState::new(Config {
-            host: "127.0.0.1".to_string(),
-            port: 8380,
-            storage_mode: StorageMode::Memory,
-            data_dir: "data/rusty-red".to_string(),
-            require_volume: false,
-            volume_available: false,
-            durability: RedCoreDurability::None,
-            snapshot_interval_writes: 0,
-            strict_acid: false,
-            concurrency: "single_writer".to_string(),
-            txn_isolation: "snapshot".to_string(),
-            tenant_memory_quota_bytes: 0,
-            tenant_memory_quota_config_error: None,
-            redis_url: "not-a-redis-url".to_string(),
-            redis_key_prefix: "rusty-red".to_string(),
-            require_auth: false,
-            allowed_origins: Vec::new(),
-            api_tokens: Vec::new(),
-            service_name: "rusty-red".to_string(),
-            api_title: "Rusty Red".to_string(),
-            public_url: None,
-            mcp_enabled: true,
-            mcp_read_only: true,
-            mcp_allow_admin: false,
-            mcp_default_tenant: "default".to_string(),
-        });
+        let state = memory_product_state();
 
         let first_write = execute_tenant_command(
             &state,
@@ -2089,5 +2258,139 @@ mod tests {
 
         headers.insert("origin", HeaderValue::from_static("https://evil.example"));
         assert!(!mcp_origin_allowed(&headers, &allowed));
+    }
+
+    #[tokio::test]
+    async fn transaction_routes_support_begin_stage_and_commit() {
+        let state = memory_product_state();
+        let begin_response = transaction_begin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionBeginBody {
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(begin_response.status(), StatusCode::OK);
+
+        let begin_payload = response_payload_json(begin_response).await;
+        let tx_id = begin_payload["tx_id"]
+            .as_str()
+            .expect("transaction id in begin response");
+
+        let stage_response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                tenant_id: Some("tenant-tx".to_string()),
+                query: "CREATE (n:File {id: $id, path: $path})".to_string(),
+                params: BTreeMap::from([
+                    ("id".to_string(), json!("node:tx-commit")),
+                    ("path".to_string(), json!("src/main.rs")),
+                ]),
+                tx_id: Some(tx_id.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stage_response.status(), StatusCode::OK);
+
+        let stage_payload = response_payload_json(stage_response).await;
+        assert_eq!(stage_payload["ok"], true);
+        assert_eq!(stage_payload["staged_mutations"], 1);
+        assert_eq!(stage_payload["tx_id"], tx_id);
+
+        let commit_response = transaction_commit(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: tx_id.to_string(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::OK);
+
+        let commit_payload = response_payload_json(commit_response).await;
+        assert_eq!(commit_payload["ok"], true);
+        assert_eq!(commit_payload["tenant"], "tenant-tx");
+        assert!(commit_payload["transaction"]["writes"].as_array().is_some());
+
+        let store = state.tenant_graph_store("tenant-tx").unwrap();
+        let node = store.get_node("node:tx-commit").unwrap().unwrap();
+        assert_eq!(node.id, "node:tx-commit");
+    }
+
+    #[tokio::test]
+    async fn transaction_routes_support_rollback() {
+        let state = memory_product_state();
+        let begin_response = transaction_begin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionBeginBody {
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(begin_response.status(), StatusCode::OK);
+        let begin_payload = response_payload_json(begin_response).await;
+        let tx_id = begin_payload["tx_id"].as_str().unwrap();
+
+        let stage_response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                tenant_id: Some("tenant-tx".to_string()),
+                query: "CREATE (n:File {id: $id, path: $path})".to_string(),
+                params: BTreeMap::from([
+                    ("id".to_string(), json!("node:tx-rollback")),
+                    ("path".to_string(), json!("src/rollback.rs")),
+                ]),
+                tx_id: Some(tx_id.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stage_response.status(), StatusCode::OK);
+
+        let rollback_response = transaction_rollback(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: tx_id.to_string(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = response_payload_json(rollback_response).await;
+        assert_eq!(rollback_payload["status"], "rolled_back");
+        assert_eq!(rollback_payload["tx_id"], tx_id);
+
+        let store = state.tenant_graph_store("tenant-tx").unwrap();
+        assert!(store.get_node("node:tx-rollback").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_commit_rejects_missing_tx_id() {
+        let state = memory_product_state();
+        let response = transaction_commit(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: String::new(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["error"], "missing_tx_id");
     }
 }

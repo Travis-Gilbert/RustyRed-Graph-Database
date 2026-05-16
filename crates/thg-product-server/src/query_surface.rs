@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use thg_core::{Direction, GraphStoreError, NeighborQuery, NodeQuery, NodeRecord};
+use thg_core::{
+    Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError, NeighborQuery,
+    NodeQuery, NodeRecord,
+};
 
 use crate::state::TenantGraphStore;
 
@@ -17,6 +20,8 @@ pub struct PublicCypherBody {
     pub query: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub tx_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,11 +40,7 @@ impl QuerySurfaceError {
         }
     }
 
-    fn invalid(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, code, message)
-    }
-
-    fn unsupported(feature: impl AsRef<str>, message: impl Into<String>) -> Self {
+    pub(crate) fn unsupported(feature: impl AsRef<str>, message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             "unsupported_cypher_feature",
@@ -47,11 +48,15 @@ impl QuerySurfaceError {
         )
     }
 
-    fn missing_param(name: &str) -> Self {
+    pub(crate) fn missing_param(name: &str) -> Self {
         Self::invalid(
             "missing_cypher_param",
             format!("missing required cypher parameter ${name}"),
         )
+    }
+
+    pub(crate) fn invalid(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 
     pub fn status(&self) -> StatusCode {
@@ -406,6 +411,44 @@ pub fn execute_cypher_query(
                 "explain": explain,
             }))
         }
+    }
+}
+
+pub fn parse_tx_cypher_mutations(
+    query: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<GraphMutationBatch, QuerySurfaceError> {
+    let normalized = normalize_query(query);
+    if normalized.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "empty_cypher_query",
+            "query is required",
+        ));
+    }
+    let upper = normalized.to_ascii_uppercase();
+    if upper.starts_with("EXPLAIN ") || upper.starts_with("PROFILE ") {
+        return Err(QuerySurfaceError::unsupported(
+            "query_prefix",
+            "use POST /v1/cypher/explain instead of EXPLAIN or PROFILE query prefixes",
+        ));
+    }
+    for keyword in ["DELETE ", "DETACH DELETE ", "SET ", "REMOVE "] {
+        if upper.starts_with(keyword) || upper.contains(&format!(" {keyword}")) {
+            return Err(QuerySurfaceError::unsupported(
+                keyword.trim(),
+                "write transaction mode currently supports CREATE and MERGE only",
+            ));
+        }
+    }
+    if upper.starts_with("CREATE ") {
+        parse_tx_create_mutation(&normalized["CREATE ".len()..].trim(), params)
+    } else if upper.starts_with("MERGE ") {
+        parse_tx_create_mutation(&normalized["MERGE ".len()..].trim(), params)
+    } else {
+        Err(QuerySurfaceError::unsupported(
+            "tx_mode",
+            "transactional /v1/cypher requires CREATE or MERGE statements",
+        ))
     }
 }
 
@@ -816,6 +859,167 @@ fn parse_pattern(
         }));
     }
     Ok(CypherPattern::Node(parse_node_pattern(match_part, params)?))
+}
+
+fn parse_tx_create_mutation(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<GraphMutationBatch, QuerySurfaceError> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            "transactional CREATE/MERGE requires a full node or relationship pattern",
+        ));
+    }
+    if !source.ends_with(')') {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            "transactional CREATE/MERGE requires a closing parenthesis",
+        ));
+    }
+
+    if let Some((left, right)) = source.split_once(")-[:") {
+        return parse_tx_create_relationship(left, right, params);
+    }
+
+    if source.contains(" CREATE ") || source.contains(" MATCH ") || source.contains(" RETURN ") {
+        return Err(QuerySurfaceError::unsupported(
+            "unsupported_transaction_query",
+            "transactional CREATE/MERGE supports write statements only",
+        ));
+    }
+
+    parse_tx_create_node(source, params)
+}
+
+fn parse_tx_create_node(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<GraphMutationBatch, QuerySurfaceError> {
+    let mut pattern = parse_node_pattern(source, params)?;
+    let id = extract_required_id(
+        "node",
+        pattern.label.as_deref().unwrap_or("<unknown>"),
+        &mut pattern.properties,
+    )?;
+    let labels = pattern.label.into_iter().collect::<Vec<_>>();
+    let properties = Value::Object(
+        pattern
+            .properties
+            .into_iter()
+            .map(|(key, value)| (key, value))
+            .collect(),
+    );
+    Ok(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+        NodeRecord::new(id, labels, properties),
+    )]))
+}
+
+fn parse_tx_create_relationship(
+    left: &str,
+    right: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<GraphMutationBatch, QuerySurfaceError> {
+    let mut left_pattern = parse_node_pattern(&format!("{left})"), params)?;
+    let (relation, right) = right.split_once("]->(").ok_or_else(|| {
+        QuerySurfaceError::unsupported(
+            "relationship_shape",
+            "transactional CREATE/MERGE relationship shape requires [:TYPE ...]->(...)",
+        )
+    })?;
+
+    let (edge_type, mut edge_properties) = parse_tx_relationship_properties(relation, params)?;
+    if edge_type.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_relationship_type",
+            "relationship type is required for transactional edge writes",
+        ));
+    }
+    let edge_id = extract_required_id("relationship", &edge_type, &mut edge_properties)?;
+    if !right.ends_with(')') {
+        return Err(QuerySurfaceError::unsupported(
+            "transactional_statement",
+            "transactional CREATE/MERGE relationship statements must have closed nodes",
+        ));
+    }
+    let mut right_pattern = parse_node_pattern(&format!("({right}"), params)?;
+    let from_id = extract_required_id(
+        "left node",
+        &left_pattern.label.as_deref().unwrap_or("<unknown>"),
+        &mut left_pattern.properties,
+    )?;
+    let to_id = extract_required_id(
+        "right node",
+        &right_pattern.label.as_deref().unwrap_or("<unknown>"),
+        &mut right_pattern.properties,
+    )?;
+
+    let edge_properties = Value::Object(
+        edge_properties
+            .into_iter()
+            .map(|(key, value)| (key, value))
+            .collect(),
+    );
+    Ok(GraphMutationBatch::new([GraphMutation::EdgeUpsert(
+        EdgeRecord::new(edge_id, from_id, edge_type, to_id, edge_properties),
+    )]))
+}
+
+fn parse_tx_relationship_properties(
+    source: &str,
+    params: &BTreeMap<String, Value>,
+) -> Result<(String, BTreeMap<String, Value>), QuerySurfaceError> {
+    let source = source.trim().trim_start_matches(":").trim();
+    if source.is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_relationship_type",
+            "relationship type is required",
+        ));
+    }
+    if !source.contains('{') {
+        return Ok((source.to_string(), BTreeMap::new()));
+    }
+    let (raw_type, tail) = source.split_once('{').ok_or_else(|| {
+        QuerySurfaceError::unsupported(
+            "relationship_shape",
+            "relationship property block is malformed",
+        )
+    })?;
+    let edge_type = raw_type.trim();
+    let block = format!("{{{tail}");
+    let (property_block, remainder) = take_braced_block(&block)?;
+    if !remainder.trim().is_empty() {
+        return Err(QuerySurfaceError::invalid(
+            "invalid_relationship_properties",
+            "relationship property block must only contain simple key:value pairs",
+        ));
+    }
+    Ok((
+        edge_type.to_string(),
+        parse_property_block(property_block, params)?,
+    ))
+}
+
+fn extract_required_id(
+    location: &str,
+    label: &str,
+    properties: &mut BTreeMap<String, Value>,
+) -> Result<String, QuerySurfaceError> {
+    let raw = properties.remove("id").ok_or_else(|| {
+        QuerySurfaceError::invalid(
+            "missing_graph_record_id",
+            format!("{location} {label} mutation requires an id field"),
+        )
+    })?;
+    match raw {
+        Value::String(id) => Ok(id),
+        Value::Number(number) => Ok(number.to_string()),
+        _ => Err(QuerySurfaceError::invalid(
+            "invalid_graph_record_id",
+            format!("{location} {label} id must be a string or number"),
+        )),
+    }
 }
 
 fn parse_node_pattern(
@@ -1275,12 +1479,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
+    use thg_core::{EdgeRecord, GraphMutation, NodeRecord, RedCoreDurability};
 
     use super::{
         cypher_compatibility_matrix, execute_cypher_query, execute_public_query,
-        explain_cypher_query, explain_public_query, parse_cypher, resolve_tenant_id,
-        PublicCypherBody,
+        explain_cypher_query, explain_public_query, parse_cypher, parse_tx_cypher_mutations,
+        resolve_tenant_id, PublicCypherBody,
     };
     use crate::{
         config::{Config, StorageMode},
@@ -1416,6 +1620,7 @@ mod tests {
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) WHERE n.path = $path RETURN n LIMIT 5".to_string(),
             params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+            tx_id: None,
         };
 
         let response = execute_cypher_query(&store, "demo", &body).unwrap();
@@ -1433,6 +1638,7 @@ mod tests {
                 "MATCH (a:File {path: $path})-[:IMPORTS]->(b:File) RETURN a.path, b.path LIMIT 10"
                     .to_string(),
             params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+            tx_id: None,
         };
 
         let response = execute_cypher_query(&store, "demo", &body).unwrap();
@@ -1447,6 +1653,7 @@ mod tests {
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) RETURN n LIMIT 10".to_string(),
             params: BTreeMap::new(),
+            tx_id: None,
         };
 
         let response = explain_cypher_query("demo", &body).unwrap();
@@ -1472,6 +1679,60 @@ mod tests {
             expand_error.payload()["error"],
             "unsupported_cypher_feature"
         );
+    }
+
+    #[test]
+    fn cypher_tx_mode_parses_node_create_mutation() {
+        let mutations = parse_tx_cypher_mutations(
+            "CREATE (n:File {id: $id, path: $path})",
+            &BTreeMap::from([
+                (String::from("id"), json!("node:main")),
+                (String::from("path"), json!("src/main.rs")),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(mutations.mutations.len(), 1);
+        match &mutations.mutations[0] {
+            GraphMutation::NodeUpsert(node) => {
+                assert_eq!(node.id, "node:main");
+                assert_eq!(node.labels, vec!["File"]);
+                assert_eq!(node.properties["path"], json!("src/main.rs"));
+            }
+            _ => panic!("expected node upsert mutation"),
+        }
+    }
+
+    #[test]
+    fn cypher_tx_mode_parses_edge_create_mutation() {
+        let mutations = parse_tx_cypher_mutations(
+            "CREATE (a:File {id: $from_id})-[:IMPORTS {id: $edge_id, weight: 0.5}]->(b:File {id: $to_id})",
+            &BTreeMap::from([
+                (String::from("from_id"), json!("file:main")),
+                (String::from("to_id"), json!("file:lib")),
+                (String::from("edge_id"), json!("edge:main-lib")),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(mutations.mutations.len(), 1);
+        match &mutations.mutations[0] {
+            GraphMutation::EdgeUpsert(edge) => {
+                assert_eq!(edge.id, "edge:main-lib");
+                assert_eq!(edge.from_id, "file:main");
+                assert_eq!(edge.to_id, "file:lib");
+                assert_eq!(edge.edge_type, "IMPORTS");
+            }
+            _ => panic!("expected edge upsert mutation"),
+        }
+    }
+
+    #[test]
+    fn cypher_tx_mode_rejects_read_only_queries() {
+        let error =
+            parse_tx_cypher_mutations("MATCH (n:File) RETURN n", &BTreeMap::new()).unwrap_err();
+
+        assert_eq!(error.payload()["error"], "unsupported_cypher_feature");
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::graph_store::EdgeRecord;
 
@@ -225,9 +225,7 @@ pub fn paths_shortest_weighted(
             for &(neighbor, edge_cost) in neighbors {
                 let new_cost = cost + edge_cost;
                 let neighbor_str = neighbor.to_string();
-                if !best_cost.contains_key(&neighbor_str)
-                    || new_cost < best_cost[&neighbor_str]
-                {
+                if !best_cost.contains_key(&neighbor_str) || new_cost < best_cost[&neighbor_str] {
                     best_cost.insert(neighbor_str.clone(), new_cost);
                     parent.insert(neighbor_str.clone(), node_id.clone());
                     heap.push(WeightedNode {
@@ -342,12 +340,7 @@ mod tests {
             make_edge("e2", "b", "c", Some(0.2)),
             make_edge("e3", "a", "d", Some(0.8)),
         ];
-        let result = expand_bounded_weighted(
-            &edges,
-            &["a".to_string()],
-            3,
-            0.5,
-        );
+        let result = expand_bounded_weighted(&edges, &["a".to_string()], 3, 0.5);
         assert!(result.contains(&"a".to_string()));
         assert!(result.contains(&"b".to_string()));
         assert!(result.contains(&"d".to_string()));
@@ -356,9 +349,7 @@ mod tests {
 
     #[test]
     fn expand_bounded_weighted_treats_none_as_1() {
-        let edges = vec![
-            make_edge("e1", "a", "b", None),
-        ];
+        let edges = vec![make_edge("e1", "a", "b", None)];
         let result = expand_bounded_weighted(&edges, &["a".to_string()], 1, 0.5);
         assert!(result.contains(&"b".to_string()));
     }

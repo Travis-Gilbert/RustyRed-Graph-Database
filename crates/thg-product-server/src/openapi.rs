@@ -45,6 +45,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             { "name": "mcp", "description": "Streamable HTTP MCP agent port over Rusty Red graph APIs." },
             { "name": "runs", "description": "THG-compatible run and batch command runtime." },
             { "name": "graph", "description": "First-class graph node, edge, adjacency, index, and verification routes." },
+            { "name": "transactions", "description": "Open and commit staged transaction workflows for Cypher writes." },
             { "name": "context", "description": "Context pack writes used by Context Theorem harness flows." }
         ],
         "security": [{ "bearerAuth": [] }],
@@ -217,8 +218,8 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/cypher": {
                 "post": {
                     "tags": ["graph"],
-                    "summary": "Run the first read-only OpenCypher-compatible subset",
-                    "description": "Supports the first bounded `/v1/cypher` subset: MATCH, RETURN, simple equality WHERE, LIMIT, and single-hop outgoing relationship expansion. When tenant_id is omitted, the configured default tenant is used.",
+                    "summary": "Run the first OpenCypher-compatible subset",
+                    "description": "Supports the first bounded `/v1/cypher` subset: MATCH, RETURN, simple equality WHERE, LIMIT, and single-hop outgoing relationship expansion. When tenant_id is omitted, the configured default tenant is used. If tx_id is provided, matching write statements are staged into that open transaction.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -232,7 +233,96 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                             "description": "Cypher subset query result.",
                             "content": {
                                 "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/CypherQueryResponse" }
+                                    "schema": {
+                                        "oneOf": [
+                                            { "$ref": "#/components/schemas/CypherQueryResponse" },
+                                            { "$ref": "#/components/schemas/CypherWriteStagingResponse" }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/transactions/begin": {
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Begin a transaction for staging Cypher writes",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/TransactionBeginRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Transaction started and assigned a tx_id.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/TransactionBeginResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/transactions/commit": {
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Commit a staged Cypher transaction",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/TransactionMutationRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Transaction committed and mutations applied.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/TransactionCommitResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/transactions/rollback": {
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Rollback a staged transaction",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/TransactionMutationRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Transaction rolled back and discarded.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/TransactionRollbackResponse" }
                                 }
                             }
                         },
@@ -964,11 +1054,75 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "properties": {
                         "tenant_id": { "type": "string" },
                         "query": { "type": "string" },
+                        "tx_id": { "type": "string" },
                         "params": {
                             "type": "object",
                             "additionalProperties": { "$ref": "#/components/schemas/ScalarPropertyValue" },
                             "default": {}
                         }
+                    },
+                    "additionalProperties": false
+                },
+                "TransactionBeginRequest": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "TransactionMutationRequest": {
+                    "type": "object",
+                    "required": ["tx_id"],
+                    "properties": {
+                        "tx_id": { "type": "string" },
+                        "tenant_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "TransactionBeginResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "tx_id"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "tx_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "TransactionCommitResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "transaction"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "transaction": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "TransactionRollbackResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "tx_id", "status"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "tx_id": { "type": "string" },
+                        "status": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "CypherWriteStagingResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "query", "tx_id", "subset", "staged_mutations"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "query": { "type": "string" },
+                        "tx_id": { "type": "string" },
+                        "subset": { "type": "string" },
+                        "staged_mutations": { "type": "integer", "minimum": 0 }
                     },
                     "additionalProperties": false
                 },
@@ -1575,11 +1729,30 @@ mod tests {
             .is_some());
         assert!(document.pointer("/paths/~1v1~1cache~1check/post").is_some());
         assert!(document.pointer("/paths/~1v1~1cache~1put/post").is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1transactions~1begin/post")
+            .is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1transactions~1commit/post")
+            .is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1transactions~1rollback/post")
+            .is_some());
         assert_eq!(
             document.pointer("/components/schemas/RebuildIndexesResponse/properties/rebuild/$ref"),
             Some(&serde_json::Value::String(
                 "#/components/schemas/RebuildIndexesReport".to_string()
             ))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/CypherRequest/properties/tx_id/type"),
+            Some(&serde_json::Value::String("string".to_string()))
+        );
+        assert_eq!(
+            document.pointer(
+                "/components/schemas/TransactionCommitResponse/properties/transaction/type"
+            ),
+            Some(&serde_json::Value::String("object".to_string()))
         );
         assert_eq!(
             document

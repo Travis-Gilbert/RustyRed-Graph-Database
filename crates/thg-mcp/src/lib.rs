@@ -321,10 +321,7 @@ fn call_tool<P: McpGraphProvider>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| McpError::invalid_params("thg.vector.search requires property"))?;
             let query = parse_f32_array(&arguments, "query")?;
-            let k = arguments
-                .get("k")
-                .and_then(Value::as_u64)
-                .unwrap_or(10) as usize;
+            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
             let label = arguments.get("label").and_then(Value::as_str);
             let results = backend.vector_search(label, property, &query, k)?;
             json!({
@@ -339,10 +336,7 @@ fn call_tool<P: McpGraphProvider>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| McpError::invalid_params("thg.vector.hybrid requires property"))?;
             let query = parse_f32_array(&arguments, "query")?;
-            let k = arguments
-                .get("k")
-                .and_then(Value::as_u64)
-                .unwrap_or(10) as usize;
+            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
             let label = arguments.get("label").and_then(Value::as_str);
             let graph_seeds: Vec<String> = arguments
                 .get("graph_seeds")
@@ -761,13 +755,17 @@ fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
         .map(|arr| {
             arr.iter()
                 .map(|v| {
-                    v.as_f64()
-                        .map(|f| f as f32)
-                        .ok_or_else(|| McpError::invalid_params(format!("{key} must be an array of numbers")))
+                    v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                        McpError::invalid_params(format!("{key} must be an array of numbers"))
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
-        .unwrap_or_else(|| Err(McpError::invalid_params(format!("{key} is required and must be an array of numbers"))))
+        .unwrap_or_else(|| {
+            Err(McpError::invalid_params(format!(
+                "{key} is required and must be an array of numbers"
+            )))
+        })
 }
 
 fn tool_result(payload: Value) -> Value {
@@ -1202,7 +1200,13 @@ impl McpGraphBackend for InMemoryGraphStore {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
-        Ok(InMemoryGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth))
+        Ok(InMemoryGraphStore::epistemic_neighbors(
+            self,
+            node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+        ))
     }
 }
 
@@ -1295,7 +1299,13 @@ impl McpGraphBackend for RedCoreGraphStore {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
-        Ok(RedCoreGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth))
+        Ok(RedCoreGraphStore::epistemic_neighbors(
+            self,
+            node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+        ))
     }
 }
 
