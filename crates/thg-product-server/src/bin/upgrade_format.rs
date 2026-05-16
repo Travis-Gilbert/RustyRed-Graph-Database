@@ -144,7 +144,10 @@ fn upgrade_one(tenant_dir: &Path, dry_run: bool) -> ExitCode {
     let mut store = match RedCoreGraphStore::open(tenant_dir.to_path_buf(), options) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("tenant {}: refuse, open failed: {err:?}", tenant_dir.display());
+            eprintln!(
+                "tenant {}: refuse, open failed: {err:?}",
+                tenant_dir.display()
+            );
             return ExitCode::from(1);
         }
     };

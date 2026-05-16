@@ -504,10 +504,20 @@ fn call_tool<P: McpGraphProvider>(
         "thg.graph.index_status" => index_status_payload(&tenant, &backend)?,
         "thg.graph.explain" => explain_payload(&tenant, &arguments),
         "thg.graph.query" => query_payload(&tenant, &backend, &arguments)?,
-        "thg.algorithm.ppr" => algorithm_ppr_payload(&tenant, &backend, &arguments)?,
-        "thg.algorithm.components" => algorithm_components_payload(&tenant, &backend, &arguments)?,
-        "thg.algorithm.pagerank" => algorithm_pagerank_payload(&tenant, &backend, &arguments)?,
-        "thg.algorithm.communities" => algorithm_communities_payload(&tenant, &backend)?,
+        // §P6-B pb6.1: SPEC names `thg.algo.*` are aliases for the existing
+        // `thg.algorithm.*` arms below. Either name reaches the same payload.
+        "thg.algorithm.ppr" | "thg.algo.ppr" => {
+            algorithm_ppr_payload(&tenant, &backend, &arguments)?
+        }
+        "thg.algorithm.components" | "thg.algo.components" => {
+            algorithm_components_payload(&tenant, &backend, &arguments)?
+        }
+        "thg.algorithm.pagerank" | "thg.algo.pagerank" => {
+            algorithm_pagerank_payload(&tenant, &backend, &arguments)?
+        }
+        "thg.algorithm.communities" | "thg.algo.communities" => {
+            algorithm_communities_payload(&tenant, &backend)?
+        }
         "thg.fulltext.search" => {
             let property = required_str(&arguments, "property", name)?;
             let query = required_str(&arguments, "query", name)?;

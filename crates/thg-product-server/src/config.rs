@@ -1,7 +1,8 @@
-use std::env;
+use std::{collections::BTreeMap, env, fs};
 
 use crate::auth::ApiToken;
-use thg_core::RedCoreDurability;
+use serde::{Deserialize, Serialize};
+use thg_core::{default_hybrid_edge_type_weights, HybridScoringConfig, RedCoreDurability};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageMode {
@@ -43,6 +44,12 @@ pub struct Config {
     pub txn_isolation: String,
     pub tenant_memory_quota_bytes: usize,
     pub tenant_memory_quota_config_error: Option<String>,
+    pub tenant_config_overrides: BTreeMap<String, TenantConfigOverride>,
+    pub tenant_config_error: Option<String>,
+    pub slow_query_threshold_nanos: u64,
+    pub slow_query_capacity: usize,
+    pub slow_query_log: Option<String>,
+    pub hybrid_scoring: HybridScoringConfig,
     pub redis_url: String,
     pub redis_key_prefix: String,
     pub require_auth: bool,
@@ -55,6 +62,29 @@ pub struct Config {
     pub mcp_read_only: bool,
     pub mcp_allow_admin: bool,
     pub mcp_default_tenant: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TenantConfigOverride {
+    #[serde(default)]
+    pub durability: Option<RedCoreDurability>,
+    #[serde(default)]
+    pub snapshot_interval_writes: Option<u64>,
+    #[serde(default)]
+    pub strict_acid: Option<bool>,
+    #[serde(default)]
+    pub tenant_memory_quota_bytes: Option<usize>,
+    #[serde(default)]
+    pub hybrid_scoring: Option<HybridScoringConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectiveTenantConfig {
+    pub durability: RedCoreDurability,
+    pub snapshot_interval_writes: u64,
+    pub strict_acid: bool,
+    pub tenant_memory_quota_bytes: usize,
+    pub hybrid_scoring: HybridScoringConfig,
 }
 
 impl Config {
@@ -128,6 +158,27 @@ impl Config {
             ],
             0,
         );
+        let (slow_query_threshold_nanos, slow_query_threshold_error) = env_u64(
+            &["RUSTY_RED_SLOW_QUERY_NANOS", "THG_PRODUCT_SLOW_QUERY_NANOS"],
+            100_000_000,
+        );
+        let (slow_query_capacity, slow_query_capacity_error) = env_usize(
+            &[
+                "RUSTY_RED_SLOW_QUERY_CAPACITY",
+                "THG_PRODUCT_SLOW_QUERY_CAPACITY",
+            ],
+            128,
+        );
+        let slow_query_log = env_first(&["RUSTY_RED_SLOW_QUERY_LOG", "THG_PRODUCT_SLOW_QUERY_LOG"])
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let mut tenant_config_error = slow_query_threshold_error.or(slow_query_capacity_error);
+        let (tenant_config_overrides, parsed_tenant_config_error) = tenant_config_from_env();
+        if tenant_config_error.is_none() {
+            tenant_config_error = parsed_tenant_config_error;
+        }
+        let hybrid_scoring = HybridScoringConfig::default();
         let redis_url = env_first(&["RUSTY_RED_REDIS_URL", "THG_REDIS_URL"])
             .or_else(|_| env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -175,6 +226,12 @@ impl Config {
             txn_isolation,
             tenant_memory_quota_bytes,
             tenant_memory_quota_config_error,
+            tenant_config_overrides,
+            tenant_config_error,
+            slow_query_threshold_nanos,
+            slow_query_capacity,
+            slow_query_log,
+            hybrid_scoring,
             redis_url,
             redis_key_prefix,
             require_auth,
@@ -197,6 +254,12 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(error) = &self.tenant_memory_quota_config_error {
             return Err(error.clone());
+        }
+        if let Some(error) = &self.tenant_config_error {
+            return Err(error.clone());
+        }
+        if self.slow_query_capacity == 0 {
+            return Err("RUSTY_RED_SLOW_QUERY_CAPACITY must be greater than 0".to_string());
         }
         if self.storage_mode == StorageMode::Embedded
             && self.require_volume
@@ -242,6 +305,35 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn tenant_config(&self, tenant_id: &str) -> EffectiveTenantConfig {
+        let key = thg_core::sanitize_tenant_segment(tenant_id);
+        let override_config = self
+            .tenant_config_overrides
+            .get(tenant_id)
+            .or_else(|| self.tenant_config_overrides.get(&key));
+        let mut hybrid_scoring = self.hybrid_scoring.clone();
+        if hybrid_scoring.edge_type_weights.is_empty() {
+            hybrid_scoring.edge_type_weights = default_hybrid_edge_type_weights();
+        }
+        EffectiveTenantConfig {
+            durability: override_config
+                .and_then(|config| config.durability)
+                .unwrap_or(self.durability),
+            snapshot_interval_writes: override_config
+                .and_then(|config| config.snapshot_interval_writes)
+                .unwrap_or(self.snapshot_interval_writes),
+            strict_acid: override_config
+                .and_then(|config| config.strict_acid)
+                .unwrap_or(self.strict_acid),
+            tenant_memory_quota_bytes: override_config
+                .and_then(|config| config.tenant_memory_quota_bytes)
+                .unwrap_or(self.tenant_memory_quota_bytes),
+            hybrid_scoring: override_config
+                .and_then(|config| config.hybrid_scoring.clone())
+                .unwrap_or(hybrid_scoring),
+        }
+    }
 }
 
 fn env_bool(keys: &[&str], default: bool) -> bool {
@@ -271,6 +363,63 @@ fn env_usize(keys: &[&str], default: usize) -> (usize, Option<String>) {
     }
 }
 
+fn env_u64(keys: &[&str], default: u64) -> (u64, Option<String>) {
+    match env_first(keys) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) => (parsed, None),
+            Err(_) => (
+                default,
+                Some(format!(
+                    "{} must be an unsigned integer, got {value}",
+                    keys.join(" or "),
+                )),
+            ),
+        },
+        Err(_) => (default, None),
+    }
+}
+
+fn tenant_config_from_env() -> (BTreeMap<String, TenantConfigOverride>, Option<String>) {
+    let mut merged = BTreeMap::new();
+    if let Ok(path) = env_first(&[
+        "RUSTY_RED_TENANT_CONFIG_PATH",
+        "THG_PRODUCT_TENANT_CONFIG_PATH",
+    ]) {
+        match fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|raw| parse_tenant_config_json(&raw))
+        {
+            Ok(values) => merged.extend(values),
+            Err(error) => {
+                return (
+                    merged,
+                    Some(format!("RUSTY_RED_TENANT_CONFIG_PATH {path}: {error}")),
+                )
+            }
+        }
+    }
+    if let Ok(raw) = env_first(&[
+        "RUSTY_RED_TENANT_CONFIG_JSON",
+        "THG_PRODUCT_TENANT_CONFIG_JSON",
+    ]) {
+        match parse_tenant_config_json(&raw) {
+            Ok(values) => merged.extend(values),
+            Err(error) => {
+                return (
+                    merged,
+                    Some(format!("RUSTY_RED_TENANT_CONFIG_JSON: {error}")),
+                )
+            }
+        }
+    }
+    (merged, None)
+}
+
+fn parse_tenant_config_json(raw: &str) -> Result<BTreeMap<String, TenantConfigOverride>, String> {
+    serde_json::from_str::<BTreeMap<String, TenantConfigOverride>>(raw)
+        .map_err(|error| error.to_string())
+}
+
 fn env_first(keys: &[&str]) -> Result<String, env::VarError> {
     for key in keys {
         match env::var(key) {
@@ -285,7 +434,11 @@ fn env_first(keys: &[&str]) -> Result<String, env::VarError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, RedCoreDurability, StorageMode};
+    use std::collections::BTreeMap;
+
+    use super::{
+        parse_tenant_config_json, Config, HybridScoringConfig, RedCoreDurability, StorageMode,
+    };
 
     fn base_config() -> Config {
         Config {
@@ -302,6 +455,12 @@ mod tests {
             txn_isolation: "serializable".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: BTreeMap::new(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: HybridScoringConfig::default(),
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -367,5 +526,36 @@ mod tests {
         config.tenant_memory_quota_bytes = 1024;
 
         assert!(config.validate().unwrap_err().contains("redis mode quota"));
+    }
+
+    #[test]
+    fn tenant_config_json_overlays_per_tenant_runtime_values() {
+        let mut config = base_config();
+        config.tenant_config_overrides = parse_tenant_config_json(
+            r#"{
+                "tenant-a": {
+                    "durability": "snapshot_only",
+                    "snapshot_interval_writes": 12,
+                    "strict_acid": false,
+                    "tenant_memory_quota_bytes": 4096,
+                    "hybrid_scoring": {
+                        "alpha": 0.25,
+                        "confidence_weighted_graph_distance": false,
+                        "edge_type_weights": { "CONTRADICTS": -2.0 }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let tenant = config.tenant_config("tenant-a");
+
+        assert_eq!(tenant.durability, RedCoreDurability::SnapshotOnly);
+        assert_eq!(tenant.snapshot_interval_writes, 12);
+        assert!(!tenant.strict_acid);
+        assert_eq!(tenant.tenant_memory_quota_bytes, 4096);
+        assert_eq!(tenant.hybrid_scoring.alpha, 0.25);
+        assert!(!tenant.hybrid_scoring.confidence_weighted_graph_distance);
+        assert_eq!(tenant.hybrid_scoring.edge_type_weights["CONTRADICTS"], -2.0);
     }
 }

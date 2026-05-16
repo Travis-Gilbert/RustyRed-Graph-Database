@@ -11,9 +11,9 @@ use thg_core::store::RedisThgStore;
 use thg_core::{
     sanitize_tenant_segment, EdgeRecord, EpistemicType, FullTextDesignation, FullTextIndex,
     GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphStats, GraphStoreError,
-    GraphStoreResult, GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
-    SpatialDesignation, SpatialIndex, VectorDesignation, VerifyReport,
+    GraphStoreResult, GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
+    RedisGraphStore, SpatialDesignation, SpatialIndex, VectorDesignation, VerifyReport,
 };
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
@@ -53,9 +53,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let observability = Observability::new_with_log(
+            config.slow_query_threshold_nanos,
+            config.slow_query_capacity,
+            config.slow_query_log.clone(),
+        );
         Self {
             config: Arc::new(config),
-            observability: Observability::default(),
+            observability,
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -204,12 +209,8 @@ impl AppState {
             .map_err(StoreAccessError::from)?;
         for node in nodes {
             if let (Some(lat), Some(lon)) = (
-                node.properties
-                    .get(lat_property)
-                    .and_then(|v| v.as_f64()),
-                node.properties
-                    .get(lon_property)
-                    .and_then(|v| v.as_f64()),
+                node.properties.get(lat_property).and_then(|v| v.as_f64()),
+                node.properties.get(lon_property).and_then(|v| v.as_f64()),
             ) {
                 let _ = index.upsert(&node.id, lat, lon);
             }
@@ -218,17 +219,14 @@ impl AppState {
             .spatial_indexes
             .lock()
             .map_err(|_| StoreAccessError::internal("spatial index lock poisoned"))?;
-        indexes
-            .entry(tenant_id.to_string())
-            .or_default()
-            .insert(
-                (
-                    label.to_string(),
-                    lat_property.to_string(),
-                    lon_property.to_string(),
-                ),
-                index,
-            );
+        indexes.entry(tenant_id.to_string()).or_default().insert(
+            (
+                label.to_string(),
+                lat_property.to_string(),
+                lon_property.to_string(),
+            ),
+            index,
+        );
         Ok(())
     }
 
@@ -596,14 +594,15 @@ impl AppState {
         let data_dir = PathBuf::from(&self.config.data_dir)
             .join("tenants")
             .join(&safe_tenant);
+        let tenant_config = self.config.tenant_config(tenant_id);
         let options = RedCoreOptions {
-            durability: self.config.durability,
-            snapshot_interval_writes: self.config.snapshot_interval_writes,
-            strict_acid: self.config.strict_acid,
+            durability: tenant_config.durability,
+            snapshot_interval_writes: tenant_config.snapshot_interval_writes,
+            strict_acid: tenant_config.strict_acid,
         };
         let store = Arc::new(RedCoreTenantExecutor::new(
             RedCoreGraphStore::open(data_dir, options)?,
-            self.config.tenant_memory_quota_bytes,
+            tenant_config.tenant_memory_quota_bytes,
         )?);
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -621,9 +620,10 @@ impl AppState {
         if let Some(store) = stores.get(&safe_tenant) {
             return Ok(store.clone());
         }
+        let tenant_config = self.config.tenant_config(tenant_id);
         let store = Arc::new(RedCoreTenantExecutor::new(
             RedCoreGraphStore::memory(),
-            self.config.tenant_memory_quota_bytes,
+            tenant_config.tenant_memory_quota_bytes,
         )?);
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -736,6 +736,7 @@ impl RedCoreTenantExecutor {
             .ok_or_else(|| GraphStoreError::new("redcore_missing_write", "edge write vanished"))
     }
 
+    #[cfg(test)]
     pub fn read_barrier(&self) -> GraphStoreResult<u64> {
         Ok(self.lock_writer()?.status().last_txn_id)
     }
@@ -855,6 +856,29 @@ impl RedCoreTenantExecutor {
     ) -> GraphStoreResult<Vec<(String, f32)>> {
         self.with_snapshot(|snapshot| {
             snapshot.hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+        })?
+    }
+
+    pub fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.with_snapshot(|snapshot| {
+            snapshot.hybrid_search_with_config(
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                config,
+            )
         })?
     }
 
@@ -1136,6 +1160,33 @@ impl TenantGraphStore {
             )),
         }
     }
+
+    pub fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        match self {
+            Self::RedCore(store) => store.hybrid_search_with_config(
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                config,
+            ),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "hybrid_search is not supported on Redis graph stores",
+            )),
+        }
+    }
 }
 
 impl McpGraphBackend for TenantGraphStore {
@@ -1173,6 +1224,18 @@ impl McpGraphBackend for TenantGraphStore {
 
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         TenantGraphStore::property_keys(self)
+    }
+
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        TenantGraphStore::list_edges(self)
+    }
+
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        TenantGraphStore::upsert_node(self, node).map(|_| ())
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        TenantGraphStore::upsert_edge(self, edge).map(|_| ())
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -1220,6 +1283,28 @@ impl McpGraphBackend for TenantGraphStore {
         )
     }
 
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        TenantGraphStore::hybrid_search_with_config(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
+        )
+    }
+
     fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -1237,12 +1322,241 @@ impl McpGraphBackend for TenantGraphStore {
     }
 }
 
+#[derive(Clone)]
+pub struct ProductMcpBackend {
+    state: AppState,
+    tenant_id: String,
+    store: TenantGraphStore,
+}
+
+impl McpGraphBackend for ProductMcpBackend {
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.store.get_node(id)
+    }
+
+    fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.store.get_edge(id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.store.query_nodes(query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        self.store.neighbors(query)
+    }
+
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        self.store.stats()
+    }
+
+    fn verify(&self) -> GraphStoreResult<VerifyReport> {
+        self.store.verify()
+    }
+
+    fn labels(&self) -> GraphStoreResult<Vec<String>> {
+        self.store.labels()
+    }
+
+    fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+        self.store.edge_types()
+    }
+
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        self.store.property_keys()
+    }
+
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        self.store.list_edges()
+    }
+
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.store.upsert_node(node.clone())?;
+        self.state.observability.record_mutation();
+        self.state
+            .maybe_index_node_spatially(&self.tenant_id, &node);
+        self.state.maybe_index_node_fulltext(&self.tenant_id, &node);
+        Ok(())
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.store.upsert_edge(edge)?;
+        self.state.observability.record_mutation();
+        Ok(())
+    }
+
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        self.store.vector_designations()
+    }
+
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        self.store
+            .designate_vector_property(label, property_name, dimension)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store.vector_search(label, property_name, query, k)
+    }
+
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store
+            .hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+    }
+
+    fn hybrid_scoring_config(&self) -> HybridScoringConfig {
+        self.state
+            .config
+            .tenant_config(&self.tenant_id)
+            .hybrid_scoring
+    }
+
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store.hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
+        )
+    }
+
+    fn designate_fulltext_property(&mut self, label: &str, property: &str) -> GraphStoreResult<()> {
+        self.state
+            .designate_fulltext_property(&self.tenant_id, label, property)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    fn fulltext_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.state
+            .fulltext_search(&self.tenant_id, label, property, query, k)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    fn designate_spatial_property(
+        &mut self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        resolution: u8,
+    ) -> GraphStoreResult<()> {
+        self.state
+            .designate_spatial_property(
+                &self.tenant_id,
+                label,
+                lat_property,
+                lon_property,
+                resolution,
+            )
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    fn spatial_radius_search(
+        &self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        self.state
+            .spatial_radius_search(
+                &self.tenant_id,
+                label,
+                lat_property,
+                lon_property,
+                lat,
+                lon,
+                radius_km,
+            )
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    fn spatial_bbox_search(
+        &self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        self.state
+            .spatial_bbox_search(
+                &self.tenant_id,
+                label,
+                lat_property,
+                lon_property,
+                min_lat,
+                min_lon,
+                max_lat,
+                max_lon,
+            )
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        self.store
+            .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+    }
+}
+
 impl McpGraphProvider for AppState {
-    type Backend = TenantGraphStore;
+    type Backend = ProductMcpBackend;
 
     fn backend_for_tenant(&self, tenant: &str) -> Result<Self::Backend, McpError> {
-        self.tenant_graph_store(tenant)
-            .map_err(|error| McpError::internal(error.message))
+        let store = self
+            .tenant_graph_store(tenant)
+            .map_err(|error| McpError::internal(error.message))?;
+        Ok(ProductMcpBackend {
+            state: self.clone(),
+            tenant_id: tenant.to_string(),
+            store,
+        })
     }
 }
 
@@ -1252,8 +1566,9 @@ mod tests {
 
     use super::{AppState, RedCoreTenantExecutor};
     use serde_json::json;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
     use thg_core::{
         EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeRecord,
         RedCoreDurability, RedCoreGraphStore,
@@ -1275,6 +1590,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1312,6 +1633,12 @@ mod tests {
             txn_isolation: "serializable".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1364,6 +1691,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1400,6 +1733,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1511,6 +1850,30 @@ mod tests {
             "node:b"
         );
         assert_eq!(executor.verify().unwrap().ok, true);
+    }
+
+    #[test]
+    fn redcore_snapshot_reads_do_not_wait_for_writer_lock() {
+        let executor =
+            Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap());
+        executor
+            .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+                NodeRecord::new("node:committed", ["File"], json!({ "path": "src/lib.rs" })),
+            )]))
+            .unwrap();
+        let _writer_guard = executor.lock_writer().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader = executor.clone();
+
+        thread::spawn(move || {
+            let node = reader.get_node("node:committed").unwrap();
+            tx.send(node.map(|node| node.id)).unwrap();
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+            Some("node:committed".to_string())
+        );
     }
 
     #[test]
@@ -1627,6 +1990,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn product_mcp_backend_reaches_fulltext_spatial_and_bulk_tools() {
+        let state = AppState::new(memory_config());
+        let mut config = state.mcp_config();
+        config.read_only = false;
+
+        let bulk = thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "bulk",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.bulk.nodes",
+                    "arguments": {
+                        "tenant": "tenant-mcp",
+                        "nodes": [
+                            {
+                                "id": "place:a",
+                                "labels": ["Place"],
+                                "properties": {
+                                    "body": "north campus library",
+                                    "lat": 42.0,
+                                    "lon": -83.0
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        assert_eq!(bulk["result"]["structuredContent"]["inserted"], 1);
+
+        let fulltext_designate = thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "ft-designate",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.fulltext.designate",
+                    "arguments": {
+                        "tenant": "tenant-mcp",
+                        "label": "Place",
+                        "property": "body"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            fulltext_designate["result"]["structuredContent"]["designated"]["property"],
+            "body"
+        );
+        let fulltext_search = thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "ft-search",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.fulltext.search",
+                    "arguments": {
+                        "tenant": "tenant-mcp",
+                        "label": "Place",
+                        "property": "body",
+                        "query": "library"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            fulltext_search["result"]["structuredContent"]["results"][0]["node_id"],
+            "place:a"
+        );
+
+        let spatial_designate = thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "sp-designate",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.spatial.designate",
+                    "arguments": {
+                        "tenant": "tenant-mcp",
+                        "label": "Place",
+                        "lat_property": "lat",
+                        "lon_property": "lon"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            spatial_designate["result"]["structuredContent"]["designated"]["label"],
+            "Place"
+        );
+        let spatial_search = thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "sp-radius",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.spatial.radius",
+                    "arguments": {
+                        "tenant": "tenant-mcp",
+                        "label": "Place",
+                        "lat_property": "lat",
+                        "lon_property": "lon",
+                        "lat": 42.0,
+                        "lon": -83.0,
+                        "radius_km": 1.0
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            spatial_search["result"]["structuredContent"]["node_ids"][0],
+            "place:a"
+        );
+    }
+
     fn memory_config() -> Config {
         Config {
             host: "127.0.0.1".to_string(),
@@ -1642,6 +2132,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,

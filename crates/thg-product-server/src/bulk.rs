@@ -57,6 +57,9 @@ pub fn jsonl_parse_node(line: &str) -> Result<NodeRecord, String> {
         .get("properties")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !properties.is_object() {
+        return Err("node properties must be a JSON object".to_string());
+    }
     Ok(NodeRecord::new(id, labels, properties))
 }
 
@@ -87,6 +90,9 @@ pub fn jsonl_parse_edge(line: &str) -> Result<EdgeRecord, String> {
         .get("properties")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !properties.is_object() {
+        return Err("edge properties must be a JSON object".to_string());
+    }
     Ok(EdgeRecord::new(id, from_id, edge_type, to_id, properties))
 }
 
@@ -106,9 +112,7 @@ impl CsvNodeParser {
             .iter()
             .position(|h| h.eq_ignore_ascii_case("id"))
             .unwrap_or(0);
-        let label_idx = headers
-            .iter()
-            .position(|h| h.eq_ignore_ascii_case("label"));
+        let label_idx = headers.iter().position(|h| h.eq_ignore_ascii_case("label"));
         Self {
             headers,
             id_idx,
@@ -161,11 +165,7 @@ pub struct CsvEdgeParser {
 }
 
 impl CsvEdgeParser {
-    pub fn new(
-        headers: Vec<String>,
-        from_col: &str,
-        to_col: &str,
-    ) -> Result<Self, String> {
+    pub fn new(headers: Vec<String>, from_col: &str, to_col: &str) -> Result<Self, String> {
         let id_idx = headers
             .iter()
             .position(|h| h.eq_ignore_ascii_case("id"))
@@ -213,11 +213,7 @@ impl CsvEdgeParser {
         }
         let mut props_obj = serde_json::Map::new();
         for (i, name) in self.headers.iter().enumerate() {
-            if i == self.id_idx
-                || i == self.from_idx
-                || i == self.to_idx
-                || i == self.type_idx
-            {
+            if i == self.id_idx || i == self.from_idx || i == self.to_idx || i == self.type_idx {
                 continue;
             }
             props_obj.insert(name.clone(), json!(fields[i].trim()));
@@ -261,8 +257,7 @@ mod tests {
     #[test]
     fn jsonl_parse_node_returns_record() {
         let record =
-            jsonl_parse_node("{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}")
-                .unwrap();
+            jsonl_parse_node("{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}").unwrap();
         assert_eq!(record.id, "n1");
         assert_eq!(record.labels, vec!["Doc".to_string()]);
     }
@@ -273,9 +268,6 @@ mod tests {
         let record = parser.parse("n1,Doc,src/lib.rs").unwrap();
         assert_eq!(record.id, "n1");
         assert_eq!(record.labels, vec!["Doc".to_string()]);
-        assert_eq!(
-            record.properties,
-            serde_json::json!({"path": "src/lib.rs"})
-        );
+        assert_eq!(record.properties, serde_json::json!({"path": "src/lib.rs"}));
     }
 }

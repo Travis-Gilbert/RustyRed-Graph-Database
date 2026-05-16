@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -109,6 +109,53 @@ pub struct VectorDesignation {
     pub label: String,
     pub property: String,
     pub dimension: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct HybridScoringConfig {
+    pub alpha: f32,
+    #[serde(default = "default_confidence_weighted_graph_distance")]
+    pub confidence_weighted_graph_distance: bool,
+    #[serde(default = "default_hybrid_edge_type_weights")]
+    pub edge_type_weights: BTreeMap<String, f32>,
+}
+
+impl Default for HybridScoringConfig {
+    fn default() -> Self {
+        Self {
+            alpha: 0.5,
+            confidence_weighted_graph_distance: true,
+            edge_type_weights: default_hybrid_edge_type_weights(),
+        }
+    }
+}
+
+impl HybridScoringConfig {
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha.clamp(0.0, 1.0);
+        self
+    }
+
+    fn edge_type_weight(&self, edge_type: &str) -> f32 {
+        self.edge_type_weights
+            .get(edge_type)
+            .or_else(|| self.edge_type_weights.get(&edge_type.to_ascii_lowercase()))
+            .copied()
+            .unwrap_or(1.0)
+    }
+}
+
+fn default_confidence_weighted_graph_distance() -> bool {
+    true
+}
+
+pub fn default_hybrid_edge_type_weights() -> BTreeMap<String, f32> {
+    BTreeMap::from([
+        ("contradicts".to_string(), -1.0),
+        ("CONTRADICTS".to_string(), -1.0),
+        ("tension".to_string(), -0.5),
+        ("TENSION".to_string(), -0.5),
+    ])
 }
 
 pub type GraphStoreResult<T> = Result<T, GraphStoreError>;
@@ -977,31 +1024,43 @@ impl InMemoryGraphStore {
         max_hops: usize,
         alpha: f32,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            &HybridScoringConfig::default().with_alpha(alpha),
+        )
+    }
+
+    pub fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
         let vector_results = self.vector_search(label, property_name, query, k * 2)?;
         if vector_results.is_empty() {
             return Ok(Vec::new());
         }
-        let all_edges: Vec<crate::graph::EdgeTuple> = self
-            .edges
-            .values()
-            .filter(|e| !e.tombstone)
-            .map(|e| (e.from_id.clone(), e.edge_type.clone(), e.to_id.clone()))
-            .collect();
-        let expansion = crate::graph::expand_bounded(all_edges, graph_seeds.to_vec(), max_hops);
-        let graph_distances: HashMap<String, usize> = expansion.into_iter().collect();
+        let graph_scores = self.hybrid_graph_scores(graph_seeds, max_hops, config);
         let max_vec_dist = vector_results
             .iter()
             .map(|(_, d)| *d)
             .fold(0.0_f32, f32::max)
             .max(1e-10);
+        let alpha = config.alpha.clamp(0.0, 1.0);
         let mut scored: Vec<(String, f32)> = vector_results
             .into_iter()
             .map(|(node_id, vec_dist)| {
                 let vector_score = 1.0 - (vec_dist / max_vec_dist);
-                let graph_score = graph_distances
-                    .get(&node_id)
-                    .map(|&d| 1.0 / (1.0 + d as f32))
-                    .unwrap_or(0.0);
+                let graph_score = graph_scores.get(&node_id).copied().unwrap_or(0.0);
                 let final_score = (1.0 - alpha) * vector_score + alpha * graph_score;
                 (node_id, final_score)
             })
@@ -1009,6 +1068,54 @@ impl InMemoryGraphStore {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
         Ok(scored)
+    }
+
+    fn hybrid_graph_scores(
+        &self,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> HashMap<String, f32> {
+        let mut adjacency: HashMap<String, Vec<&EdgeRecord>> = HashMap::new();
+        for edge in self.edges.values().filter(|edge| !edge.tombstone) {
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push(edge);
+        }
+        let mut best: HashMap<String, f32> = HashMap::new();
+        let mut queue: VecDeque<(String, usize, f32)> = VecDeque::new();
+        for seed in graph_seeds {
+            best.insert(seed.clone(), 1.0);
+            queue.push_back((seed.clone(), 0, 1.0));
+        }
+        while let Some((node_id, depth, path_score)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            let Some(edges) = adjacency.get(&node_id) else {
+                continue;
+            };
+            for edge in edges {
+                let confidence = if config.confidence_weighted_graph_distance {
+                    edge.effective_confidence() as f32
+                } else {
+                    1.0
+                };
+                let edge_weight = config.edge_type_weight(&edge.edge_type);
+                let next_depth = depth + 1;
+                let next_score = path_score * edge_weight * confidence / (1.0 + next_depth as f32);
+                let should_update = best
+                    .get(&edge.to_id)
+                    .map(|current| next_score.abs() > current.abs())
+                    .unwrap_or(true);
+                if should_update {
+                    best.insert(edge.to_id.clone(), next_score.clamp(-1.0, 1.0));
+                    queue.push_back((edge.to_id.clone(), next_depth, next_score));
+                }
+            }
+        }
+        best
     }
 
     fn auto_index_vectors(&mut self, node: &NodeRecord) {
@@ -1679,6 +1786,27 @@ impl RedCoreGraphStore {
             .hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
     }
 
+    pub fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store.hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
+        )
+    }
+
     pub fn vector_designations(&self) -> Vec<VectorDesignation> {
         self.store.vector_designations()
     }
@@ -1970,7 +2098,7 @@ impl RedCoreGraphStore {
 
 impl Drop for RedCoreDirectoryLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = fs2::FileExt::unlock(&self.file);
         if let Some(locks) = REDCORE_PROCESS_LOCKS.get() {
             if let Ok(mut locks) = locks.lock() {
                 locks.remove(&self.process_key);
@@ -4151,6 +4279,58 @@ mod tests {
     }
 
     #[test]
+    fn redcore_checked_in_format_fixture_loads_current_read_paths() {
+        let data_dir = unique_test_dir("redcore-format-fixture");
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("redcore-v1");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        for file in ["manifest.json", "graph.snapshot.current"] {
+            std::fs::copy(fixture_dir.join(file), data_dir.join(file)).unwrap();
+        }
+
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 10,
+            strict_acid: false,
+        };
+        let mut store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+
+        assert_eq!(super::read_manifest(&data_dir).unwrap().unwrap().version, 1);
+        assert_eq!(
+            store.get_node("doc:a").unwrap().unwrap().labels,
+            vec!["Doc"]
+        );
+        assert_eq!(
+            store
+                .query_nodes(NodeQuery {
+                    label: Some("Doc".to_string()),
+                    properties: std::collections::BTreeMap::new(),
+                    limit: Some(10),
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store.neighbors(NeighborQuery::out("doc:a")).unwrap()[0].node_id,
+            "doc:b"
+        );
+        assert!(store.verify().unwrap().ok);
+        assert!(store.rebuild_indexes().unwrap().after.ok);
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        let vector_hits = store
+            .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 2)
+            .unwrap();
+        assert_eq!(vector_hits[0].0, "doc:a");
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn redcore_strict_acid_requires_aof_always() {
         let data_dir = unique_test_dir("redcore-strict-requires-aof-always");
         let error = RedCoreGraphStore::open(
@@ -4409,6 +4589,80 @@ mod tests {
             ids.contains(&"doc:a"),
             "doc:a should appear (near vector + reachable from seed)"
         );
+    }
+
+    #[test]
+    fn hybrid_search_can_penalize_contradicting_edges() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Claim", "embedding", 2)
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "claim:seed",
+                ["Claim"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "claim:support",
+                ["Claim"],
+                json!({ "embedding": [0.95, 0.05] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "claim:against",
+                ["Claim"],
+                json!({ "embedding": [0.95, 0.05] }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:support",
+                "claim:seed",
+                "SUPPORTS",
+                "claim:support",
+                json!({}),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(
+                EdgeRecord::new(
+                    "edge:against",
+                    "claim:seed",
+                    "CONTRADICTS",
+                    "claim:against",
+                    json!({}),
+                )
+                .with_confidence(1.0),
+            )
+            .unwrap();
+
+        let results = store
+            .hybrid_search(
+                Some("Claim"),
+                "embedding",
+                &[1.0, 0.0],
+                3,
+                &["claim:seed".to_string()],
+                1,
+                0.9,
+            )
+            .unwrap();
+        let support = results
+            .iter()
+            .find(|(id, _)| id == "claim:support")
+            .map(|(_, score)| *score)
+            .unwrap();
+        let against = results
+            .iter()
+            .find(|(id, _)| id == "claim:against")
+            .map(|(_, score)| *score)
+            .unwrap();
+
+        assert!(support > against);
     }
 
     #[test]

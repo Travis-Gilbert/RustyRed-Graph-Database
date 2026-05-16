@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "graph_version": 3,
+  "last_txn_id": 3,
+  "snapshot_txn_id": 3,
+  "durability": "snapshot_only",
+  "snapshot_file": "graph.snapshot.current",
+  "aof_file": "graph.aof.current",
+  "updated_at_unix_ms": 0,
+  "format_kind": "redcore",
+  "crate_version": "0.1.0",
+  "created_at_unix_ms": 0
+}

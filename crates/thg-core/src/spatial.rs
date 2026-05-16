@@ -38,19 +38,10 @@ impl SpatialIndex {
         }
     }
 
-    pub fn upsert(
-        &mut self,
-        node_id: &str,
-        lat: f64,
-        lon: f64,
-    ) -> Result<CellIndex, SpatialError> {
-        let res = self
-            .designation
-            .as_ref()
-            .map(|d| d.resolution)
-            .unwrap_or(8);
-        let resolution = Resolution::try_from(res)
-            .map_err(|_| SpatialError::InvalidResolution(res))?;
+    pub fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<CellIndex, SpatialError> {
+        let res = self.designation.as_ref().map(|d| d.resolution).unwrap_or(8);
+        let resolution =
+            Resolution::try_from(res).map_err(|_| SpatialError::InvalidResolution(res))?;
         let cell = LatLng::new(lat, lon)
             .map_err(|err| SpatialError::InvalidCoordinate(format!("{err}")))?
             .to_cell(resolution);
@@ -85,13 +76,9 @@ impl SpatialIndex {
         lon: f64,
         radius_km: f64,
     ) -> Result<Vec<String>, SpatialError> {
-        let res = self
-            .designation
-            .as_ref()
-            .map(|d| d.resolution)
-            .unwrap_or(8);
-        let resolution = Resolution::try_from(res)
-            .map_err(|_| SpatialError::InvalidResolution(res))?;
+        let res = self.designation.as_ref().map(|d| d.resolution).unwrap_or(8);
+        let resolution =
+            Resolution::try_from(res).map_err(|_| SpatialError::InvalidResolution(res))?;
         let center_ll = LatLng::new(lat, lon)
             .map_err(|err| SpatialError::InvalidCoordinate(format!("{err}")))?;
         let center_cell = center_ll.to_cell(resolution);

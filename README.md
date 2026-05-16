@@ -21,7 +21,7 @@ Template ID pending: after creating or publishing the Railway template, replace 
 - **Graph algorithms over HTTP/MCP**: PPR, connected components, PageRank, and label-propagation community detection
 - **MCP agent port** with scoped auth tokens, read-only and read-write modes, tool annotations, and structured tool/resource/prompt surfaces
 - **Graph-version-aware cache** (10 kinds) that detects stale entries when the underlying graph mutates
-- **Read-only Cypher subset**: single-hop MATCH with label/property filters, RETURN with aliases, LIMIT, and `COUNT(*) / COUNT(binding)` aggregations
+- **Bounded Cypher surface**: single-hop and outgoing multi-hop MATCH, bounded variable-length expand, path aliases, property projections, `COUNT(*) / COUNT(binding)`, and transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE`
 - **JSONL bulk loader** for nodes and edges
 - **Observability**: Prometheus `/metrics` (17 counters), slow-query ring buffer at `/v1/diagnostics/slow_queries`
 - **HTTP transaction API**: `/v1/transactions/begin|commit|rollback` with snapshot isolation
@@ -31,10 +31,10 @@ Template ID pending: after creating or publishing the Railway template, replace 
 
 These are on the roadmap, in roughly this priority order:
 
-1. Multi-hop Cypher patterns (`MATCH (a)-[:T1]->(b)-[:T2]->(c)`) and variable-length expand (`*1..3`, `*`)
-2. Write clauses in Cypher (`CREATE`, `MERGE`, `SET`, `DELETE`) — use the bulk loader or `THG.GRAPH.NODE.UPSERT` MCP/HTTP today
-3. `SUM` and `AVG` aggregations, `WITH` pipeline stages, `ORDER BY`, `SKIP`
-4. Path projection (`MATCH p = (a)-[:T*]->(b) RETURN p`)
+1. Incoming and undirected Cypher relationship patterns, plus the rest of full OpenCypher/GQL coverage
+2. `OPTIONAL MATCH`, `WITH`, `UNION`, `CALL`, `ORDER BY`, `SKIP`, `DISTINCT`
+3. `SUM` / `AVG` / `MIN` / `MAX` aggregations
+4. `REMOVE` clauses
 5. CSV/JSONL `LOAD CSV` syntactic form (JSONL bulk endpoints exist already)
 6. Distributed snapshot replication
 7. Spatial S2 cell index (H3 ships today)
@@ -154,23 +154,26 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 
 | Tool | Description |
 |------|-------------|
-| `thg.graph.node.upsert` | Create or update a node |
-| `thg.graph.edge.upsert` | Create or update an edge |
-| `thg.graph.nodes.query` | Query nodes by label and properties |
-| `thg.graph.neighbors` | Adjacency traversal |
+| `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
+| `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
+| `thg.algorithm.ppr` / `thg.algorithm.components` / `thg.algorithm.pagerank` / `thg.algorithm.communities` | Graph algorithms, with communities reported honestly as label propagation |
+| `thg.fulltext.search` / `thg.spatial.radius` / `thg.spatial.bbox` | Full-text and spatial read surfaces |
 | `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
 | `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
 | `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
 | `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
-| `thg.graph.stats` | Graph statistics |
-| `thg.graph.verify` | Verify index integrity |
-| `thg.graph.rebuild_indexes` | Rebuild all derived indexes (admin) |
+| `thg.fulltext.designate` / `thg.spatial.designate` / `thg.bulk.nodes` / `thg.bulk.edges` | Write-mode-only designation and bulk ingest tools |
+| `thg.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
 
 The public query surface is now split cleanly:
 
 - `/v1/query` is the product-facing native subset for `node_match` and `neighbors`.
-- `/v1/cypher` and `/v1/cypher/explain` are the first read-only OpenCypher-compatible subset.
+- `/v1/cypher` and `/v1/cypher/explain` are the bounded OpenCypher-compatible surface for read queries plus transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE` writes.
 - `/v1/tenants/{tenant_id}/graph/query` remains the older debug bridge and should not be treated as the product route.
+
+`GET /v1/diagnostics/config` returns the static runtime config snapshot, including
+startup-only tenant override details. Runtime mutation of tenant config is not
+supported in this slice.
 
 The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
 is exposed through HTTP and MCP even though the underlying storage engine is a

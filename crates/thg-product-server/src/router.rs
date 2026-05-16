@@ -147,8 +147,12 @@ pub struct HybridSearchBody {
     pub graph_seeds: Vec<String>,
     #[serde(default = "default_max_hops")]
     pub max_hops: usize,
-    #[serde(default = "default_alpha")]
-    pub alpha: f32,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    pub confidence_weighted_graph_distance: Option<bool>,
+    #[serde(default)]
+    pub edge_type_weights: Option<std::collections::BTreeMap<String, f32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,10 +185,6 @@ fn default_k() -> usize {
 fn default_max_hops() -> usize {
     3
 }
-fn default_alpha() -> f32 {
-    0.5
-}
-
 pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state);
     Router::new()
@@ -1038,14 +1038,24 @@ async fn graph_vector_hybrid(
 
     state.observability.record_vector_search();
     let label_ref = body.label.as_deref();
-    match store.hybrid_search(
+    let mut scoring = state.config.tenant_config(&tenant_id).hybrid_scoring;
+    if let Some(alpha) = body.alpha {
+        scoring = scoring.with_alpha(alpha);
+    }
+    if let Some(confidence_weighted) = body.confidence_weighted_graph_distance {
+        scoring.confidence_weighted_graph_distance = confidence_weighted;
+    }
+    if let Some(edge_type_weights) = body.edge_type_weights {
+        scoring.edge_type_weights = edge_type_weights;
+    }
+    match store.hybrid_search_with_config(
         label_ref,
         &body.property,
         &body.query,
         body.k,
         &body.graph_seeds,
         body.max_hops,
-        body.alpha,
+        &scoring,
     ) {
         Ok(results) => {
             let items: Vec<Value> = results
@@ -1055,7 +1065,16 @@ async fn graph_vector_hybrid(
                     json!({ "node_id": node_id, "score": score, "node": node })
                 })
                 .collect();
-            Json(json!({ "ok": true, "results": items })).into_response()
+            Json(json!({
+                "ok": true,
+                "results": items,
+                "scoring": {
+                    "alpha": scoring.alpha,
+                    "confidence_weighted_graph_distance": scoring.confidence_weighted_graph_distance,
+                    "edge_type_weights": scoring.edge_type_weights,
+                }
+            }))
+            .into_response()
         }
         Err(error) => {
             state.observability.record_error();
@@ -2376,13 +2395,18 @@ async fn graph_bulk_nodes(
     produced_lines.extend(splitter.flush());
 
     let mut csv_parser: Option<crate::bulk::CsvNodeParser> = None;
+    let mut first_data_line = 1usize;
     if is_csv {
         if let Some(header_str) = query.headers.as_deref() {
             csv_parser = Some(crate::bulk::CsvNodeParser::new(
-                header_str.split(',').map(|s| s.trim().to_string()).collect(),
+                header_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect(),
             ));
         } else if !produced_lines.is_empty() {
             let first = produced_lines.remove(0);
+            first_data_line = 2;
             csv_parser = Some(crate::bulk::CsvNodeParser::new(
                 first.split(',').map(|s| s.trim().to_string()).collect(),
             ));
@@ -2393,9 +2417,10 @@ async fn graph_bulk_nodes(
     let mut failed = 0usize;
     let mut errors: Vec<Value> = Vec::new();
     let mut batches = 0usize;
-    let mut pending: Vec<thg_core::NodeRecord> = Vec::with_capacity(batch_size);
+    let mut pending: Vec<(usize, thg_core::NodeRecord)> = Vec::with_capacity(batch_size);
 
     for (line_no, line) in produced_lines.iter().enumerate() {
+        let source_line = first_data_line + line_no;
         let parsed = if is_csv {
             csv_parser
                 .as_ref()
@@ -2406,7 +2431,7 @@ async fn graph_bulk_nodes(
         };
         match parsed {
             Ok(node) => {
-                pending.push(node);
+                pending.push((source_line, node));
                 if pending.len() >= batch_size {
                     flush_node_batch(
                         &mut store,
@@ -2423,7 +2448,7 @@ async fn graph_bulk_nodes(
             Err(err) => {
                 failed += 1;
                 if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": err }));
+                    errors.push(bulk_parse_error(source_line, &err));
                 }
             }
         }
@@ -2457,7 +2482,7 @@ fn flush_node_batch(
     store: &mut TenantGraphStore,
     state: &AppState,
     tenant_id: &str,
-    pending: &mut Vec<thg_core::NodeRecord>,
+    pending: &mut Vec<(usize, thg_core::NodeRecord)>,
     inserted: &mut usize,
     failed: &mut usize,
     errors: &mut Vec<Value>,
@@ -2465,29 +2490,42 @@ fn flush_node_batch(
     if pending.is_empty() {
         return;
     }
-    let snapshot: Vec<thg_core::NodeRecord> = pending.drain(..).collect();
+    let snapshot: Vec<(usize, thg_core::NodeRecord)> = pending.drain(..).collect();
     let mutations: Vec<thg_core::GraphMutation> = snapshot
         .iter()
-        .cloned()
-        .map(thg_core::GraphMutation::NodeUpsert)
+        .map(|(_, node)| thg_core::GraphMutation::NodeUpsert(node.clone()))
         .collect();
     let batch = thg_core::GraphMutationBatch::new(mutations);
     match store.commit_batch(batch) {
         Ok(_transaction) => {
             *inserted += snapshot.len();
-            for node in &snapshot {
+            for (_, node) in &snapshot {
                 state.observability.record_mutation();
                 state.maybe_index_node_spatially(tenant_id, node);
                 state.maybe_index_node_fulltext(tenant_id, node);
             }
         }
-        Err(err) => {
-            *failed += snapshot.len();
-            if errors.len() < 32 {
-                errors.push(json!({
-                    "batch_size": snapshot.len(),
-                    "error": format!("{err:?}"),
-                }));
+        Err(_) => {
+            for (line, node) in snapshot {
+                let record_id = node.id.clone();
+                let batch =
+                    thg_core::GraphMutationBatch::new([thg_core::GraphMutation::NodeUpsert(
+                        node.clone(),
+                    )]);
+                match store.commit_batch(batch) {
+                    Ok(_) => {
+                        *inserted += 1;
+                        state.observability.record_mutation();
+                        state.maybe_index_node_spatially(tenant_id, &node);
+                        state.maybe_index_node_fulltext(tenant_id, &node);
+                    }
+                    Err(err) => {
+                        *failed += 1;
+                        if errors.len() < 32 {
+                            errors.push(bulk_store_error(line, &record_id, &err));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2540,12 +2578,15 @@ async fn graph_bulk_edges(
     produced_lines.extend(splitter.flush());
 
     let mut csv_parser: Option<crate::bulk::CsvEdgeParser> = None;
+    let mut first_data_line = 1usize;
     if is_csv {
         let from_col = query.from_col.as_deref().unwrap_or("from_id");
         let to_col = query.to_col.as_deref().unwrap_or("to_id");
         if let Some(header_str) = query.headers.as_deref() {
-            let header_vec: Vec<String> =
-                header_str.split(',').map(|s| s.trim().to_string()).collect();
+            let header_vec: Vec<String> = header_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
                 Ok(parser) => csv_parser = Some(parser),
                 Err(err) => {
@@ -2561,8 +2602,8 @@ async fn graph_bulk_edges(
             }
         } else if !produced_lines.is_empty() {
             let first = produced_lines.remove(0);
-            let header_vec: Vec<String> =
-                first.split(',').map(|s| s.trim().to_string()).collect();
+            first_data_line = 2;
+            let header_vec: Vec<String> = first.split(',').map(|s| s.trim().to_string()).collect();
             match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
                 Ok(parser) => csv_parser = Some(parser),
                 Err(err) => {
@@ -2583,9 +2624,10 @@ async fn graph_bulk_edges(
     let mut failed = 0usize;
     let mut errors: Vec<Value> = Vec::new();
     let mut batches = 0usize;
-    let mut pending: Vec<thg_core::EdgeRecord> = Vec::with_capacity(batch_size);
+    let mut pending: Vec<(usize, thg_core::EdgeRecord)> = Vec::with_capacity(batch_size);
 
     for (line_no, line) in produced_lines.iter().enumerate() {
+        let source_line = first_data_line + line_no;
         let parsed = if is_csv {
             csv_parser
                 .as_ref()
@@ -2596,7 +2638,7 @@ async fn graph_bulk_edges(
         };
         match parsed {
             Ok(edge) => {
-                pending.push(edge);
+                pending.push((source_line, edge));
                 if pending.len() >= batch_size {
                     flush_edge_batch(
                         &mut store,
@@ -2612,7 +2654,7 @@ async fn graph_bulk_edges(
             Err(err) => {
                 failed += 1;
                 if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": err }));
+                    errors.push(bulk_parse_error(source_line, &err));
                 }
             }
         }
@@ -2644,7 +2686,7 @@ async fn graph_bulk_edges(
 fn flush_edge_batch(
     store: &mut TenantGraphStore,
     state: &AppState,
-    pending: &mut Vec<thg_core::EdgeRecord>,
+    pending: &mut Vec<(usize, thg_core::EdgeRecord)>,
     inserted: &mut usize,
     failed: &mut usize,
     errors: &mut Vec<Value>,
@@ -2652,29 +2694,70 @@ fn flush_edge_batch(
     if pending.is_empty() {
         return;
     }
-    let snapshot: Vec<thg_core::EdgeRecord> = pending.drain(..).collect();
+    let snapshot: Vec<(usize, thg_core::EdgeRecord)> = pending.drain(..).collect();
     let mutations: Vec<thg_core::GraphMutation> = snapshot
         .iter()
-        .cloned()
-        .map(thg_core::GraphMutation::EdgeUpsert)
+        .map(|(_, edge)| thg_core::GraphMutation::EdgeUpsert(edge.clone()))
         .collect();
     let batch = thg_core::GraphMutationBatch::new(mutations);
     match store.commit_batch(batch) {
         Ok(_transaction) => {
             *inserted += snapshot.len();
-            for _ in &snapshot {
+            for _ in snapshot {
                 state.observability.record_mutation();
             }
         }
-        Err(err) => {
-            *failed += snapshot.len();
-            if errors.len() < 32 {
-                errors.push(json!({
-                    "batch_size": snapshot.len(),
-                    "error": format!("{err:?}"),
-                }));
+        Err(_) => {
+            for (line, edge) in snapshot {
+                let record_id = edge.id.clone();
+                let batch =
+                    thg_core::GraphMutationBatch::new([thg_core::GraphMutation::EdgeUpsert(edge)]);
+                match store.commit_batch(batch) {
+                    Ok(_) => {
+                        *inserted += 1;
+                        state.observability.record_mutation();
+                    }
+                    Err(err) => {
+                        *failed += 1;
+                        if errors.len() < 32 {
+                            errors.push(bulk_store_error(line, &record_id, &err));
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+fn bulk_parse_error(line: usize, message: &str) -> Value {
+    json!({
+        "line": line,
+        "code": bulk_error_code(message),
+        "message": message,
+    })
+}
+
+fn bulk_store_error(line: usize, record_id: &str, error: &thg_core::GraphStoreError) -> Value {
+    json!({
+        "line": line,
+        "code": error.code,
+        "message": error.message,
+        "record_id": record_id,
+    })
+}
+
+fn bulk_error_code(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("properties") {
+        "invalid_properties"
+    } else if lower.contains("json") || lower.contains("expected") || lower.contains("eof") {
+        "invalid_json"
+    } else if lower.contains("missing") {
+        "missing_required_field"
+    } else if lower.contains("csv") {
+        "invalid_csv_row"
+    } else {
+        "invalid_record"
     }
 }
 
@@ -2934,7 +3017,7 @@ async fn graph_algorithm_communities(
         Err(error) => return graph_store_error_response(error),
     };
     state.observability.record_communities();
-    let (community, modularity) = thg_core::louvain_communities(&edges);
+    let (community, modularity) = thg_core::label_propagation_communities(&edges);
     let mut entries: Vec<Value> = community
         .into_iter()
         .map(|(node_id, c)| json!({ "node_id": node_id, "community_id": c }))
@@ -2948,6 +3031,7 @@ async fn graph_algorithm_communities(
     Json(json!({
         "ok": true,
         "tenant": tenant_id,
+        "algorithm": "label_propagation",
         "communities": entries,
         "modularity": modularity,
     }))
@@ -2966,13 +3050,15 @@ mod tests {
 
     use super::{
         execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        graph_bulk_edges, graph_bulk_nodes, graph_error_status, is_cache_command, is_graph_command,
-        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
-        transaction_commit, transaction_rollback, BulkQuery, PublicCypherBody,
-        TransactionBeginBody, TransactionMutationBody,
+        graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_vector_hybrid,
+        is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
+        required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
+        BulkQuery, HybridSearchBody, PublicCypherBody, TransactionBeginBody,
+        TransactionMutationBody,
     };
     use crate::{
-        config::{Config, StorageMode},
+        config::{Config, StorageMode, TenantConfigOverride},
+        metrics::diagnostics_config,
         state::AppState,
     };
     use thg_core::RedCoreDurability;
@@ -3002,6 +3088,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -3076,6 +3168,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -3209,6 +3307,163 @@ mod tests {
 
         headers.insert("origin", HeaderValue::from_static("https://evil.example"));
         assert!(!mcp_origin_allowed(&headers, &allowed));
+    }
+
+    #[tokio::test]
+    async fn graph_vector_hybrid_reports_effective_scoring_overrides() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-hybrid").unwrap();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        store
+            .upsert_node(thg_core::NodeRecord::new(
+                "node:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(thg_core::NodeRecord::new(
+                "node:b",
+                ["Doc"],
+                json!({ "embedding": [0.8, 0.2] }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(thg_core::EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "CONTRADICTS",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+
+        let response = graph_vector_hybrid(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-hybrid".to_string()),
+            HeaderMap::new(),
+            Json(HybridSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+                graph_seeds: vec!["node:a".to_string()],
+                max_hops: 2,
+                alpha: Some(0.2),
+                confidence_weighted_graph_distance: Some(false),
+                edge_type_weights: Some(std::collections::BTreeMap::from([(
+                    "CONTRADICTS".to_string(),
+                    -2.0,
+                )])),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        let alpha = payload["scoring"]["alpha"].as_f64().unwrap();
+        assert!((alpha - 0.2).abs() < 1e-6);
+        assert_eq!(
+            payload["scoring"]["confidence_weighted_graph_distance"],
+            false
+        );
+        assert_eq!(payload["scoring"]["edge_type_weights"]["CONTRADICTS"], -2.0);
+        assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_config_reports_startup_only_tenant_overrides() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            tenant_config_overrides: BTreeMap::from([(
+                "tenant-a".to_string(),
+                TenantConfigOverride {
+                    durability: Some(RedCoreDurability::AofAlways),
+                    snapshot_interval_writes: Some(42),
+                    strict_acid: Some(true),
+                    tenant_memory_quota_bytes: Some(4_096),
+                    hybrid_scoring: Some(thg_core::HybridScoringConfig {
+                        alpha: 0.25,
+                        confidence_weighted_graph_distance: false,
+                        edge_type_weights: BTreeMap::from([("CONTRADICTS".to_string(), -2.0)]),
+                    }),
+                },
+            )]),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        });
+
+        let response = diagnostics_config(axum::extract::State(state), HeaderMap::new())
+            .await
+            .unwrap()
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["tenant_config_overrides"], 1);
+        assert_eq!(payload["tenant_config_runtime_mutation_supported"], false);
+        assert_eq!(payload["tenant_config_tenants"], json!(["tenant-a"]));
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["durability"],
+            "aof_always"
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["snapshot_interval_writes"],
+            42
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["strict_acid"],
+            true
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["tenant_memory_quota_bytes"],
+            4096
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]["alpha"],
+            0.25
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]
+                ["confidence_weighted_graph_distance"],
+            false
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]
+                ["edge_type_weights"]["CONTRADICTS"],
+            -2.0
+        );
     }
 
     #[tokio::test]
@@ -3356,7 +3611,10 @@ mod tests {
                 .to_string(),
         );
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
         let response = graph_bulk_nodes(
             axum::extract::State(state.clone()),
             axum::extract::Path("tenant-bulk".to_string()),
@@ -3375,9 +3633,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_nodes_csv_streaming_uses_first_row_headers() {
         let state = memory_product_state();
-        let body = Body::from(
-            "id,label,path\nnA,Doc,src/a.rs\nnB,Doc,src/b.rs\n".to_string(),
-        );
+        let body = Body::from("id,label,path\nnA,Doc,src/a.rs\nnB,Doc,src/b.rs\n".to_string());
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", HeaderValue::from_static("text/csv"));
         let response = graph_bulk_nodes(
@@ -3403,7 +3659,10 @@ mod tests {
                 .to_string(),
         );
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
         let response = graph_bulk_nodes(
             axum::extract::State(state),
             axum::extract::Path("tenant-bulk".to_string()),
@@ -3424,6 +3683,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_nodes_reports_per_line_parse_errors_and_keeps_good_rows() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"bad\",\"labels\":[\"Doc\"],\"properties\":[]}\n\
+             {\"id\":\"good\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+
+        let response = graph_bulk_nodes(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-bulk-errors".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["inserted"], 1);
+        assert_eq!(payload["failed"], 1);
+        assert_eq!(payload["errors"][0]["line"], 1);
+        assert_eq!(payload["errors"][0]["code"], "invalid_properties");
+    }
+
+    #[tokio::test]
     async fn bulk_edges_jsonl_streaming_inserts_one_edge() {
         let state = memory_product_state();
         let nodes_body = Body::from(
@@ -3432,7 +3722,10 @@ mod tests {
                 .to_string(),
         );
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
         let _ = graph_bulk_nodes(
             axum::extract::State(state.clone()),
             axum::extract::Path("tenant-edges".to_string()),
@@ -3457,6 +3750,51 @@ mod tests {
         .into_response();
         let payload = response_payload_json(response).await;
         assert_eq!(payload["inserted"], 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_retries_batch_to_report_missing_endpoint_line() {
+        let state = memory_product_state();
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edge-errors".to_string()),
+            headers.clone(),
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let edges_body = Body::from(
+            "{\"id\":\"e1\",\"from_id\":\"a\",\"to_id\":\"b\",\"type\":\"CITES\",\"properties\":{}}\n\
+             {\"id\":\"e2\",\"from_id\":\"a\",\"to_id\":\"missing\",\"type\":\"CITES\",\"properties\":{}}\n"
+                .to_string(),
+        );
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edge-errors".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            edges_body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["inserted"], 1);
+        assert_eq!(payload["failed"], 1);
+        assert_eq!(payload["errors"][0]["line"], 2);
+        assert_eq!(payload["errors"][0]["code"], "missing_graph_endpoint");
+        assert_eq!(payload["errors"][0]["record_id"], "e2");
     }
 
     // ===== Phase 3-A: auto-tx write Cypher tests =====
@@ -3534,7 +3872,10 @@ mod tests {
                 .to_string(),
         );
         let mut nh = HeaderMap::new();
-        nh.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        nh.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
         let _ = graph_bulk_nodes(
             axum::extract::State(state.clone()),
             axum::extract::Path("tenant-edges".to_string()),

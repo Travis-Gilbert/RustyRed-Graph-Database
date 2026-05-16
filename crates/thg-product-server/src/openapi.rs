@@ -142,6 +142,109 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/metrics": {
+                "get": {
+                    "tags": ["operations"],
+                    "summary": "Prometheus metrics",
+                    "description": "Admin-scoped Prometheus 0.0.4 text exposition for request counters, query latency percentiles, and graph/runtime activity.",
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus text exposition.",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/v1/diagnostics/slow_queries": {
+                "get": {
+                    "tags": ["operations"],
+                    "summary": "Slow-query diagnostics",
+                    "description": "Admin-scoped ring buffer of slow queries plus execution detail such as query kind, elapsed nanoseconds, and touched graph counts.",
+                    "responses": {
+                        "200": {
+                            "description": "Slow-query snapshot.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "entries": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "recorded_at_unix_ms": { "type": "string" },
+                                                        "nanos": { "type": "integer" },
+                                                        "kind": { "type": "string" },
+                                                        "detail": { "type": "string" },
+                                                        "nodes_visited": { "type": "integer" },
+                                                        "edges_touched": { "type": "integer" }
+                                                    }
+                                                }
+                                            },
+                                            "count": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/v1/diagnostics/config": {
+                "get": {
+                    "tags": ["operations"],
+                    "summary": "Static runtime configuration snapshot",
+                    "description": "Admin-scoped runtime config, including slow-query settings and startup-only tenant override details. Runtime mutation of tenant config is not supported in this slice.",
+                    "responses": {
+                        "200": {
+                            "description": "Static config snapshot.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "service": { "type": "string" },
+                                            "status": { "type": "string" },
+                                            "auth_required": { "type": "boolean" },
+                                            "configured_origins": { "type": "integer" },
+                                            "storage_mode": { "type": "string" },
+                                            "durability": { "type": "string" },
+                                            "strict_acid": { "type": "boolean" },
+                                            "tenant_memory_quota_bytes": { "type": "integer" },
+                                            "tenant_memory_quota_supported": { "type": "boolean" },
+                                            "tenant_memory_quota_enforced": { "type": "boolean" },
+                                            "slow_query_threshold_nanos": { "type": "integer" },
+                                            "slow_query_capacity": { "type": "integer" },
+                                            "slow_query_log_enabled": { "type": "boolean" },
+                                            "tenant_config_overrides": { "type": "integer" },
+                                            "tenant_config_runtime_mutation_supported": { "type": "boolean" },
+                                            "tenant_config_tenants": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            "tenant_config_overrides_detail": {
+                                                "type": "object",
+                                                "additionalProperties": { "type": "object" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
             "/v1/command": {
                 "post": {
                     "tags": ["runs"],
@@ -219,7 +322,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                 "post": {
                     "tags": ["graph"],
                     "summary": "Run the first OpenCypher-compatible subset",
-                    "description": "Supports the first bounded `/v1/cypher` subset: MATCH, RETURN, simple equality WHERE, LIMIT, and single-hop outgoing relationship expansion. When tenant_id is omitted, the configured default tenant is used. If tx_id is provided, matching write statements are staged into that open transaction.",
+                    "description": "Supports the bounded `/v1/cypher` subset: MATCH, RETURN, simple equality WHERE, LIMIT, outgoing multi-hop chains, bounded variable-length expansion, path aliases, and CREATE/MERGE/SET/DELETE write clauses. When tenant_id is omitted, the configured default tenant is used. If tx_id is provided, matching write statements are staged into that open transaction.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -1703,6 +1806,12 @@ mod tests {
             txn_isolation: "snapshot".to_string(),
             tenant_memory_quota_bytes: 0,
             tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
             redis_url: "not-a-redis-url".to_string(),
             redis_key_prefix: "rusty-red".to_string(),
             require_auth: false,
@@ -1727,6 +1836,13 @@ mod tests {
         assert!(document
             .pointer("/paths/~1v1~1cypher~1explain/post")
             .is_some());
+        assert!(document.pointer("/paths/~1metrics/get").is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1diagnostics~1slow_queries/get")
+            .is_some());
+        assert!(document
+            .pointer("/paths/~1v1~1diagnostics~1config/get")
+            .is_some());
         assert!(document.pointer("/paths/~1v1~1cache~1check/post").is_some());
         assert!(document.pointer("/paths/~1v1~1cache~1put/post").is_some());
         assert!(document
@@ -1747,6 +1863,12 @@ mod tests {
         assert_eq!(
             document.pointer("/components/schemas/CypherRequest/properties/tx_id/type"),
             Some(&serde_json::Value::String("string".to_string()))
+        );
+        assert_eq!(
+            document.pointer(
+                "/paths/~1v1~1diagnostics~1config/get/responses/200/content/application~1json/schema/properties/tenant_config_runtime_mutation_supported/type"
+            ),
+            Some(&serde_json::Value::String("boolean".to_string()))
         );
         assert_eq!(
             document.pointer(

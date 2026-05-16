@@ -437,7 +437,7 @@ pub fn pagerank(
 /// undirected, edge-weight-aware projection. Cheap, deterministic, and
 /// adequate for showing cluster structure in mid-sized graphs.
 /// Returns (node_id -> community_id, modularity).
-pub fn louvain_communities(edges: &[EdgeRecord]) -> (HashMap<String, u64>, f64) {
+pub fn label_propagation_communities(edges: &[EdgeRecord]) -> (HashMap<String, u64>, f64) {
     let mut adjacency: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut total_weight = 0.0;
     for edge in edges {
@@ -538,6 +538,14 @@ pub fn louvain_communities(edges: &[EdgeRecord]) -> (HashMap<String, u64>, f64) 
         modularity /= total_weight;
     }
     (community, modularity)
+}
+
+#[deprecated(
+    since = "0.1.0",
+    note = "this function runs label propagation, not Louvain; use label_propagation_communities"
+)]
+pub fn louvain_communities(edges: &[EdgeRecord]) -> (HashMap<String, u64>, f64) {
+    label_propagation_communities(edges)
 }
 
 fn adjacency_from_edges(edges: Vec<EdgeTuple>) -> HashMap<String, Vec<String>> {
@@ -688,7 +696,9 @@ mod tests {
         assert!((result.1 - 0.0).abs() < 1e-10);
     }
 
-    use super::{connected_components, louvain_communities, pagerank, personalized_pagerank};
+    use super::{
+        connected_components, label_propagation_communities, pagerank, personalized_pagerank,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -759,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn louvain_finds_two_clusters() {
+    fn label_propagation_finds_two_clusters() {
         // Two triangles connected by a single weak edge.
         let edges = vec![
             // cluster 1
@@ -773,7 +783,7 @@ mod tests {
             // bridge
             make_edge("e7", "a", "x", Some(0.1)),
         ];
-        let (community, modularity) = louvain_communities(&edges);
+        let (community, modularity) = label_propagation_communities(&edges);
         assert_eq!(community.len(), 6);
         // a, b, c share a community
         assert_eq!(community["a"], community["b"]);

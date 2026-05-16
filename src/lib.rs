@@ -17,6 +17,7 @@
 //! because Theseus PKs are arbitrary integers.
 
 mod bgi;
+mod cmh;
 mod graph_export;
 mod push_ppr;
 mod search_kernel;
@@ -27,6 +28,9 @@ use pyo3::prelude::*;
 #[pymodule]
 fn theseus_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(push_ppr::push_ppr, m)?)?;
+    m.add_function(wrap_pyfunction!(cmh::cmh_body_hash, m)?)?;
+    m.add_function(wrap_pyfunction!(cmh::cmh_atom_id_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(cmh::cmh_handoff_state_hash_v1, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_stable_hash_json, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_fact_pack_hash_rows_json, m)?)?;
     m.add_function(wrap_pyfunction!(bgi::bgi_egraph_receipt_summary_json, m)?)?;

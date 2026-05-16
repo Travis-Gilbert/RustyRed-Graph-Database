@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+// Some AST fields are intentionally carried ahead of executor support so the
+// parser can normalize future clauses without reparsing later.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ParsedCypher {
     pub normalized: String,
@@ -19,6 +22,7 @@ pub struct ParsedCypher {
     pub skip: Option<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggOp {
     Count,
@@ -28,6 +32,7 @@ pub enum AggOp {
     Max,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum WithItem {
     Field {
@@ -44,17 +49,20 @@ pub enum WithItem {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct WithClause {
     pub items: Vec<WithItem>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct OrderBy {
     pub expression: String,
     pub descending: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum SetExpr {
     Literal(Value),
@@ -148,6 +156,7 @@ pub struct PropertyFilter {
     pub value: Value,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum ReturnItem {
     Variable(String),

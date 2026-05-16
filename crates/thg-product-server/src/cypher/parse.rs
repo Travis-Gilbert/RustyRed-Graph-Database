@@ -983,10 +983,7 @@ fn parse_with_clause(
             }
             let mut sub = entry.into_inner();
             let expr_pair = sub.next().ok_or_else(|| {
-                QuerySurfaceError::invalid(
-                    "invalid_with_clause",
-                    "WITH item missing expression",
-                )
+                QuerySurfaceError::invalid("invalid_with_clause", "WITH item missing expression")
             })?;
             let alias_pair = sub.next().ok_or_else(|| {
                 QuerySurfaceError::invalid("invalid_with_clause", "WITH item missing alias")
@@ -1111,10 +1108,7 @@ fn parse_order_clause(pair: Pair<Rule>) -> Result<Vec<OrderBy>, QuerySurfaceErro
             }
             let mut iter = entry.into_inner();
             let expr_pair = iter.next().ok_or_else(|| {
-                QuerySurfaceError::invalid(
-                    "invalid_order_clause",
-                    "missing ORDER BY expression",
-                )
+                QuerySurfaceError::invalid("invalid_order_clause", "missing ORDER BY expression")
             })?;
             let expression = expr_pair.as_str().to_string();
             let descending = match iter.next() {
@@ -1422,10 +1416,7 @@ mod parse_to_ast_tests {
             op, binding, key, ..
         } = &parsed.returns[0]
         else {
-            panic!(
-                "expected Aggregate ReturnItem, got {:?}",
-                parsed.returns[0]
-            );
+            panic!("expected Aggregate ReturnItem, got {:?}", parsed.returns[0]);
         };
         assert_eq!(*op, AggOp::Sum);
         assert_eq!(binding.as_deref(), Some("n"));
@@ -1513,8 +1504,7 @@ mod aggregation_grammar_tests {
 
     #[test]
     fn grammar_parses_sum_aggregation() {
-        let pairs =
-            CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN sum(n.score)");
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN sum(n.score)");
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
 
@@ -1538,10 +1528,7 @@ mod aggregation_grammar_tests {
 
     #[test]
     fn grammar_parses_skip() {
-        let pairs = CypherPestParser::parse(
-            Rule::query,
-            "MATCH (n:Doc) RETURN n SKIP 10 LIMIT 5",
-        );
+        let pairs = CypherPestParser::parse(Rule::query, "MATCH (n:Doc) RETURN n SKIP 10 LIMIT 5");
         assert!(pairs.is_ok(), "{:?}", pairs);
     }
 

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "txn_id": 3,
+  "graph": {
+    "version": 3,
+    "nodes": [
+      {
+        "id": "doc:a",
+        "labels": ["Doc"],
+        "properties": {
+          "path": "src/a.rs",
+          "embedding": [1.0, 0.0]
+        },
+        "version": 1,
+        "tombstone": false
+      },
+      {
+        "id": "doc:b",
+        "labels": ["Doc"],
+        "properties": {
+          "path": "src/b.rs",
+          "embedding": [0.0, 1.0]
+        },
+        "version": 2,
+        "tombstone": false
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge:ab",
+        "from_id": "doc:a",
+        "to_id": "doc:b",
+        "type": "CITES",
+        "properties": {
+          "source": "format-fixture"
+        },
+        "version": 3,
+        "tombstone": false,
+        "confidence": 0.9
+      }
+    ]
+  }
+}

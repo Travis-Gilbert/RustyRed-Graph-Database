@@ -129,10 +129,8 @@ impl FullTextIndex {
                 *scores.entry(doc_id.clone()).or_insert(0.0) += s;
             }
         }
-        let mut entries: Vec<(String, f32)> = scores
-            .into_iter()
-            .map(|(id, s)| (id, s as f32))
-            .collect();
+        let mut entries: Vec<(String, f32)> =
+            scores.into_iter().map(|(id, s)| (id, s as f32)).collect();
         entries.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
