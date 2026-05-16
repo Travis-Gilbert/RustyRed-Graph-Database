@@ -1,6 +1,6 @@
 [package]
 name = "theseus_native"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Native (Rust + PyO3) accelerators for Theseus retrieval. push_ppr is the first export."
 license = "MIT"

@@ -567,7 +567,7 @@ impl AppState {
     pub fn mcp_config(&self) -> McpServerConfig {
         McpServerConfig {
             name: self.config.service_name.clone(),
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,

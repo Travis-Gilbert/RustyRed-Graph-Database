@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "theseus_native"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "datafrog",
  "egg",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "thg-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "h3o",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "thg-mcp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "thg-product-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "http",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "thg-resp-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "redis-protocol",
  "serde_json",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "thg-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "thg-core",
