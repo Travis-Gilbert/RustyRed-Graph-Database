@@ -8,7 +8,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use thg_core::unix_ms;
 
 #[derive(Default)]
 struct CounterSet {
@@ -314,12 +315,6 @@ fn write_counter(out: &mut String, name: &str, help: &str, value: u64) {
     out.push('\n');
 }
 
-fn unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default()
-}
 
 #[cfg(test)]
 mod tests {

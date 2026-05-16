@@ -63,28 +63,35 @@ fn main() -> ExitCode {
 }
 
 fn discover_tenants(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // Production layout: <data_dir>/tenants/<safe>/{manifest.json,graph.snapshot.current,graph.aof}
+    // Legacy / single-tenant layout: <data_dir>/{manifest.json,...}
     let mut out = Vec::new();
-    let mut top_has_manifest = false;
+
+    let tenants_root = data_dir.join("tenants");
+    if tenants_root.is_dir() {
+        for entry in fs::read_dir(&tenants_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() && tenant_dir_looks_redcore(&path) {
+                out.push(path);
+            }
+        }
+        return Ok(out);
+    }
+
+    // Fall back to top-level scan for the legacy single-tenant case.
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            if path.join("manifest.json").exists() || path.join("graph.snapshot.current").exists()
-            {
-                out.push(path);
-            }
-        } else if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case("manifest.json")
-        {
-            top_has_manifest = true;
+        if path.is_dir() && tenant_dir_looks_redcore(&path) {
+            out.push(path);
         }
     }
-    if top_has_manifest && out.is_empty() {
-        return Ok(Vec::new());
-    }
     Ok(out)
+}
+
+fn tenant_dir_looks_redcore(dir: &Path) -> bool {
+    dir.join("manifest.json").exists() || dir.join("graph.snapshot.current").exists()
 }
 
 fn upgrade_one(tenant_dir: &Path, dry_run: bool) -> ExitCode {

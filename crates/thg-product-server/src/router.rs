@@ -2312,8 +2312,6 @@ async fn graph_algorithm_pagerank(
 struct BulkNodesBody {
     /// JSONL: one node per line. Each line must be `{"id": "...", "labels": [...], "properties": {...}}`.
     jsonl: String,
-    #[serde(default = "default_bulk_batch_size")]
-    batch_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2321,12 +2319,6 @@ struct BulkEdgesBody {
     /// JSONL: one edge per line. Each line must be
     /// `{"id": "...", "from_id": "...", "to_id": "...", "edge_type": "...", "properties": {...}}`.
     jsonl: String,
-    #[serde(default = "default_bulk_batch_size")]
-    batch_size: usize,
-}
-
-fn default_bulk_batch_size() -> usize {
-    500
 }
 
 async fn graph_bulk_nodes(
@@ -2380,9 +2372,6 @@ async fn graph_bulk_nodes(
                 }
             }
         }
-        // batch_size acts as a cooperative yielding boundary for future
-        // async chunking; today every record is a separate write txn.
-        let _ = body.batch_size;
     }
     Json(json!({
         "ok": failed == 0,
@@ -2443,7 +2432,6 @@ async fn graph_bulk_edges(
                 }
             }
         }
-        let _ = body.batch_size;
     }
     Json(json!({
         "ok": failed == 0,

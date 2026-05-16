@@ -22,12 +22,12 @@ pub use graph::{
     paths_shortest, paths_shortest_weighted, personalized_pagerank, EdgeTuple,
 };
 pub use graph_store::{
-    manifest_version_compatible, read_manifest, sanitize_tenant_segment, Direction, EdgeRecord,
-    EpistemicType, GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphSnapshot,
-    GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphTransaction, GraphWriteResult,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, Provenance,
-    RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions, RedCoreStatus,
-    VectorDesignation, VectorIndex, VectorPoint, VerifyProblem, VerifyReport,
+    manifest_version_compatible, read_manifest, sanitize_tenant_segment, unix_ms, Direction,
+    EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch, GraphRebuildReport,
+    GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphTransaction,
+    GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    Provenance, RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions,
+    RedCoreStatus, VectorDesignation, VectorIndex, VectorPoint, VerifyProblem, VerifyReport,
     CURRENT_FORMAT_VERSION,
 };
 #[cfg(feature = "redis-store")]

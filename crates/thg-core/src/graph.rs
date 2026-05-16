@@ -248,6 +248,15 @@ pub fn paths_shortest_weighted(
 /// node id to initial residual mass; values should sum to ~1.0. Returns
 /// approximate PPR scores for nodes touched during the push.
 ///
+/// Push spread is weight-proportional: each neighbor receives
+/// `(1-alpha) * residual * (w_e / sum_w)`. When the source has no
+/// neighbors, residual is absorbed into the seed's own score
+/// (dangling-node convention).
+///
+/// Threshold is `epsilon * max(out_degree, 1)`. Active nodes are tracked in
+/// a FIFO queue with an `in_queue` set so each push is O(out_degree) rather
+/// than O(|residual|).
+///
 /// Reference: Andersen, Chung, Lang (FOCS 2006).
 pub fn personalized_pagerank(
     adjacency: &HashMap<String, Vec<(String, f64)>>,
@@ -256,47 +265,60 @@ pub fn personalized_pagerank(
     epsilon: f64,
     max_pushes: usize,
 ) -> HashMap<String, f64> {
+    // Pre-sum out-weights once.
+    let mut out_weight: HashMap<&str, f64> = HashMap::new();
+    for (node, neighbors) in adjacency.iter() {
+        let sum: f64 = neighbors.iter().map(|(_, w)| *w).sum();
+        out_weight.insert(node.as_str(), sum);
+    }
+
     let mut p: HashMap<String, f64> = HashMap::new();
     let mut r: HashMap<String, f64> = seeds.clone();
-    let mut pushes = 0usize;
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut in_queue: HashSet<String> = HashSet::new();
+    for node in seeds.keys() {
+        queue.push_back(node.clone());
+        in_queue.insert(node.clone());
+    }
 
-    loop {
+    let mut pushes = 0usize;
+    while let Some(u) = queue.pop_front() {
+        in_queue.remove(&u);
         if pushes >= max_pushes {
             break;
         }
-        // Pick the node with the largest r/deg ratio above threshold.
-        let mut target: Option<(String, f64, f64)> = None;
-        for (node, &residual) in r.iter() {
-            let degree = adjacency.get(node).map(|n| n.len()).unwrap_or(0) as f64;
-            let deg_eff = if degree > 0.0 { degree } else { 1.0 };
-            if residual / deg_eff <= epsilon {
-                continue;
-            }
-            if target
-                .as_ref()
-                .map(|(_, _, prev)| residual / deg_eff > *prev)
-                .unwrap_or(true)
-            {
-                target = Some((node.clone(), residual, residual / deg_eff));
-            }
+        let residual_u = *r.get(&u).unwrap_or(&0.0);
+        let degree = adjacency.get(&u).map(|n| n.len()).unwrap_or(0).max(1) as f64;
+        if residual_u <= epsilon * degree {
+            continue;
         }
-
-        let Some((u, residual_u, _)) = target else {
-            break;
-        };
+        pushes += 1;
 
         *p.entry(u.clone()).or_insert(0.0) += alpha * residual_u;
         r.insert(u.clone(), 0.0);
-        if let Some(neighbors) = adjacency.get(&u) {
-            let degree = neighbors.len() as f64;
-            if degree > 0.0 {
-                let push_amount = (1.0 - alpha) * residual_u / degree;
-                for (target_node, _weight) in neighbors {
-                    *r.entry(target_node.clone()).or_insert(0.0) += push_amount;
-                }
+
+        let neighbors = adjacency.get(&u);
+        let total_w = out_weight.get(u.as_str()).copied().unwrap_or(0.0);
+        if neighbors.map(|n| n.is_empty()).unwrap_or(true) || total_w <= 0.0 {
+            // Dangling node: keep residual on u so total mass is conserved.
+            *r.entry(u.clone()).or_insert(0.0) += (1.0 - alpha) * residual_u;
+            continue;
+        }
+        for (target_node, w) in neighbors.unwrap() {
+            let share = (1.0 - alpha) * residual_u * w / total_w;
+            *r.entry(target_node.clone()).or_insert(0.0) += share;
+            let target_deg = adjacency
+                .get(target_node)
+                .map(|n| n.len())
+                .unwrap_or(0)
+                .max(1) as f64;
+            if *r.get(target_node).unwrap_or(&0.0) > epsilon * target_deg
+                && !in_queue.contains(target_node)
+            {
+                queue.push_back(target_node.clone());
+                in_queue.insert(target_node.clone());
             }
         }
-        pushes += 1;
     }
     p
 }
@@ -684,6 +706,28 @@ mod tests {
         entries.sort_by(|x, y| y.1.partial_cmp(x.1).unwrap());
         assert_eq!(entries[0].0, "a");
         assert!(*entries[0].1 > 0.0);
+    }
+
+    #[test]
+    fn ppr_honors_edge_weights() {
+        // a has two neighbors with very different weights.
+        // The mass leaving a should go almost entirely to the heavy one.
+        let mut adj: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        adj.insert(
+            "a".into(),
+            vec![("heavy".into(), 99.0), ("light".into(), 1.0)],
+        );
+        adj.insert("heavy".into(), vec![]);
+        adj.insert("light".into(), vec![]);
+        let mut seeds = HashMap::new();
+        seeds.insert("a".to_string(), 1.0);
+        let scores = personalized_pagerank(&adj, &seeds, 0.15, 1e-6, 100_000);
+        let heavy = *scores.get("heavy").unwrap_or(&0.0);
+        let light = *scores.get("light").unwrap_or(&0.0);
+        assert!(
+            heavy > 10.0 * light,
+            "heavy ({heavy}) should dominate light ({light})"
+        );
     }
 
     #[test]

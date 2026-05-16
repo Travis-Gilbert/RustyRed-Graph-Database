@@ -2183,7 +2183,7 @@ fn read_snapshot_file(
         .map_err(|err| GraphStoreError::io(format!("decode RedCore {label}"), err))
 }
 
-fn unix_ms() -> u128 {
+pub fn unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())

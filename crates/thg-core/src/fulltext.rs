@@ -29,6 +29,8 @@ pub struct FullTextIndex {
     postings: HashMap<String, Vec<(String, u32)>>,
     /// per-doc total term count
     doc_lengths: HashMap<String, u32>,
+    /// per-doc unique terms (for O(doc_terms) removes instead of full vocab scan)
+    doc_terms: HashMap<String, Vec<String>>,
     /// docs known to this index (for re-indexing on update)
     indexed: BTreeSet<String>,
     total_length: u64,
@@ -40,6 +42,7 @@ impl FullTextIndex {
             designation: Some(d),
             postings: HashMap::new(),
             doc_lengths: HashMap::new(),
+            doc_terms: HashMap::new(),
             indexed: BTreeSet::new(),
             total_length: 0,
         }
@@ -66,6 +69,7 @@ impl FullTextIndex {
             *term_freq.entry(tok.clone()).or_insert(0) += 1;
         }
         let length = tokens.len() as u32;
+        let unique_terms: Vec<String> = term_freq.keys().cloned().collect();
         for (term, freq) in term_freq {
             self.postings
                 .entry(term)
@@ -73,6 +77,7 @@ impl FullTextIndex {
                 .push((doc_id.to_string(), freq));
         }
         self.doc_lengths.insert(doc_id.to_string(), length);
+        self.doc_terms.insert(doc_id.to_string(), unique_terms);
         self.indexed.insert(doc_id.to_string());
         self.total_length += length as u64;
     }
@@ -84,11 +89,17 @@ impl FullTextIndex {
         if let Some(len) = self.doc_lengths.remove(doc_id) {
             self.total_length = self.total_length.saturating_sub(len as u64);
         }
-        // Filter postings.
-        for plist in self.postings.values_mut() {
-            plist.retain(|(id, _)| id != doc_id);
+        // Only scan the doc's own terms, not the entire vocabulary.
+        if let Some(terms) = self.doc_terms.remove(doc_id) {
+            for term in terms {
+                if let Some(plist) = self.postings.get_mut(&term) {
+                    plist.retain(|(id, _)| id != doc_id);
+                    if plist.is_empty() {
+                        self.postings.remove(&term);
+                    }
+                }
+            }
         }
-        self.postings.retain(|_, v| !v.is_empty());
     }
 
     /// Return the top-k doc_ids ranked by BM25 against the query string.
