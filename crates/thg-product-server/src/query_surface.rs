@@ -398,13 +398,366 @@ pub fn execute_cypher_query(
                 "explain": explain,
             }))
         }
-        CypherPattern::EdgeChain(_) | CypherPattern::EdgeVarLength(_) => {
-            Err(QuerySurfaceError::unsupported(
-                "multi_hop_execution",
-                "multi-hop and variable-length expand are parsed but not yet executed in this slice; execution lands in §P2-B pb.2.2 / pb.2.3",
-            ))
+        CypherPattern::EdgeChain(chain) => {
+            // Multi-hop chain: walk one hop at a time, filtering each step's
+            // target by label and inline properties. Emit one row per leaf walk.
+            let seed_filter = parsed
+                .where_filter
+                .as_ref()
+                .filter(|f| f.binding == chain.start.binding);
+            let seed_query = node_query_for_pattern(
+                &chain.start,
+                seed_filter,
+                parsed.limit.saturating_add(1),
+            )?;
+            if seed_query.label.is_none() && seed_query.properties.is_empty() {
+                return Err(QuerySurfaceError::unsupported(
+                    "chain_scan",
+                    "multi-hop chain requires a label or property filter on the starting node",
+                ));
+            }
+            let seeds = store.query_nodes(seed_query.clone())?;
+            let mut rows: Vec<Value> = Vec::new();
+            let mut hops_touched: usize = 0;
+
+            // Recursive walk via an explicit stack: each frame holds the
+            // current step index and the bindings accumulated so far.
+            for seed in &seeds {
+                if let Some(filter) = seed_filter {
+                    if !node_matches_filter(seed, filter) {
+                        continue;
+                    }
+                }
+                walk_chain(
+                    store,
+                    chain,
+                    &parsed,
+                    seed,
+                    0,
+                    &mut Vec::from([(chain.start.binding.clone(), seed.clone())]),
+                    &mut rows,
+                    &mut hops_touched,
+                )?;
+                if rows.len() > parsed.limit {
+                    break;
+                }
+            }
+            let truncated = rows.len() > parsed.limit;
+            if truncated {
+                rows.truncate(parsed.limit);
+            }
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "query": parsed.normalized,
+                "subset": "opencypher_v0_1_read_only",
+                "rows": rows,
+                "row_count": rows.len(),
+                "stats": {
+                    "returned": rows.len(),
+                    "truncated": truncated,
+                    "seed_nodes": seeds.len(),
+                    "hops_touched": hops_touched,
+                    "plan_operation": "multi_hop_chain_walk",
+                },
+                "explain": explain,
+            }))
+        }
+        CypherPattern::EdgeVarLength(var) => {
+            let from_filter = parsed
+                .where_filter
+                .as_ref()
+                .filter(|f| f.binding == var.from.binding);
+            let to_filter = parsed
+                .where_filter
+                .as_ref()
+                .filter(|f| f.binding == var.to.binding);
+            let from_query =
+                node_query_for_pattern(&var.from, from_filter, parsed.limit.saturating_add(1))?;
+            if from_query.label.is_none() && from_query.properties.is_empty() {
+                return Err(QuerySurfaceError::unsupported(
+                    "var_length_scan",
+                    "variable-length expand requires a label or property filter on the source",
+                ));
+            }
+            let froms = store.query_nodes(from_query.clone())?;
+            let max_hops = var.max.unwrap_or(8);
+            if max_hops == 0 || var.min > max_hops {
+                return Err(QuerySurfaceError::invalid(
+                    "invalid_var_length_range",
+                    format!(
+                        "variable-length range {}..{:?} is empty or invalid",
+                        var.min, var.max
+                    ),
+                ));
+            }
+            let mut rows: Vec<Value> = Vec::new();
+            let mut endpoints_touched: usize = 0;
+
+            for from_node in &froms {
+                if let Some(filter) = from_filter {
+                    if !node_matches_filter(from_node, filter) {
+                        continue;
+                    }
+                }
+                let mut visited: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut frontier: Vec<(String, Vec<String>)> =
+                    vec![(from_node.id.clone(), vec![from_node.id.clone()])];
+                visited.insert(from_node.id.clone());
+                let mut depth: usize = 0;
+                while depth < max_hops && !frontier.is_empty() {
+                    depth += 1;
+                    let mut next: Vec<(String, Vec<String>)> = Vec::new();
+                    for (current_id, path) in frontier.drain(..) {
+                        let neighbors = store.neighbors(NeighborQuery {
+                            node_id: current_id,
+                            direction: Direction::Out,
+                            edge_type: Some(var.edge_type.clone()),
+                        })?;
+                        for hit in neighbors {
+                            if visited.contains(&hit.node_id) {
+                                continue;
+                            }
+                            let mut next_path = path.clone();
+                            next_path.push(hit.node_id.clone());
+                            if depth >= var.min {
+                                if let Some(target_node) = store.get_node(&hit.node_id)? {
+                                    endpoints_touched += 1;
+                                    if !node_matches_pattern(&target_node, &var.to) {
+                                        continue;
+                                    }
+                                    if let Some(filter) = to_filter {
+                                        if !node_matches_filter(&target_node, filter) {
+                                            continue;
+                                        }
+                                    }
+                                    rows.push(project_var_length_row(
+                                        &parsed.returns,
+                                        var,
+                                        from_node,
+                                        &target_node,
+                                        &next_path,
+                                    )?);
+                                    if rows.len() > parsed.limit {
+                                        break;
+                                    }
+                                }
+                            }
+                            visited.insert(hit.node_id.clone());
+                            next.push((hit.node_id, next_path));
+                        }
+                        if rows.len() > parsed.limit {
+                            break;
+                        }
+                    }
+                    frontier = next;
+                    if rows.len() > parsed.limit {
+                        break;
+                    }
+                }
+                if rows.len() > parsed.limit {
+                    break;
+                }
+            }
+            let truncated = rows.len() > parsed.limit;
+            if truncated {
+                rows.truncate(parsed.limit);
+            }
+            Ok(json!({
+                "ok": true,
+                "tenant": tenant,
+                "query": parsed.normalized,
+                "subset": "opencypher_v0_1_read_only",
+                "rows": rows,
+                "row_count": rows.len(),
+                "stats": {
+                    "returned": rows.len(),
+                    "truncated": truncated,
+                    "seed_nodes": froms.len(),
+                    "endpoints_touched": endpoints_touched,
+                    "max_hops": max_hops,
+                    "plan_operation": "variable_length_expand",
+                },
+                "explain": explain,
+            }))
         }
     }
+}
+
+fn walk_chain(
+    store: &TenantGraphStore,
+    chain: &crate::cypher::ast::EdgeChain,
+    parsed: &ParsedCypher,
+    _current_seed: &NodeRecord,
+    step_index: usize,
+    path_bindings: &mut Vec<(String, NodeRecord)>,
+    rows: &mut Vec<Value>,
+    hops_touched: &mut usize,
+) -> Result<(), QuerySurfaceError> {
+    if step_index >= chain.steps.len() {
+        rows.push(project_chain_row(
+            &parsed.returns,
+            chain,
+            path_bindings,
+        )?);
+        return Ok(());
+    }
+    if rows.len() > parsed.limit {
+        return Ok(());
+    }
+    let step = &chain.steps[step_index];
+    let current_id = path_bindings
+        .last()
+        .map(|(_, node)| node.id.clone())
+        .expect("path_bindings non-empty");
+    let neighbors = store.neighbors(NeighborQuery {
+        node_id: current_id,
+        direction: Direction::Out,
+        edge_type: Some(step.edge_type.clone()),
+    })?;
+    *hops_touched += neighbors.len();
+    let step_filter = parsed
+        .where_filter
+        .as_ref()
+        .filter(|f| f.binding == step.target.binding);
+    for hit in neighbors {
+        if rows.len() > parsed.limit {
+            return Ok(());
+        }
+        let Some(target_node) = store.get_node(&hit.node_id)? else {
+            continue;
+        };
+        if !node_matches_pattern(&target_node, &step.target) {
+            continue;
+        }
+        if let Some(filter) = step_filter {
+            if !node_matches_filter(&target_node, filter) {
+                continue;
+            }
+        }
+        path_bindings.push((step.target.binding.clone(), target_node.clone()));
+        walk_chain(
+            store,
+            chain,
+            parsed,
+            &target_node,
+            step_index + 1,
+            path_bindings,
+            rows,
+            hops_touched,
+        )?;
+        path_bindings.pop();
+    }
+    Ok(())
+}
+
+fn project_chain_row(
+    items: &[ReturnItem],
+    chain: &crate::cypher::ast::EdgeChain,
+    bindings: &[(String, NodeRecord)],
+) -> Result<Value, QuerySurfaceError> {
+    let mut row = serde_json::Map::new();
+    let find_binding = |name: &str| -> Option<&NodeRecord> {
+        bindings.iter().find_map(|(b, n)| (b == name).then_some(n))
+    };
+    for item in items {
+        match item {
+            ReturnItem::Variable(binding) => match find_binding(binding) {
+                Some(node) => {
+                    row.insert(binding.clone(), json!(node));
+                }
+                None => {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN binding {binding} does not exist in the chain"),
+                    ));
+                }
+            },
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } => match find_binding(binding) {
+                Some(node) => {
+                    row.insert(expression.clone(), property_value(node, key));
+                }
+                None => {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN binding {binding} does not exist in the chain"),
+                    ));
+                }
+            },
+            ReturnItem::Count { .. } => {
+                unreachable!("count items handled at the executor level");
+            }
+            ReturnItem::Path { binding, expression } => {
+                if chain.path_binding.as_deref() != Some(binding.as_str()) {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN path {binding} is not bound by this MATCH"),
+                    ));
+                }
+                let ids: Vec<String> = bindings.iter().map(|(_, n)| n.id.clone()).collect();
+                row.insert(expression.clone(), json!(ids));
+            }
+        }
+    }
+    Ok(Value::Object(row))
+}
+
+fn project_var_length_row(
+    items: &[ReturnItem],
+    var: &crate::cypher::ast::EdgeVarLength,
+    from: &NodeRecord,
+    to: &NodeRecord,
+    path_ids: &[String],
+) -> Result<Value, QuerySurfaceError> {
+    let mut row = serde_json::Map::new();
+    for item in items {
+        match item {
+            ReturnItem::Variable(binding) if binding == &var.from.binding => {
+                row.insert(binding.clone(), json!(from));
+            }
+            ReturnItem::Variable(binding) if binding == &var.to.binding => {
+                row.insert(binding.clone(), json!(to));
+            }
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } if binding == &var.from.binding => {
+                row.insert(expression.clone(), property_value(from, key));
+            }
+            ReturnItem::Property {
+                binding,
+                key,
+                expression,
+            } if binding == &var.to.binding => {
+                row.insert(expression.clone(), property_value(to, key));
+            }
+            ReturnItem::Variable(binding) | ReturnItem::Property { binding, .. } => {
+                return Err(QuerySurfaceError::invalid(
+                    "invalid_return_binding",
+                    format!("RETURN binding {binding} does not exist in the var-length pattern"),
+                ));
+            }
+            ReturnItem::Count { .. } => {
+                unreachable!("count items handled at the executor level");
+            }
+            ReturnItem::Path { binding, expression } => {
+                if var.path_binding.as_deref() != Some(binding.as_str()) {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN path {binding} is not bound by this MATCH"),
+                    ));
+                }
+                row.insert(expression.clone(), json!(path_ids));
+            }
+        }
+    }
+    Ok(Value::Object(row))
 }
 
 pub fn parse_tx_cypher_mutations(
