@@ -762,36 +762,10 @@ fn reject_unsupported_subset(query: &str) -> Result<(), QuerySurfaceError> {
             "SUM/AVG aggregations are a later compatibility slice; COUNT is supported",
         ));
     }
-    let match_segment = if upper.starts_with("MATCH ") {
-        if let Some(return_index) = upper.find(" RETURN ") {
-            normalized[..return_index].to_string()
-        } else {
-            normalized.clone()
-        }
-    } else {
-        String::new()
-    };
-    let match_segment_upper = match_segment.to_ascii_uppercase();
-    if match_segment_upper.contains('*') {
-        return Err(QuerySurfaceError::unsupported(
-            "variable_length_expand",
-            "variable-length relationships are not implemented in the first /v1/cypher subset",
-        ));
-    }
-    if !match_segment.is_empty() {
-        let body = match_segment["MATCH ".len()..].trim();
-        let where_index = body.to_ascii_uppercase().find(" WHERE ");
-        let match_part = match where_index {
-            Some(idx) => body[..idx].trim(),
-            None => body,
-        };
-        if match_part.contains('=') {
-            return Err(QuerySurfaceError::unsupported(
-                "path_alias",
-                "path aliases are not implemented in the first /v1/cypher subset",
-            ));
-        }
-    }
+    // Variable-length expand and path aliases (`MATCH p = ...`) are now
+    // supported by the pest grammar (§P2-B), so do not reject them here.
+    // Anything the grammar cannot parse will surface as `invalid_cypher_query`
+    // from `parse_cypher_pest`, which is the correct shape.
     Ok(())
 }
 
@@ -1670,19 +1644,25 @@ mod tests {
     }
 
     #[test]
-    fn cypher_subset_rejects_writes_and_var_expands() {
+    fn cypher_subset_rejects_writes_and_parses_var_expands() {
+        // Writes remain unsupported until §P3-A (Stage 04) wires CREATE / MERGE
+        // / SET / DELETE through the pest grammar.
         let write_error = parse_cypher("CREATE (:File)", &BTreeMap::new()).unwrap_err();
         assert_eq!(write_error.payload()["error"], "unsupported_cypher_feature");
 
-        let expand_error = parse_cypher(
+        // Var-length expand now parses (§P2-B grammar landed). The executor
+        // still rejects it with `multi_hop_execution` until pb.2.3 wires the
+        // expand path; the assertion here is that parsing itself succeeds and
+        // produces an EdgeVarLength pattern.
+        let parsed = parse_cypher(
             "MATCH p = (a:File)-[:IMPORTS*1..2]->(b:File) RETURN p",
             &BTreeMap::new(),
         )
-        .unwrap_err();
-        assert_eq!(
-            expand_error.payload()["error"],
-            "unsupported_cypher_feature"
-        );
+        .unwrap();
+        assert!(matches!(
+            parsed.pattern,
+            crate::cypher::ast::CypherPattern::EdgeVarLength(_)
+        ));
     }
 
     #[test]

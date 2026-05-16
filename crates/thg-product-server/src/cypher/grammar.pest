@@ -1,18 +1,27 @@
-// Pest grammar for the read-only subset of Cypher that the
-// existing query_surface.rs parser supports. Stage 01 baseline.
-// Later stages add multi-hop, variable-length, aggregations, and writes.
+// Pest grammar for the read-only Cypher subset. Single-hop, multi-hop, and
+// variable-length expand. Path binding (MATCH p = ...) is captured for the
+// var-length and chain branches.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query        = { SOI ~ match_clause ~ where_clause? ~ return_clause ~ limit_clause? ~ EOI }
 
-match_clause = { ^"MATCH" ~ pattern }
+match_clause = { ^"MATCH" ~ path_binding? ~ pattern }
+path_binding = { ident ~ "=" }
+
 where_clause = { ^"WHERE" ~ where_expr }
 return_clause = { ^"RETURN" ~ return_items }
 limit_clause = { ^"LIMIT" ~ integer }
 
-pattern      = { node_pattern ~ edge_continuation? }
+// Pattern: var-length first (its `*` is the discriminator), then chain
+// (one or more continuations), then bare node.
+pattern         = { var_length_pattern | edge_chain_pattern | node_pattern }
+edge_chain_pattern = { node_pattern ~ edge_continuation+ }
+var_length_pattern = { node_pattern ~ edge_var_length ~ node_pattern }
+
 edge_continuation = { "-[" ~ rel_type ~ "]->" ~ node_pattern }
+edge_var_length   = { "-[" ~ rel_type ~ "*" ~ var_length_range? ~ "]->" }
+var_length_range  = { integer ~ ".." ~ integer | integer }
 rel_type     = { ":" ~ ident }
 
 node_pattern = { "(" ~ binding? ~ label? ~ property_block? ~ ")" }

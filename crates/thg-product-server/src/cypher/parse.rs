@@ -6,7 +6,8 @@ use pest_derive::Parser;
 use serde_json::Value;
 
 use crate::cypher::ast::{
-    CypherPattern, EdgePattern, NodePattern, ParsedCypher, PropertyFilter, ReturnItem,
+    CypherPattern, EdgeChain, EdgePattern, EdgeStep, EdgeVarLength, NodePattern, ParsedCypher,
+    PropertyFilter, ReturnItem,
 };
 use crate::query_surface::QuerySurfaceError;
 
@@ -78,6 +79,26 @@ pub fn parse_cypher_pest(
         ));
     }
 
+    // If the MATCH bound a path alias (e.g. `MATCH p = ...`), any RETURN p
+    // becomes a ReturnItem::Path rather than ReturnItem::Variable.
+    let path_binding = match &pattern {
+        CypherPattern::EdgeChain(c) => c.path_binding.clone(),
+        CypherPattern::EdgeVarLength(v) => v.path_binding.clone(),
+        _ => None,
+    };
+    if let Some(name) = &path_binding {
+        for item in returns.iter_mut() {
+            if let ReturnItem::Variable(binding) = item {
+                if binding == name {
+                    *item = ReturnItem::Path {
+                        binding: binding.clone(),
+                        expression: binding.clone(),
+                    };
+                }
+            }
+        }
+    }
+
     Ok(ParsedCypher {
         normalized,
         pattern,
@@ -95,46 +116,157 @@ fn parse_match(
     pair: Pair<Rule>,
     params: &BTreeMap<String, Value>,
 ) -> Result<CypherPattern, QuerySurfaceError> {
+    let mut path_binding: Option<String> = None;
     let mut pattern_pair: Option<Pair<Rule>> = None;
     for child in pair.into_inner() {
-        if matches!(child.as_rule(), Rule::pattern) {
-            pattern_pair = Some(child);
+        match child.as_rule() {
+            Rule::path_binding => {
+                if let Some(ident) = child.into_inner().next() {
+                    path_binding = Some(ident.as_str().to_string());
+                }
+            }
+            Rule::pattern => {
+                pattern_pair = Some(child);
+            }
+            _ => {}
         }
     }
     let pattern_pair = pattern_pair.ok_or_else(|| {
         QuerySurfaceError::invalid("invalid_cypher_query", "MATCH pattern missing")
     })?;
 
-    let mut inner = pattern_pair.into_inner();
-    let node_pair = inner
-        .next()
-        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty pattern"))?;
-    let left = parse_node_pattern(node_pair, params)?;
-
-    if let Some(edge_pair) = inner.next() {
-        if !matches!(edge_pair.as_rule(), Rule::edge_continuation) {
-            return Err(QuerySurfaceError::invalid(
-                "invalid_cypher_query",
-                "expected edge continuation",
-            ));
+    let inner_pair = pattern_pair.into_inner().next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "empty MATCH pattern")
+    })?;
+    match inner_pair.as_rule() {
+        Rule::node_pattern => {
+            let node = parse_node_pattern(inner_pair, params)?;
+            Ok(CypherPattern::Node(node))
         }
-        let mut edge_inner = edge_pair.into_inner();
-        let rel_pair = edge_inner.next().ok_or_else(|| {
-            QuerySurfaceError::invalid("invalid_cypher_query", "missing relationship type")
+        Rule::edge_chain_pattern => parse_edge_chain_pattern(inner_pair, params, path_binding),
+        Rule::var_length_pattern => parse_var_length_pattern(inner_pair, params, path_binding),
+        other => Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            format!("unexpected pattern rule: {other:?}"),
+        )),
+    }
+}
+
+fn parse_edge_chain_pattern(
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+    path_binding: Option<String>,
+) -> Result<CypherPattern, QuerySurfaceError> {
+    let mut iter = pair.into_inner();
+    let start_pair = iter.next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing chain start")
+    })?;
+    let start = parse_node_pattern(start_pair, params)?;
+    let mut steps: Vec<EdgeStep> = Vec::new();
+    for cont in iter {
+        if !matches!(cont.as_rule(), Rule::edge_continuation) {
+            continue;
+        }
+        let mut sub = cont.into_inner();
+        let rel_pair = sub.next().ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "missing rel type in chain")
         })?;
         let edge_type = parse_rel_type(rel_pair)?;
-        let right_pair = edge_inner.next().ok_or_else(|| {
-            QuerySurfaceError::invalid("invalid_cypher_query", "missing right node")
+        let target_pair = sub.next().ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "missing target in chain")
         })?;
-        let right = parse_node_pattern(right_pair, params)?;
+        let target = parse_node_pattern(target_pair, params)?;
+        steps.push(EdgeStep { edge_type, target });
+    }
+    if steps.len() < 2 {
+        // Single step: fall back to the existing Edge variant for executor compat.
+        let step = steps
+            .into_iter()
+            .next()
+            .expect("step count >= 1 enforced by grammar");
         return Ok(CypherPattern::Edge(EdgePattern {
-            left,
-            edge_type,
-            right,
+            left: start,
+            edge_type: step.edge_type,
+            right: step.target,
         }));
     }
+    Ok(CypherPattern::EdgeChain(EdgeChain {
+        start,
+        steps,
+        path_binding,
+    }))
+}
 
-    Ok(CypherPattern::Node(left))
+fn parse_var_length_pattern(
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+    path_binding: Option<String>,
+) -> Result<CypherPattern, QuerySurfaceError> {
+    let mut iter = pair.into_inner();
+    let from_pair = iter.next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing var-length source")
+    })?;
+    let from = parse_node_pattern(from_pair, params)?;
+    let edge_pair = iter.next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing var-length edge")
+    })?;
+    let mut edge_inner = edge_pair.into_inner();
+    let rel_pair = edge_inner.next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing var-length rel type")
+    })?;
+    let edge_type = parse_rel_type(rel_pair)?;
+    let (min, max) = if let Some(range_pair) = edge_inner.next() {
+        if !matches!(range_pair.as_rule(), Rule::var_length_range) {
+            return Err(QuerySurfaceError::invalid(
+                "invalid_cypher_query",
+                format!("unexpected var-length child: {:?}", range_pair.as_rule()),
+            ));
+        }
+        let mut numbers = range_pair.into_inner();
+        let first = numbers
+            .next()
+            .ok_or_else(|| {
+                QuerySurfaceError::invalid(
+                    "invalid_cypher_query",
+                    "var-length range missing minimum",
+                )
+            })?
+            .as_str()
+            .parse::<usize>()
+            .map_err(|err| {
+                QuerySurfaceError::invalid(
+                    "invalid_cypher_query",
+                    format!("invalid var-length min: {err}"),
+                )
+            })?;
+        let second = match numbers.next() {
+            Some(p) => Some(p.as_str().parse::<usize>().map_err(|err| {
+                QuerySurfaceError::invalid(
+                    "invalid_cypher_query",
+                    format!("invalid var-length max: {err}"),
+                )
+            })?),
+            None => None,
+        };
+        match second {
+            Some(max) => (first, Some(max)),
+            None => (first, Some(first)),
+        }
+    } else {
+        (1, None)
+    };
+    let to_pair = iter.next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing var-length target")
+    })?;
+    let to = parse_node_pattern(to_pair, params)?;
+    Ok(CypherPattern::EdgeVarLength(EdgeVarLength {
+        from,
+        edge_type,
+        min,
+        max,
+        to,
+        path_binding,
+    }))
 }
 
 fn parse_rel_type(pair: Pair<Rule>) -> Result<String, QuerySurfaceError> {
@@ -540,5 +672,68 @@ mod parse_to_ast_tests {
     fn parse_empty_query_errors() {
         let err = parse_cypher_pest("   ", &BTreeMap::new()).unwrap_err();
         assert!(format!("{:?}", err).contains("empty_cypher_query"));
+    }
+
+    #[test]
+    fn parse_multi_hop_into_edge_chain() {
+        let parsed = parse_cypher_pest(
+            "MATCH (a:Doc)-[:T1]->(b:Doc)-[:T2]->(c:Doc) RETURN c",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let CypherPattern::EdgeChain(chain) = &parsed.pattern else {
+            panic!("expected EdgeChain pattern, got {:?}", parsed.pattern);
+        };
+        assert_eq!(chain.start.binding, "a");
+        assert_eq!(chain.steps.len(), 2);
+        assert_eq!(chain.steps[0].edge_type, "T1");
+        assert_eq!(chain.steps[1].target.binding, "c");
+    }
+
+    #[test]
+    fn parse_bounded_var_length_into_edge_var_length() {
+        let parsed = parse_cypher_pest(
+            "MATCH (a:Doc)-[:T*1..3]->(b:Doc) RETURN b LIMIT 5",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let CypherPattern::EdgeVarLength(var) = &parsed.pattern else {
+            panic!("expected EdgeVarLength pattern");
+        };
+        assert_eq!(var.min, 1);
+        assert_eq!(var.max, Some(3));
+        assert_eq!(var.edge_type, "T");
+        assert_eq!(parsed.limit, 5);
+    }
+
+    #[test]
+    fn parse_unbounded_var_length_returns_max_none() {
+        let parsed = parse_cypher_pest(
+            "MATCH (a:Doc)-[:T*]->(b:Doc) RETURN b",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let CypherPattern::EdgeVarLength(var) = &parsed.pattern else {
+            panic!("expected EdgeVarLength pattern");
+        };
+        assert_eq!(var.min, 1);
+        assert_eq!(var.max, None);
+    }
+
+    #[test]
+    fn parse_path_binding_stores_alias() {
+        let parsed = parse_cypher_pest(
+            "MATCH p = (a:Doc)-[:T*]->(b:Doc) RETURN p",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let CypherPattern::EdgeVarLength(var) = &parsed.pattern else {
+            panic!("expected EdgeVarLength pattern");
+        };
+        assert_eq!(var.path_binding.as_deref(), Some("p"));
+        assert!(matches!(
+            parsed.returns[0],
+            ReturnItem::Path { ref binding, .. } if binding == "p"
+        ));
     }
 }
