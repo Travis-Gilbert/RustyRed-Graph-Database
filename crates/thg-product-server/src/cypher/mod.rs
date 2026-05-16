@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod compile;
 pub mod parse;
+pub mod planner;
 
 #[cfg(test)]
 mod deps_smoke {
