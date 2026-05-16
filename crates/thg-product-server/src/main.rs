@@ -2,6 +2,7 @@
 
 mod auth;
 mod config;
+mod cypher;
 mod graph_cache;
 mod metrics;
 mod observability;
