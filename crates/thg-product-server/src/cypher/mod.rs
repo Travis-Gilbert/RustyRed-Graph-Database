@@ -3,7 +3,7 @@
 //! Entry point: `parse_cypher_pest`. Returns the same `ParsedCypher` the
 //! executor consumed before the migration.
 
-// Submodules added in later tasks: pub mod ast; pub mod parse;
+pub mod parse;
 
 #[cfg(test)]
 mod deps_smoke {

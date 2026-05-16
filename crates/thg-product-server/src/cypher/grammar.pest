@@ -1,0 +1,39 @@
+// Pest grammar for the read-only subset of Cypher that the
+// existing query_surface.rs parser supports. Stage 01 baseline.
+// Later stages add multi-hop, variable-length, aggregations, and writes.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+query        = { SOI ~ match_clause ~ where_clause? ~ return_clause ~ limit_clause? ~ EOI }
+
+match_clause = { ^"MATCH" ~ pattern }
+where_clause = { ^"WHERE" ~ where_expr }
+return_clause = { ^"RETURN" ~ return_items }
+limit_clause = { ^"LIMIT" ~ integer }
+
+pattern      = { node_pattern ~ edge_continuation? }
+edge_continuation = { "-[" ~ rel_type ~ "]->" ~ node_pattern }
+rel_type     = { ":" ~ ident }
+
+node_pattern = { "(" ~ binding? ~ label? ~ property_block? ~ ")" }
+binding      = { ident }
+label        = { ":" ~ ident }
+property_block = { "{" ~ property_pair ~ ("," ~ property_pair)* ~ "}" }
+property_pair  = { ident ~ ":" ~ value }
+
+where_expr   = { property_path ~ "=" ~ value }
+property_path = { ident ~ "." ~ ident }
+
+return_items = { return_item ~ ("," ~ return_item)* }
+return_item  = { count_call | property_path | ident }
+count_call   = { ^"COUNT" ~ "(" ~ count_arg ~ ")" }
+count_arg    = { "*" | ident }
+
+value        = { param | string | number | boolean | null }
+param        = { "$" ~ ident }
+string       = @{ "'" ~ (!"'" ~ ANY)* ~ "'" | "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+number       = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+integer      = @{ ASCII_DIGIT+ }
+boolean      = { ^"true" | ^"false" }
+null         = { ^"null" }
+ident        = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
