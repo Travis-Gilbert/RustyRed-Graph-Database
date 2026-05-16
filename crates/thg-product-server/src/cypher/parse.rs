@@ -6,8 +6,9 @@ use pest_derive::Parser;
 use serde_json::Value;
 
 use crate::cypher::ast::{
-    CypherPattern, EdgeChain, EdgePattern, EdgeStep, EdgeVarLength, MergeBranch, NodePattern,
-    ParsedCypher, PropertyFilter, ReturnItem, SetExpr, WriteClause,
+    AggOp, CypherPattern, EdgeChain, EdgePattern, EdgeStep, EdgeVarLength, MergeBranch,
+    NodePattern, OrderBy, ParsedCypher, PropertyFilter, ReturnItem, SetExpr, WithClause, WithItem,
+    WriteClause,
 };
 use crate::query_surface::QuerySurfaceError;
 
@@ -60,6 +61,9 @@ fn parse_read_query(
     let mut where_filter: Option<PropertyFilter> = None;
     let mut returns: Vec<ReturnItem> = Vec::new();
     let mut limit: usize = DEFAULT_LIMIT;
+    let mut with_clause: Option<WithClause> = None;
+    let mut order_by: Vec<OrderBy> = Vec::new();
+    let mut skip: Option<usize> = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -69,8 +73,17 @@ fn parse_read_query(
             Rule::where_clause => {
                 where_filter = Some(parse_where(inner, params)?);
             }
+            Rule::with_clause => {
+                with_clause = Some(parse_with_clause(inner, params)?);
+            }
             Rule::return_clause => {
                 returns = parse_return_items(inner)?;
+            }
+            Rule::order_clause => {
+                order_by = parse_order_clause(inner)?;
+            }
+            Rule::skip_clause => {
+                skip = Some(parse_skip_clause(inner)?);
             }
             Rule::limit_clause => {
                 limit = parse_limit_literal(inner)?;
@@ -123,9 +136,9 @@ fn parse_read_query(
         returns,
         limit,
         writes: Vec::new(),
-        with_clause: None,
-        order_by: Vec::new(),
-        skip: None,
+        with_clause,
+        order_by,
+        skip,
     })
 }
 
@@ -818,30 +831,65 @@ fn parse_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>, QuerySurfaceE
                             "aggregate missing operator",
                         )
                     })?;
-                    let op_text = op_pair.as_str().to_ascii_uppercase();
+                    let op = parse_agg_op(op_pair.as_str())?;
                     let arg_pair = agg_iter.next().ok_or_else(|| {
                         QuerySurfaceError::invalid(
                             "invalid_return_clause",
                             "aggregate missing argument",
                         )
                     })?;
-                    if op_text != "COUNT" {
-                        return Err(QuerySurfaceError::invalid(
-                            "invalid_aggregate_op",
-                            format!(
-                                "aggregate operator not yet wired through parser: {op_text}"
-                            ),
-                        ));
-                    }
-                    let text = arg_pair.as_str().trim();
-                    if text == "*" {
+                    let arg_inner = arg_pair.clone().into_inner().next();
+                    let (binding, key) = match arg_inner {
+                        None => {
+                            // agg_arg matched "*" — pest leaves no inner pair.
+                            (None, None)
+                        }
+                        Some(p) => match p.as_rule() {
+                            Rule::property_path => {
+                                let mut idents = p.into_inner();
+                                let b = idents
+                                    .next()
+                                    .ok_or_else(|| {
+                                        QuerySurfaceError::invalid(
+                                            "invalid_return_clause",
+                                            "agg arg missing binding",
+                                        )
+                                    })?
+                                    .as_str()
+                                    .to_string();
+                                let k = idents
+                                    .next()
+                                    .ok_or_else(|| {
+                                        QuerySurfaceError::invalid(
+                                            "invalid_return_clause",
+                                            "agg arg missing key",
+                                        )
+                                    })?
+                                    .as_str()
+                                    .to_string();
+                                (Some(b), Some(k))
+                            }
+                            Rule::ident => (Some(p.as_str().to_string()), None),
+                            other => {
+                                return Err(QuerySurfaceError::invalid(
+                                    "invalid_return_clause",
+                                    format!("unsupported agg argument rule: {other:?}"),
+                                ));
+                            }
+                        },
+                    };
+                    if matches!(op, AggOp::Count) {
+                        // Preserve the existing ReturnItem::Count shape so the
+                        // projector keeps emitting "count(n)" -> integer rows.
                         items.push(ReturnItem::Count {
-                            binding: None,
+                            binding: binding.clone(),
                             expression: raw,
                         });
                     } else {
-                        items.push(ReturnItem::Count {
-                            binding: Some(text.to_string()),
+                        items.push(ReturnItem::Aggregate {
+                            op,
+                            binding,
+                            key,
                             expression: raw,
                         });
                     }
@@ -903,6 +951,199 @@ fn parse_limit_literal(pair: Pair<Rule>) -> Result<usize, QuerySurfaceError> {
     Err(QuerySurfaceError::invalid(
         "invalid_limit_literal",
         "LIMIT requires an integer literal",
+    ))
+}
+
+fn parse_agg_op(text: &str) -> Result<AggOp, QuerySurfaceError> {
+    match text.to_ascii_uppercase().as_str() {
+        "COUNT" => Ok(AggOp::Count),
+        "SUM" => Ok(AggOp::Sum),
+        "AVG" => Ok(AggOp::Avg),
+        "MIN" => Ok(AggOp::Min),
+        "MAX" => Ok(AggOp::Max),
+        other => Err(QuerySurfaceError::invalid(
+            "invalid_aggregate_op",
+            format!("unsupported aggregate operator: {other}"),
+        )),
+    }
+}
+
+fn parse_with_clause(
+    pair: Pair<Rule>,
+    _params: &BTreeMap<String, Value>,
+) -> Result<WithClause, QuerySurfaceError> {
+    let mut items: Vec<WithItem> = Vec::new();
+    for inner in pair.into_inner() {
+        if !matches!(inner.as_rule(), Rule::with_items) {
+            continue;
+        }
+        for entry in inner.into_inner() {
+            if !matches!(entry.as_rule(), Rule::with_item) {
+                continue;
+            }
+            let mut sub = entry.into_inner();
+            let expr_pair = sub.next().ok_or_else(|| {
+                QuerySurfaceError::invalid(
+                    "invalid_with_clause",
+                    "WITH item missing expression",
+                )
+            })?;
+            let alias_pair = sub.next().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_with_clause", "WITH item missing alias")
+            })?;
+            let alias = alias_pair.as_str().to_string();
+            match expr_pair.as_rule() {
+                Rule::aggregate_call => {
+                    let mut agg_iter = expr_pair.into_inner();
+                    let op_pair = agg_iter.next().ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_with_clause",
+                            "aggregate missing operator",
+                        )
+                    })?;
+                    let op = parse_agg_op(op_pair.as_str())?;
+                    let arg_pair = agg_iter.next().ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_with_clause",
+                            "aggregate missing argument",
+                        )
+                    })?;
+                    let arg_inner = arg_pair.into_inner().next();
+                    let (binding, key) = match arg_inner {
+                        None => (None, None),
+                        Some(p) => match p.as_rule() {
+                            Rule::property_path => {
+                                let mut idents = p.into_inner();
+                                let b = idents
+                                    .next()
+                                    .ok_or_else(|| {
+                                        QuerySurfaceError::invalid(
+                                            "invalid_with_clause",
+                                            "agg arg missing binding",
+                                        )
+                                    })?
+                                    .as_str()
+                                    .to_string();
+                                let k = idents
+                                    .next()
+                                    .ok_or_else(|| {
+                                        QuerySurfaceError::invalid(
+                                            "invalid_with_clause",
+                                            "agg arg missing key",
+                                        )
+                                    })?
+                                    .as_str()
+                                    .to_string();
+                                (Some(b), Some(k))
+                            }
+                            Rule::ident => (Some(p.as_str().to_string()), None),
+                            other => {
+                                return Err(QuerySurfaceError::invalid(
+                                    "invalid_with_clause",
+                                    format!("unsupported agg arg rule: {other:?}"),
+                                ));
+                            }
+                        },
+                    };
+                    items.push(WithItem::Aggregate {
+                        op,
+                        binding,
+                        key,
+                        alias,
+                    });
+                }
+                Rule::property_path => {
+                    let mut idents = expr_pair.into_inner();
+                    let binding = idents
+                        .next()
+                        .ok_or_else(|| {
+                            QuerySurfaceError::invalid(
+                                "invalid_with_clause",
+                                "property path missing binding",
+                            )
+                        })?
+                        .as_str()
+                        .to_string();
+                    let key = idents
+                        .next()
+                        .ok_or_else(|| {
+                            QuerySurfaceError::invalid(
+                                "invalid_with_clause",
+                                "property path missing key",
+                            )
+                        })?
+                        .as_str()
+                        .to_string();
+                    items.push(WithItem::Field {
+                        binding,
+                        key: Some(key),
+                        alias,
+                    });
+                }
+                Rule::ident => {
+                    items.push(WithItem::Field {
+                        binding: expr_pair.as_str().to_string(),
+                        key: None,
+                        alias,
+                    });
+                }
+                other => {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_with_clause",
+                        format!("unsupported WITH expression: {other:?}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(WithClause { items })
+}
+
+fn parse_order_clause(pair: Pair<Rule>) -> Result<Vec<OrderBy>, QuerySurfaceError> {
+    let mut out: Vec<OrderBy> = Vec::new();
+    for inner in pair.into_inner() {
+        if !matches!(inner.as_rule(), Rule::order_items) {
+            continue;
+        }
+        for entry in inner.into_inner() {
+            if !matches!(entry.as_rule(), Rule::order_item) {
+                continue;
+            }
+            let mut iter = entry.into_inner();
+            let expr_pair = iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid(
+                    "invalid_order_clause",
+                    "missing ORDER BY expression",
+                )
+            })?;
+            let expression = expr_pair.as_str().to_string();
+            let descending = match iter.next() {
+                Some(dir) => dir.as_str().eq_ignore_ascii_case("DESC"),
+                None => false,
+            };
+            out.push(OrderBy {
+                expression,
+                descending,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_skip_clause(pair: Pair<Rule>) -> Result<usize, QuerySurfaceError> {
+    for inner in pair.into_inner() {
+        if matches!(inner.as_rule(), Rule::integer) {
+            return inner.as_str().parse::<usize>().map_err(|err| {
+                QuerySurfaceError::invalid(
+                    "invalid_skip_literal",
+                    format!("SKIP requires a non-negative integer: {err}"),
+                )
+            });
+        }
+    }
+    Err(QuerySurfaceError::invalid(
+        "invalid_skip_literal",
+        "SKIP missing integer",
     ))
 }
 
@@ -1171,6 +1412,58 @@ mod parse_to_ast_tests {
             panic!("expected Delete write clause");
         };
         assert!(*detach);
+    }
+
+    #[test]
+    fn parse_sum_aggregate_into_return_item() {
+        let parsed =
+            parse_cypher_pest("MATCH (n:Doc) RETURN sum(n.score)", &BTreeMap::new()).unwrap();
+        let ReturnItem::Aggregate {
+            op, binding, key, ..
+        } = &parsed.returns[0]
+        else {
+            panic!(
+                "expected Aggregate ReturnItem, got {:?}",
+                parsed.returns[0]
+            );
+        };
+        assert_eq!(*op, AggOp::Sum);
+        assert_eq!(binding.as_deref(), Some("n"));
+        assert_eq!(key.as_deref(), Some("score"));
+    }
+
+    #[test]
+    fn parse_with_clause_carries_field_and_aggregate_items() {
+        let parsed = parse_cypher_pest(
+            "MATCH (n:Doc) WITH n.category AS cat, count(n) AS c RETURN cat, c",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let with = parsed.with_clause.as_ref().expect("expected WITH clause");
+        assert_eq!(with.items.len(), 2);
+        let WithItem::Field { alias, key, .. } = &with.items[0] else {
+            panic!("expected Field WithItem");
+        };
+        assert_eq!(alias, "cat");
+        assert_eq!(key.as_deref(), Some("category"));
+        let WithItem::Aggregate { op, alias, .. } = &with.items[1] else {
+            panic!("expected Aggregate WithItem");
+        };
+        assert_eq!(*op, AggOp::Count);
+        assert_eq!(alias, "c");
+    }
+
+    #[test]
+    fn parse_order_by_desc_and_skip() {
+        let parsed = parse_cypher_pest(
+            "MATCH (n:Doc) RETURN n ORDER BY n.created DESC SKIP 2 LIMIT 5",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(parsed.order_by.len(), 1);
+        assert!(parsed.order_by[0].descending);
+        assert_eq!(parsed.skip, Some(2));
+        assert_eq!(parsed.limit, 5);
     }
 }
 
