@@ -15,6 +15,8 @@ pub struct ParsedCypher {
 pub enum CypherPattern {
     Node(NodePattern),
     Edge(EdgePattern),
+    EdgeChain(EdgeChain),
+    EdgeVarLength(EdgeVarLength),
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,29 @@ pub struct EdgePattern {
     pub left: NodePattern,
     pub edge_type: String,
     pub right: NodePattern,
+}
+
+#[derive(Clone, Debug)]
+pub struct EdgeStep {
+    pub edge_type: String,
+    pub target: NodePattern,
+}
+
+#[derive(Clone, Debug)]
+pub struct EdgeChain {
+    pub start: NodePattern,
+    pub steps: Vec<EdgeStep>,
+    pub path_binding: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EdgeVarLength {
+    pub from: NodePattern,
+    pub edge_type: String,
+    pub min: usize,
+    pub max: Option<usize>,
+    pub to: NodePattern,
+    pub path_binding: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +75,10 @@ pub enum ReturnItem {
         binding: Option<String>,
         expression: String,
     },
+    Path {
+        binding: String,
+        expression: String,
+    },
 }
 
 impl ReturnItem {
@@ -58,6 +87,7 @@ impl ReturnItem {
             Self::Variable(binding) => binding.as_str(),
             Self::Property { expression, .. } => expression.as_str(),
             Self::Count { expression, .. } => expression.as_str(),
+            Self::Path { expression, .. } => expression.as_str(),
         }
     }
 }
@@ -95,5 +125,76 @@ mod tests {
             limit: 10,
         };
         assert_eq!(parsed.limit, 10);
+    }
+
+    #[test]
+    fn ast_supports_edge_chain_pattern() {
+        let chain = EdgeChain {
+            start: NodePattern {
+                binding: "a".into(),
+                label: Some("Doc".into()),
+                properties: BTreeMap::new(),
+            },
+            steps: vec![
+                EdgeStep {
+                    edge_type: "T1".into(),
+                    target: NodePattern {
+                        binding: "b".into(),
+                        label: None,
+                        properties: BTreeMap::new(),
+                    },
+                },
+                EdgeStep {
+                    edge_type: "T2".into(),
+                    target: NodePattern {
+                        binding: "c".into(),
+                        label: None,
+                        properties: BTreeMap::new(),
+                    },
+                },
+            ],
+            path_binding: None,
+        };
+        let pattern = CypherPattern::EdgeChain(chain);
+        let CypherPattern::EdgeChain(c) = &pattern else {
+            panic!("expected EdgeChain");
+        };
+        assert_eq!(c.steps.len(), 2);
+        assert_eq!(c.steps[1].target.binding, "c");
+    }
+
+    #[test]
+    fn ast_supports_edge_var_length_pattern() {
+        let var = EdgeVarLength {
+            from: NodePattern {
+                binding: "a".into(),
+                label: None,
+                properties: BTreeMap::new(),
+            },
+            edge_type: "T".into(),
+            min: 1,
+            max: Some(3),
+            to: NodePattern {
+                binding: "b".into(),
+                label: None,
+                properties: BTreeMap::new(),
+            },
+            path_binding: None,
+        };
+        let pattern = CypherPattern::EdgeVarLength(var);
+        let CypherPattern::EdgeVarLength(v) = &pattern else {
+            panic!("expected EdgeVarLength");
+        };
+        assert_eq!(v.min, 1);
+        assert_eq!(v.max, Some(3));
+    }
+
+    #[test]
+    fn ast_return_item_path_variant() {
+        let item = ReturnItem::Path {
+            binding: "p".into(),
+            expression: "p".into(),
+        };
+        assert_eq!(item.key(), "p");
     }
 }

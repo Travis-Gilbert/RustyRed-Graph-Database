@@ -398,6 +398,12 @@ pub fn execute_cypher_query(
                 "explain": explain,
             }))
         }
+        CypherPattern::EdgeChain(_) | CypherPattern::EdgeVarLength(_) => {
+            Err(QuerySurfaceError::unsupported(
+                "multi_hop_execution",
+                "multi-hop and variable-length expand are parsed but not yet executed in this slice; execution lands in §P2-B pb.2.2 / pb.2.3",
+            ))
+        }
     }
 }
 
@@ -506,6 +512,60 @@ pub fn explain_cypher_query(
                 ]),
             )
         }
+        CypherPattern::EdgeChain(chain) => (
+            "multi_hop_chain",
+            json!([
+                {
+                    "op": "node_by_label",
+                    "binding": chain.start.binding,
+                    "label": chain.start.label,
+                    "properties": chain.start.properties,
+                },
+                {
+                    "op": "expand_chain",
+                    "hops": chain.steps.iter().map(|step| json!({
+                        "edge_type": step.edge_type,
+                        "target_binding": step.target.binding,
+                        "target_label": step.target.label,
+                    })).collect::<Vec<_>>(),
+                },
+                {
+                    "op": "project",
+                    "returns": parsed.returns.iter().map(ReturnItem::key).collect::<Vec<_>>()
+                },
+                {
+                    "op": "limit",
+                    "count": parsed.limit
+                }
+            ]),
+        ),
+        CypherPattern::EdgeVarLength(var) => (
+            "variable_length_expand",
+            json!([
+                {
+                    "op": "node_by_label",
+                    "binding": var.from.binding,
+                    "label": var.from.label,
+                    "properties": var.from.properties,
+                },
+                {
+                    "op": "expand_var_length",
+                    "edge_type": var.edge_type,
+                    "min_hops": var.min,
+                    "max_hops": var.max,
+                    "target_binding": var.to.binding,
+                    "target_label": var.to.label,
+                },
+                {
+                    "op": "project",
+                    "returns": parsed.returns.iter().map(ReturnItem::key).collect::<Vec<_>>()
+                },
+                {
+                    "op": "limit",
+                    "count": parsed.limit
+                }
+            ]),
+        ),
     };
     Ok(json!({
         "ok": true,
@@ -747,6 +807,16 @@ fn validate_where_filter(
         CypherPattern::Edge(edge) => {
             edge.left.binding == filter.binding || edge.right.binding == filter.binding
         }
+        CypherPattern::EdgeChain(chain) => {
+            chain.start.binding == filter.binding
+                || chain
+                    .steps
+                    .iter()
+                    .any(|step| step.target.binding == filter.binding)
+        }
+        CypherPattern::EdgeVarLength(var) => {
+            var.from.binding == filter.binding || var.to.binding == filter.binding
+        }
     };
     if valid {
         Ok(())
@@ -765,9 +835,26 @@ fn validate_return_items(
     pattern: &CypherPattern,
     returns: &[ReturnItem],
 ) -> Result<(), QuerySurfaceError> {
-    let bindings = match pattern {
+    let bindings: Vec<&str> = match pattern {
         CypherPattern::Node(node) => vec![node.binding.as_str()],
         CypherPattern::Edge(edge) => vec![edge.left.binding.as_str(), edge.right.binding.as_str()],
+        CypherPattern::EdgeChain(chain) => {
+            let mut out = vec![chain.start.binding.as_str()];
+            for step in &chain.steps {
+                out.push(step.target.binding.as_str());
+            }
+            if let Some(path) = chain.path_binding.as_deref() {
+                out.push(path);
+            }
+            out
+        }
+        CypherPattern::EdgeVarLength(var) => {
+            let mut out = vec![var.from.binding.as_str(), var.to.binding.as_str()];
+            if let Some(path) = var.path_binding.as_deref() {
+                out.push(path);
+            }
+            out
+        }
     };
     for item in returns {
         match item {
@@ -795,6 +882,14 @@ fn validate_return_items(
                             format!("COUNT({b}) binding does not exist in the MATCH pattern"),
                         ));
                     }
+                }
+            }
+            ReturnItem::Path { binding, .. } => {
+                if !bindings.contains(&binding.as_str()) {
+                    return Err(QuerySurfaceError::invalid(
+                        "invalid_return_binding",
+                        format!("RETURN path {binding} does not exist in the MATCH pattern"),
+                    ));
                 }
             }
         }
@@ -1080,6 +1175,12 @@ fn project_node_row(
                 // project_node_row is not called when returns are pure counts.
                 unreachable!("count items handled at the executor level");
             }
+            ReturnItem::Path { binding, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "path_projection_on_node",
+                    format!("RETURN path {binding} is only meaningful for chain or var-length patterns"),
+                ));
+            }
         }
     }
     Ok(Value::Object(row))
@@ -1122,6 +1223,12 @@ fn project_edge_row(
             }
             ReturnItem::Count { .. } => {
                 unreachable!("count items handled at the executor level");
+            }
+            ReturnItem::Path { binding, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "path_projection_on_edge",
+                    format!("RETURN path {binding} is only meaningful for chain or var-length patterns"),
+                ));
             }
         }
     }
