@@ -17,7 +17,7 @@ pub mod store;
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
-pub use fulltext::{FullTextDesignation, FullTextIndex};
+pub use fulltext::{FullTextBackend, FullTextDesignation, FullTextIndex};
 #[allow(deprecated)]
 pub use graph::louvain_communities;
 pub use graph::{

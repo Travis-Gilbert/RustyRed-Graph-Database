@@ -22,9 +22,13 @@ pub struct FullTextDesignation {
     pub property: String,
 }
 
-#[derive(Debug, Default)]
+/// §P5-A pa5.1 + cross-cutting cc.3: the full-text designation is now a
+/// required, owned field. The per-tenant map already keys by (label, property),
+/// so wrapping the designation in `Option` was redundant and prone to silent
+/// fall-throughs ("missing designation" only surfaced via `.unwrap_or_default`).
+#[derive(Debug)]
 pub struct FullTextIndex {
-    pub designation: Option<FullTextDesignation>,
+    pub designation: FullTextDesignation,
     /// term -> list of (doc_id, term frequency in this doc)
     postings: HashMap<String, Vec<(String, u32)>>,
     /// per-doc total term count
@@ -36,10 +40,27 @@ pub struct FullTextIndex {
     total_length: u64,
 }
 
+/// §P5-A pa5.1: trait abstraction over the full-text storage layer. The
+/// hand-rolled `FullTextIndex` is the only impl today; a tantivy-backed
+/// implementation will sit behind a `tantivy` feature flag once the SPEC's
+/// switch is implemented.
+pub trait FullTextBackend {
+    /// Index (or re-index) a document under `doc_id` with the given text.
+    fn upsert(&mut self, doc_id: &str, text: &str);
+    /// Remove a document from the index.
+    fn remove(&mut self, doc_id: &str);
+    /// Return the top-k scored hits for the query.
+    fn search(&self, query: &str, k: usize) -> Vec<(String, f32)>;
+    /// Return the designation this backend was created for.
+    fn designation(&self) -> &FullTextDesignation;
+    /// Number of documents currently indexed.
+    fn doc_count(&self) -> usize;
+}
+
 impl FullTextIndex {
     pub fn for_designation(d: FullTextDesignation) -> Self {
         Self {
-            designation: Some(d),
+            designation: d,
             postings: HashMap::new(),
             doc_lengths: HashMap::new(),
             doc_terms: HashMap::new(),
@@ -211,5 +232,58 @@ mod tests {
         assert!(r.is_empty());
         let r = idx.search("weather", 5);
         assert_eq!(r[0].0, "d1");
+    }
+
+    // §P5-A pa5.1 + cc.3: backend trait + designation-required guarantees.
+
+    #[test]
+    fn fulltext_index_implements_fulltext_backend_trait() {
+        let designation = FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        };
+        let mut backend: Box<dyn FullTextBackend> =
+            Box::new(FullTextIndex::for_designation(designation));
+        backend.upsert("d1", "the quick brown fox");
+        backend.upsert("d2", "the lazy dog");
+        let hits = backend.search("fox", 5);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, "d1");
+        assert_eq!(backend.doc_count(), 2);
+    }
+
+    #[test]
+    fn designation_is_owned_value_not_optional() {
+        let idx = FullTextIndex::for_designation(FullTextDesignation {
+            label: "Doc".into(),
+            property: "text".into(),
+        });
+        // No `.as_ref()` / `.unwrap()` needed: the field is the value itself.
+        assert_eq!(idx.designation.label, "Doc");
+        assert_eq!(idx.designation.property, "text");
+    }
+}
+
+// §P5-A pa5.1: the hand-rolled backend wired through the trait. Until the
+// optional tantivy backend lands, this is the only `FullTextBackend` impl.
+impl FullTextBackend for FullTextIndex {
+    fn upsert(&mut self, doc_id: &str, text: &str) {
+        FullTextIndex::upsert(self, doc_id, text);
+    }
+
+    fn remove(&mut self, doc_id: &str) {
+        FullTextIndex::remove(self, doc_id);
+    }
+
+    fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
+        FullTextIndex::search(self, query, k)
+    }
+
+    fn designation(&self) -> &FullTextDesignation {
+        &self.designation
+    }
+
+    fn doc_count(&self) -> usize {
+        FullTextIndex::doc_count(self)
     }
 }
