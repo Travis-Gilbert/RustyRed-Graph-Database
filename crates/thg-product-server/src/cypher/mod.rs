@@ -4,6 +4,7 @@
 //! executor consumed before the migration.
 
 pub mod ast;
+pub mod compile;
 pub mod parse;
 
 #[cfg(test)]
