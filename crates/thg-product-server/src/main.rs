@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod auth;
+mod bulk;
 mod config;
 mod cypher;
 mod graph_cache;
