@@ -2462,19 +2462,32 @@ fn flush_node_batch(
     failed: &mut usize,
     errors: &mut Vec<Value>,
 ) {
-    for node in pending.drain(..) {
-        match store.upsert_node(node.clone()) {
-            Ok(_) => {
-                *inserted += 1;
+    if pending.is_empty() {
+        return;
+    }
+    let snapshot: Vec<thg_core::NodeRecord> = pending.drain(..).collect();
+    let mutations: Vec<thg_core::GraphMutation> = snapshot
+        .iter()
+        .cloned()
+        .map(thg_core::GraphMutation::NodeUpsert)
+        .collect();
+    let batch = thg_core::GraphMutationBatch::new(mutations);
+    match store.commit_batch(batch) {
+        Ok(_transaction) => {
+            *inserted += snapshot.len();
+            for node in &snapshot {
                 state.observability.record_mutation();
-                state.maybe_index_node_spatially(tenant_id, &node);
-                state.maybe_index_node_fulltext(tenant_id, &node);
+                state.maybe_index_node_spatially(tenant_id, node);
+                state.maybe_index_node_fulltext(tenant_id, node);
             }
-            Err(err) => {
-                *failed += 1;
-                if errors.len() < 32 {
-                    errors.push(json!({ "node_id": node.id, "error": format!("{err:?}") }));
-                }
+        }
+        Err(err) => {
+            *failed += snapshot.len();
+            if errors.len() < 32 {
+                errors.push(json!({
+                    "batch_size": snapshot.len(),
+                    "error": format!("{err:?}"),
+                }));
             }
         }
     }
@@ -2636,17 +2649,30 @@ fn flush_edge_batch(
     failed: &mut usize,
     errors: &mut Vec<Value>,
 ) {
-    for edge in pending.drain(..) {
-        match store.upsert_edge(edge.clone()) {
-            Ok(_) => {
-                *inserted += 1;
+    if pending.is_empty() {
+        return;
+    }
+    let snapshot: Vec<thg_core::EdgeRecord> = pending.drain(..).collect();
+    let mutations: Vec<thg_core::GraphMutation> = snapshot
+        .iter()
+        .cloned()
+        .map(thg_core::GraphMutation::EdgeUpsert)
+        .collect();
+    let batch = thg_core::GraphMutationBatch::new(mutations);
+    match store.commit_batch(batch) {
+        Ok(_transaction) => {
+            *inserted += snapshot.len();
+            for _ in &snapshot {
                 state.observability.record_mutation();
             }
-            Err(err) => {
-                *failed += 1;
-                if errors.len() < 32 {
-                    errors.push(json!({ "edge_id": edge.id, "error": format!("{err:?}") }));
-                }
+        }
+        Err(err) => {
+            *failed += snapshot.len();
+            if errors.len() < 32 {
+                errors.push(json!({
+                    "batch_size": snapshot.len(),
+                    "error": format!("{err:?}"),
+                }));
             }
         }
     }

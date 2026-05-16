@@ -941,6 +941,38 @@ impl TenantGraphStore {
         }
     }
 
+    /// Apply a `GraphMutationBatch` in a single transaction. RedCore uses its
+    /// transactional `commit_batch`. Redis loops per-mutation upserts (it has
+    /// no atomic batch primitive yet); callers still get the bulk-loader's
+    /// `batches:` counter, just without single-transaction semantics on Redis.
+    pub fn commit_batch(
+        &mut self,
+        batch: thg_core::GraphMutationBatch,
+    ) -> GraphStoreResult<thg_core::GraphTransaction> {
+        match self {
+            Self::RedCore(executor) => executor.commit_batch(batch),
+            Self::Redis(store) => {
+                let mut writes: Vec<thg_core::GraphWriteResult> = Vec::new();
+                for mutation in batch.mutations {
+                    match mutation {
+                        thg_core::GraphMutation::NodeUpsert(node) => {
+                            writes.push(store.upsert_node(node)?);
+                        }
+                        thg_core::GraphMutation::EdgeUpsert(edge) => {
+                            writes.push(store.upsert_edge(edge)?);
+                        }
+                    }
+                }
+                let graph_version = store.stats().map(|s| s.version).unwrap_or(0);
+                Ok(thg_core::GraphTransaction {
+                    txn_id: writes.len() as u64,
+                    graph_version,
+                    writes,
+                })
+            }
+        }
+    }
+
     pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
         match self {
             Self::RedCore(store) => store.get_node(id),
