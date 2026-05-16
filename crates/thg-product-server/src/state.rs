@@ -694,6 +694,10 @@ pub struct RedCoreTenantExecutor {
     writer: Mutex<RedCoreGraphStore>,
     committed_snapshot: RwLock<InMemoryGraphStore>,
     tenant_memory_quota_bytes: usize,
+    /// §P6-A pa6.1: cached `(graph_version, edges)` pair. Algorithm endpoints
+    /// share the underlying allocation across concurrent calls; any mutation
+    /// that bumps `graph_version` triggers a rebuild on the next read.
+    cached_edges: RwLock<Option<(u64, Arc<Vec<EdgeRecord>>)>>,
 }
 
 impl RedCoreTenantExecutor {
@@ -703,7 +707,38 @@ impl RedCoreTenantExecutor {
             writer: Mutex::new(store),
             committed_snapshot: RwLock::new(committed_snapshot),
             tenant_memory_quota_bytes,
+            cached_edges: RwLock::new(None),
         })
+    }
+
+    /// §P6-A pa6.1: cheap `Arc<Vec<EdgeRecord>>` clone for algorithm endpoints.
+    /// Reads the cached arc when `graph_version` matches the current snapshot;
+    /// rebuilds otherwise. Concurrent callers share the same allocation.
+    pub fn list_edges_arc(&self) -> GraphStoreResult<Arc<Vec<EdgeRecord>>> {
+        let current_version = self.stats()?.version;
+        {
+            let guard = self.cached_edges.read().map_err(|_| {
+                GraphStoreError::new(
+                    "redcore_snapshot_lock_poisoned",
+                    "RedCore arc-cache lock poisoned",
+                )
+            })?;
+            if let Some((cached_version, arc)) = guard.as_ref() {
+                if *cached_version == current_version {
+                    return Ok(Arc::clone(arc));
+                }
+            }
+        }
+        let edges = self.with_snapshot(|snapshot| snapshot.snapshot().edges)?;
+        let arc = Arc::new(edges);
+        let mut guard = self.cached_edges.write().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_snapshot_lock_poisoned",
+                "RedCore arc-cache lock poisoned",
+            )
+        })?;
+        *guard = Some((current_version, Arc::clone(&arc)));
+        Ok(arc)
     }
 
     pub fn commit_batch(&self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
@@ -1079,6 +1114,19 @@ impl TenantGraphStore {
         }
     }
 
+    /// §P6-A pa6.1: `Arc<Vec<EdgeRecord>>` snapshot used by the algorithm
+    /// endpoints. The RedCore variant returns a shared, version-cached arc;
+    /// callers must not mutate.
+    pub fn list_edges_arc(&self) -> GraphStoreResult<Arc<Vec<EdgeRecord>>> {
+        match self {
+            Self::RedCore(store) => store.list_edges_arc(),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "graph algorithms are not supported on Redis graph stores",
+            )),
+        }
+    }
+
     pub fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -1319,6 +1367,60 @@ impl McpGraphBackend for TenantGraphStore {
             min_confidence,
             max_depth,
         )
+    }
+
+    /// §P6-A pa6.1: override the trait defaults to read `list_edges_arc` so
+    /// concurrent algorithm endpoints share one allocation rather than each
+    /// cloning the live edge vector.
+    fn algo_ppr(
+        &self,
+        seeds: &std::collections::HashMap<String, f64>,
+        alpha: f64,
+        epsilon: f64,
+        max_pushes: usize,
+    ) -> GraphStoreResult<std::collections::HashMap<String, f64>> {
+        let edges = self.list_edges_arc()?;
+        let mut adjacency: std::collections::HashMap<String, Vec<(String, f64)>> =
+            std::collections::HashMap::new();
+        for edge in edges.iter() {
+            if edge.tombstone {
+                continue;
+            }
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push((edge.to_id.clone(), edge.effective_confidence()));
+        }
+        Ok(thg_core::personalized_pagerank(
+            &adjacency, seeds, alpha, epsilon, max_pushes,
+        ))
+    }
+
+    fn algo_components(&self, directed: bool) -> GraphStoreResult<Vec<Vec<String>>> {
+        let edges = self.list_edges_arc()?;
+        Ok(thg_core::connected_components(edges.as_slice(), directed))
+    }
+
+    fn algo_pagerank(
+        &self,
+        damping: f64,
+        max_iter: usize,
+        tolerance: f64,
+    ) -> GraphStoreResult<std::collections::HashMap<String, f64>> {
+        let edges = self.list_edges_arc()?;
+        Ok(thg_core::pagerank(
+            edges.as_slice(),
+            damping,
+            max_iter,
+            tolerance,
+        ))
+    }
+
+    fn algo_communities(
+        &self,
+    ) -> GraphStoreResult<(std::collections::HashMap<String, u64>, f64)> {
+        let edges = self.list_edges_arc()?;
+        Ok(thg_core::label_propagation_communities(edges.as_slice()))
     }
 }
 
@@ -2159,5 +2261,83 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{label}-{unique}"))
+    }
+
+    // ---- §P6-A pa6.1 algorithm-cache tests --------------------------------
+
+    fn arc_cache_test_state() -> AppState {
+        AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: thg_core::HybridScoringConfig::default(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+        })
+    }
+
+    #[test]
+    fn list_edges_arc_returns_shared_instance() {
+        let state = arc_cache_test_state();
+        let mut store = state.tenant_graph_store("tenant-arc").unwrap();
+        store
+            .upsert_node(NodeRecord::new("a", ["Doc"], json!({})))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("b", ["Doc"], json!({})))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new("e1", "a", "T", "b", json!({})))
+            .unwrap();
+        let first = store.list_edges_arc().unwrap();
+        let second = store.list_edges_arc().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "successive list_edges_arc calls at the same graph_version must share the allocation",
+        );
+        assert!(Arc::strong_count(&first) >= 2);
+    }
+
+    #[test]
+    fn list_edges_arc_rebuilds_after_mutation() {
+        let state = arc_cache_test_state();
+        let mut store = state.tenant_graph_store("tenant-arc-bump").unwrap();
+        store
+            .upsert_node(NodeRecord::new("a", ["Doc"], json!({})))
+            .unwrap();
+        let first = store.list_edges_arc().unwrap();
+        store
+            .upsert_node(NodeRecord::new("b", ["Doc"], json!({})))
+            .unwrap();
+        let second = store.list_edges_arc().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "mutation should bump graph_version and invalidate the arc cache",
+        );
     }
 }
