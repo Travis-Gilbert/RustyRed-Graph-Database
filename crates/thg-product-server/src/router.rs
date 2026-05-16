@@ -14,7 +14,8 @@ use thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use thg_core::errors::ThgError;
 use thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use thg_core::{
-    stable_hash, EdgeRecord, GraphStats, GraphStoreError, NeighborQuery, NodeQuery, NodeRecord,
+    stable_hash, EdgeRecord, EpistemicType, GraphStats, GraphStoreError, NeighborQuery, NodeQuery,
+    NodeRecord,
 };
 use thg_mcp::{agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext};
 use tower_http::cors::{Any, CorsLayer};
@@ -119,6 +120,57 @@ pub struct HealthBody {
     pub status: &'static str,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VectorDesignateBody {
+    pub label: String,
+    pub property: String,
+    pub dimension: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VectorSearchBody {
+    pub query: Vec<f32>,
+    #[serde(default = "default_k")]
+    pub k: usize,
+    pub label: Option<String>,
+    pub property: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HybridSearchBody {
+    pub query: Vec<f32>,
+    #[serde(default = "default_k")]
+    pub k: usize,
+    pub label: Option<String>,
+    pub property: String,
+    pub graph_seeds: Vec<String>,
+    #[serde(default = "default_max_hops")]
+    pub max_hops: usize,
+    #[serde(default = "default_alpha")]
+    pub alpha: f32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EpistemicNeighborsBody {
+    pub node_id: String,
+    #[serde(default)]
+    pub epistemic_types: Option<Vec<EpistemicType>>,
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+}
+
+fn default_k() -> usize {
+    10
+}
+fn default_max_hops() -> usize {
+    3
+}
+fn default_alpha() -> f32 {
+    0.5
+}
+
 pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state);
     Router::new()
@@ -177,6 +229,22 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_rebuild_indexes),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/designate",
+            post(graph_vector_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/search",
+            post(graph_vector_search),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/hybrid",
+            post(graph_vector_hybrid),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/epistemic-neighbors",
+            post(graph_epistemic_neighbors),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -636,6 +704,150 @@ async fn context_pack(
         return status.into_response();
     }
     execute_tenant_command(&state, &tenant_id, "THG.CONTEXT.PACK", args)
+}
+
+async fn graph_vector_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VectorDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.designate_vector_property(&body.label, &body.property, body.dimension) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "label": body.label,
+            "property": body.property,
+            "dimension": body.dimension
+        }))
+        .into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_vector_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VectorSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let label_ref = body.label.as_deref();
+    match store.vector_search(label_ref, &body.property, &body.query, body.k) {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(node_id, distance)| {
+                    let node = store.get_node(&node_id).ok().flatten();
+                    json!({ "node_id": node_id, "distance": distance, "node": node })
+                })
+                .collect();
+            Json(json!({ "ok": true, "results": items })).into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_vector_hybrid(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<HybridSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let label_ref = body.label.as_deref();
+    match store.hybrid_search(
+        label_ref,
+        &body.property,
+        &body.query,
+        body.k,
+        &body.graph_seeds,
+        body.max_hops,
+        body.alpha,
+    ) {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(node_id, score)| {
+                    let node = store.get_node(&node_id).ok().flatten();
+                    json!({ "node_id": node_id, "score": score, "node": node })
+                })
+                .collect();
+            Json(json!({ "ok": true, "results": items })).into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_epistemic_neighbors(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EpistemicNeighborsBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let types_ref = body.epistemic_types.as_deref();
+    match store.epistemic_neighbors(&body.node_id, types_ref, body.min_confidence, body.max_depth) {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(edge, node)| json!({ "edge": edge, "node": node }))
+                .collect();
+            Json(json!({ "ok": true, "results": items })).into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
 }
 
 async fn graph_node_upsert(
@@ -1540,7 +1752,10 @@ fn graph_error_status(code: &str) -> StatusCode {
         | "invalid_graph_record"
         | "invalid_graph_cache_request"
         | "unsupported_graph_cache_kind"
-        | "unsupported_graph_cache_command" => StatusCode::BAD_REQUEST,
+        | "unsupported_graph_cache_command"
+        | "dimension_mismatch"
+        | "invalid_vector_designation"
+        | "unsupported_operation" => StatusCode::BAD_REQUEST,
         "tenant_memory_quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
         "redis_graph_store_error"
         | "redcore_io_error"

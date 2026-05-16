@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -6,12 +6,162 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use instant_distance::{Builder, HnswMap, Search};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::state::stable_hash;
 
+#[derive(Clone, Debug)]
+pub struct VectorPoint(Vec<f32>);
+
+impl VectorPoint {
+    pub fn new(raw: &[f32]) -> Self {
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm < 1e-10 {
+            Self(raw.to_vec())
+        } else {
+            Self(raw.iter().map(|x| x / norm).collect())
+        }
+    }
+}
+
+impl instant_distance::Point for VectorPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
+        1.0 - dot
+    }
+}
+
+pub struct VectorIndex {
+    points: Vec<VectorPoint>,
+    node_ids: Vec<String>,
+    hnsw: Option<HnswMap<VectorPoint, String>>,
+    pub dimension: usize,
+}
+
+impl Clone for VectorIndex {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            points: self.points.clone(),
+            node_ids: self.node_ids.clone(),
+            hnsw: None,
+            dimension: self.dimension,
+        };
+        cloned.rebuild();
+        cloned
+    }
+}
+
+impl std::fmt::Debug for VectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndex")
+            .field("dimension", &self.dimension)
+            .field("count", &self.points.len())
+            .finish()
+    }
+}
+
+impl VectorIndex {
+    fn new(dimension: usize) -> Self {
+        Self {
+            points: Vec::new(),
+            node_ids: Vec::new(),
+            hnsw: None,
+            dimension,
+        }
+    }
+
+    fn insert(&mut self, node_id: &str, vector: &[f32]) {
+        if let Some(pos) = self.node_ids.iter().position(|id| id == node_id) {
+            self.points[pos] = VectorPoint::new(vector);
+        } else {
+            self.points.push(VectorPoint::new(vector));
+            self.node_ids.push(node_id.to_string());
+        }
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        if self.points.is_empty() {
+            self.hnsw = None;
+            return;
+        }
+        let hnsw = Builder::default().build(self.points.clone(), self.node_ids.clone());
+        self.hnsw = Some(hnsw);
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        let Some(ref hnsw) = self.hnsw else {
+            return Vec::new();
+        };
+        let point = VectorPoint::new(query);
+        let mut search = Search::default();
+        hnsw.search(&point, &mut search)
+            .take(k)
+            .map(|item| (item.value.clone(), item.distance))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VectorDesignation {
+    pub label: String,
+    pub property: String,
+    pub dimension: usize,
+}
+
 pub type GraphStoreResult<T> = Result<T, GraphStoreError>;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpistemicType {
+    Supports,
+    Contradicts,
+    Tension,
+    Derives,
+    Cites,
+}
+
+impl std::fmt::Display for EpistemicType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Supports => write!(f, "supports"),
+            Self::Contradicts => write!(f, "contradicts"),
+            Self::Tension => write!(f, "tension"),
+            Self::Derives => write!(f, "derives"),
+            Self::Cites => write!(f, "cites"),
+        }
+    }
+}
+
+impl std::str::FromStr for EpistemicType {
+    type Err = GraphStoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "supports" => Ok(Self::Supports),
+            "contradicts" => Ok(Self::Contradicts),
+            "tension" => Ok(Self::Tension),
+            "derives" => Ok(Self::Derives),
+            "cites" => Ok(Self::Cites),
+            _ => Err(GraphStoreError::new(
+                "invalid_epistemic_type",
+                format!("unknown epistemic type: {s}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Provenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
 
 pub trait GraphStore {
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult>;
@@ -113,7 +263,7 @@ impl NodeRecord {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EdgeRecord {
     pub id: String,
     pub from_id: String,
@@ -123,6 +273,12 @@ pub struct EdgeRecord {
     pub properties: Value,
     pub version: u64,
     pub tombstone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_type: Option<EpistemicType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 impl EdgeRecord {
@@ -141,7 +297,29 @@ impl EdgeRecord {
             properties,
             version: 0,
             tombstone: false,
+            confidence: None,
+            epistemic_type: None,
+            provenance: None,
         }
+    }
+
+    pub fn with_confidence(mut self, confidence: f64) -> Self {
+        self.confidence = Some(confidence.clamp(0.0, 1.0));
+        self
+    }
+
+    pub fn with_epistemic_type(mut self, epistemic_type: EpistemicType) -> Self {
+        self.epistemic_type = Some(epistemic_type);
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
+    pub fn effective_confidence(&self) -> f64 {
+        self.confidence.unwrap_or(1.0)
     }
 
     pub fn checksum(&self) -> String {
@@ -190,12 +368,16 @@ impl NeighborQuery {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NeighborHit {
     pub edge_id: String,
     pub node_id: String,
     #[serde(rename = "type")]
     pub edge_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_type: Option<EpistemicType>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,14 +430,14 @@ pub struct GraphWriteResult {
     pub checksum: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "op", content = "record", rename_all = "snake_case")]
 pub enum GraphMutation {
     NodeUpsert(NodeRecord),
     EdgeUpsert(EdgeRecord),
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct GraphMutationBatch {
     pub mutations: Vec<GraphMutation>,
 }
@@ -289,7 +471,7 @@ pub struct GraphStats {
     pub memory_quota_bytes: usize,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct GraphSnapshot {
     pub version: u64,
     pub nodes: Vec<NodeRecord>,
@@ -317,7 +499,7 @@ pub struct GraphRebuildReport {
     pub after: VerifyReport,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct InMemoryGraphStore {
     version: u64,
     nodes: BTreeMap<String, NodeRecord>,
@@ -327,6 +509,25 @@ pub struct InMemoryGraphStore {
     label_index: BTreeMap<String, BTreeSet<String>>,
     edge_type_index: BTreeMap<String, BTreeSet<String>>,
     property_index: BTreeMap<(String, String), BTreeSet<String>>,
+    vector_designations: HashMap<(String, String), usize>,
+    vector_indexes: HashMap<(String, String), VectorIndex>,
+}
+
+impl Default for InMemoryGraphStore {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            out_adjacency: BTreeMap::new(),
+            in_adjacency: BTreeMap::new(),
+            label_index: BTreeMap::new(),
+            edge_type_index: BTreeMap::new(),
+            property_index: BTreeMap::new(),
+            vector_designations: HashMap::new(),
+            vector_indexes: HashMap::new(),
+        }
+    }
 }
 
 impl InMemoryGraphStore {
@@ -372,6 +573,7 @@ impl InMemoryGraphStore {
         let id = node.id.clone();
         if !node.tombstone {
             self.add_node_indexes(&node);
+            self.auto_index_vectors(&node);
         }
         self.nodes.insert(id.clone(), node);
 
@@ -392,6 +594,7 @@ impl InMemoryGraphStore {
         }
         if !node.tombstone {
             self.add_node_indexes(&node);
+            self.auto_index_vectors(&node);
         }
         self.version = self.version.max(node.version);
         self.nodes.insert(node.id.clone(), node);
@@ -554,9 +757,64 @@ impl InMemoryGraphStore {
                 edge_id: edge.id.clone(),
                 node_id,
                 edge_type: edge.edge_type.clone(),
+                confidence: edge.confidence,
+                epistemic_type: edge.epistemic_type.clone(),
             });
         }
         hits
+    }
+
+    pub fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> Vec<(EdgeRecord, NodeRecord)> {
+        let max_depth = max_depth.unwrap_or(1);
+        let min_conf = min_confidence.unwrap_or(0.0);
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<(String, usize)> =
+            std::collections::VecDeque::new();
+        let mut results: Vec<(EdgeRecord, NodeRecord)> = Vec::new();
+
+        visited.insert(node_id.to_string());
+        queue.push_back((node_id.to_string(), 0));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            for hits in [
+                self.neighbors(NeighborQuery::out(&current_id)),
+                self.neighbors(NeighborQuery::in_(&current_id)),
+            ] {
+                for hit in hits {
+                    if visited.contains(&hit.node_id) {
+                        continue;
+                    }
+                    let Some(edge) = self.get_edge(&hit.edge_id) else {
+                        continue;
+                    };
+                    if edge.effective_confidence() < min_conf {
+                        continue;
+                    }
+                    if let Some(types) = epistemic_types {
+                        match &edge.epistemic_type {
+                            Some(et) if types.contains(et) => {}
+                            _ => continue,
+                        }
+                    }
+                    let Some(node) = self.get_node(&hit.node_id) else {
+                        continue;
+                    };
+                    visited.insert(hit.node_id.clone());
+                    results.push((edge.clone(), node.clone()));
+                    queue.push_back((hit.node_id, depth + 1));
+                }
+            }
+        }
+        results
     }
 
     pub fn stats(&self) -> GraphStats {
@@ -570,6 +828,214 @@ impl InMemoryGraphStore {
             property_indexes_total: self.property_index.len(),
             memory_bytes: self.estimated_memory_bytes(),
             memory_quota_bytes: 0,
+        }
+    }
+
+    pub fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        if label.trim().is_empty() || property_name.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_vector_designation",
+                "label and property_name must be non-empty".to_string(),
+            ));
+        }
+        if dimension == 0 {
+            return Err(GraphStoreError::new(
+                "invalid_vector_designation",
+                "dimension must be > 0".to_string(),
+            ));
+        }
+        let key = (label.to_string(), property_name.to_string());
+        self.vector_designations.insert(key.clone(), dimension);
+        self.vector_indexes
+            .entry(key)
+            .or_insert_with(|| VectorIndex::new(dimension));
+        for node in self.nodes.values() {
+            if node.tombstone {
+                continue;
+            }
+            if !node.labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if let Some(arr) = extract_float_array(&node.properties, property_name) {
+                if arr.len() == dimension {
+                    let idx_key = (label.to_string(), property_name.to_string());
+                    if let Some(idx) = self.vector_indexes.get_mut(&idx_key) {
+                        idx.insert(&node.id, &arr);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn vector_designations(&self) -> Vec<VectorDesignation> {
+        self.vector_designations
+            .iter()
+            .map(|((label, property), &dimension)| VectorDesignation {
+                label: label.clone(),
+                property: property.clone(),
+                dimension,
+            })
+            .collect()
+    }
+
+    pub fn index_vector(
+        &mut self,
+        node_id: &str,
+        property_name: &str,
+        vector: &[f32],
+    ) -> GraphStoreResult<()> {
+        let node = self.nodes.get(node_id).ok_or_else(|| {
+            GraphStoreError::new("node_not_found", format!("no node with id {node_id}"))
+        })?;
+        let matching_label = node.labels.iter().find(|label| {
+            self.vector_designations
+                .contains_key(&(label.to_string(), property_name.to_string()))
+        });
+        let label = matching_label
+            .ok_or_else(|| {
+                GraphStoreError::new(
+                    "no_vector_designation",
+                    format!("no vector designation covers property {property_name} for node {node_id}"),
+                )
+            })?
+            .clone();
+        let key = (label, property_name.to_string());
+        let expected_dim = self.vector_designations[&key];
+        if vector.len() != expected_dim {
+            return Err(GraphStoreError::new(
+                "dimension_mismatch",
+                format!(
+                    "expected {expected_dim} dimensions, got {}",
+                    vector.len()
+                ),
+            ));
+        }
+        let idx = self
+            .vector_indexes
+            .entry(key)
+            .or_insert_with(|| VectorIndex::new(expected_dim));
+        idx.insert(node_id, vector);
+        Ok(())
+    }
+
+    pub fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        for ((l, p), idx) in &self.vector_indexes {
+            if p != property_name {
+                continue;
+            }
+            if let Some(lbl) = label {
+                if l != lbl {
+                    continue;
+                }
+            }
+            if query.len() != idx.dimension {
+                return Err(GraphStoreError::new(
+                    "dimension_mismatch",
+                    format!(
+                        "query dimension {} does not match index dimension {}",
+                        query.len(),
+                        idx.dimension
+                    ),
+                ));
+            }
+        }
+        let mut results = Vec::new();
+        for ((l, p), idx) in &self.vector_indexes {
+            if p != property_name {
+                continue;
+            }
+            if let Some(label) = label {
+                if l != label {
+                    continue;
+                }
+            }
+            results.extend(idx.search(query, k));
+        }
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        Ok(results)
+    }
+
+    pub fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        let vector_results = self.vector_search(label, property_name, query, k * 2)?;
+        if vector_results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all_edges: Vec<crate::graph::EdgeTuple> = self
+            .edges
+            .values()
+            .filter(|e| !e.tombstone)
+            .map(|e| (e.from_id.clone(), e.edge_type.clone(), e.to_id.clone()))
+            .collect();
+        let expansion = crate::graph::expand_bounded(
+            all_edges,
+            graph_seeds.to_vec(),
+            max_hops,
+        );
+        let graph_distances: HashMap<String, usize> = expansion.into_iter().collect();
+        let max_vec_dist = vector_results
+            .iter()
+            .map(|(_, d)| *d)
+            .fold(0.0_f32, f32::max)
+            .max(1e-10);
+        let mut scored: Vec<(String, f32)> = vector_results
+            .into_iter()
+            .map(|(node_id, vec_dist)| {
+                let vector_score = 1.0 - (vec_dist / max_vec_dist);
+                let graph_score = graph_distances
+                    .get(&node_id)
+                    .map(|&d| 1.0 / (1.0 + d as f32))
+                    .unwrap_or(0.0);
+                let final_score = (1.0 - alpha) * vector_score + alpha * graph_score;
+                (node_id, final_score)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored)
+    }
+
+    fn auto_index_vectors(&mut self, node: &NodeRecord) {
+        let designations: Vec<((String, String), usize)> = self
+            .vector_designations
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for ((label, property), dimension) in designations {
+            if !node.labels.iter().any(|l| l == &label) {
+                continue;
+            }
+            if let Some(arr) = extract_float_array(&node.properties, &property) {
+                if arr.len() == dimension {
+                    let key = (label, property);
+                    let idx = self
+                        .vector_indexes
+                        .entry(key)
+                        .or_insert_with(|| VectorIndex::new(dimension));
+                    idx.insert(&node.id, &arr);
+                }
+            }
         }
     }
 
@@ -881,14 +1347,14 @@ struct RedCoreManifest {
     updated_at_unix_ms: u128,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct RedCoreSnapshotEnvelope {
     version: u32,
     txn_id: u64,
     graph: GraphSnapshot,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct RedCoreAofFrame {
     magic: String,
     version: u32,
@@ -899,12 +1365,13 @@ struct RedCoreAofFrame {
     mutation: RedCoreMutation,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "op", content = "record", rename_all = "snake_case")]
 enum RedCoreMutation {
     NodeUpsert(NodeRecord),
     EdgeUpsert(EdgeRecord),
     Batch(Vec<RedCoreMutation>),
+    VectorDesignation(VectorDesignation),
 }
 
 impl From<GraphMutation> for RedCoreMutation {
@@ -1148,6 +1615,71 @@ impl RedCoreGraphStore {
         Ok(self.store.property_keys())
     }
 
+    pub fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        self.store
+            .designate_vector_property(label, property_name, dimension)?;
+        let designation = VectorDesignation {
+            label: label.to_string(),
+            property: property_name.to_string(),
+            dimension,
+        };
+        let txn_id = self.last_txn_id + 1;
+        let staged = self.store.clone();
+        let graph_version = staged.stats().version;
+        self.persist_before_publish(
+            txn_id,
+            graph_version,
+            &staged,
+            RedCoreMutation::VectorDesignation(designation),
+        )?;
+        self.last_txn_id = txn_id;
+        Ok(())
+    }
+
+    pub fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store.vector_search(label, property_name, query, k)
+    }
+
+    pub fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.store
+            .hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+    }
+
+    pub fn vector_designations(&self) -> Vec<VectorDesignation> {
+        self.store.vector_designations()
+    }
+
+    pub fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> Vec<(EdgeRecord, NodeRecord)> {
+        self.store
+            .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+    }
+
     pub fn snapshot_now(&mut self) -> GraphStoreResult<()> {
         self.write_snapshot()?;
         self.write_manifest()
@@ -1228,6 +1760,10 @@ impl RedCoreGraphStore {
                     self.apply_recovered_mutation(mutation)?;
                 }
                 Ok(())
+            }
+            RedCoreMutation::VectorDesignation(d) => {
+                self.store
+                    .designate_vector_property(&d.label, &d.property, d.dimension)
             }
         }
     }
@@ -2141,9 +2677,11 @@ impl RedisGraphStore {
                 continue;
             }
             hits.push(NeighborHit {
-                edge_id: edge.id,
+                edge_id: edge.id.clone(),
                 node_id,
-                edge_type: edge.edge_type,
+                edge_type: edge.edge_type.clone(),
+                confidence: edge.confidence,
+                epistemic_type: edge.epistemic_type.clone(),
             });
         }
         Ok(hits)
@@ -2507,6 +3045,19 @@ fn validate_edge_shape(edge: &EdgeRecord) -> GraphStoreResult<()> {
         return Err(GraphStoreError::empty_field("edge.type"));
     }
     Ok(())
+}
+
+fn extract_float_array(properties: &Value, key: &str) -> Option<Vec<f32>> {
+    let arr = properties.get(key)?.as_array()?;
+    let floats: Vec<f32> = arr
+        .iter()
+        .filter_map(|v| v.as_f64().map(|f| f as f32))
+        .collect();
+    if floats.len() == arr.len() {
+        Some(floats)
+    } else {
+        None
+    }
 }
 
 fn normalize_labels(labels: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
@@ -2929,6 +3480,7 @@ mod tests {
     use super::{
         Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, InMemoryGraphStore,
         NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+        VectorDesignation,
     };
 
     #[test]
@@ -2995,6 +3547,8 @@ mod tests {
                 edge_id: "edge:ab".to_string(),
                 node_id: "node:b".to_string(),
                 edge_type: "KNOWS".to_string(),
+                confidence: None,
+                epistemic_type: None,
             }]
         );
         assert_eq!(
@@ -3258,6 +3812,9 @@ mod tests {
                 properties: json!({}),
                 version: 9,
                 tombstone: false,
+                confidence: None,
+                epistemic_type: None,
+                provenance: None,
             },
         );
 
@@ -3689,6 +4246,196 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{label}-{unique}"))
+    }
+
+    #[test]
+    fn vector_designate_and_search_returns_nearest() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 3)
+            .unwrap();
+
+        for (id, vec) in [
+            ("doc:1", vec![1.0_f32, 0.0, 0.0]),
+            ("doc:2", vec![0.0, 1.0, 0.0]),
+            ("doc:3", vec![0.7, 0.7, 0.0]),
+        ] {
+            store
+                .upsert_node(NodeRecord::new(
+                    id,
+                    ["Doc"],
+                    json!({ "embedding": vec }),
+                ))
+                .unwrap();
+        }
+
+        let results = store
+            .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 2)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "doc:1");
+        assert!(results[0].1 < 0.01, "exact match should have near-zero distance");
+        assert_eq!(results[1].0, "doc:3");
+    }
+
+    #[test]
+    fn vector_search_dimension_mismatch_errors() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 3)
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:1",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0, 0.0] }),
+            ))
+            .unwrap();
+
+        let err = store
+            .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 2)
+            .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("dimension"), "error should mention dimension: {msg}");
+    }
+
+    #[test]
+    fn vector_auto_index_on_upsert() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:b",
+                ["Doc"],
+                json!({ "embedding": [0.0, 1.0] }),
+            ))
+            .unwrap();
+
+        let results = store
+            .vector_search(Some("Doc"), "embedding", &[0.0, 1.0], 1)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "doc:b");
+    }
+
+    #[test]
+    fn hybrid_search_blends_vector_and_graph() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:b",
+                ["Doc"],
+                json!({ "embedding": [0.9, 0.1] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:c",
+                ["Doc"],
+                json!({ "embedding": [0.0, 1.0] }),
+            ))
+            .unwrap();
+
+        store
+            .upsert_edge(EdgeRecord::new("e1", "doc:c", "LINKS", "doc:a", json!({})))
+            .unwrap();
+
+        let results = store
+            .hybrid_search(
+                Some("Doc"),
+                "embedding",
+                &[1.0, 0.0],
+                3,
+                &["doc:c".to_string()],
+                2,
+                0.8,
+            )
+            .unwrap();
+
+        assert!(!results.is_empty());
+        let ids: Vec<&str> = results.iter().map(|r| r.0.as_str()).collect();
+        assert!(
+            ids.contains(&"doc:a"),
+            "doc:a should appear (near vector + reachable from seed)"
+        );
+    }
+
+    #[test]
+    fn vector_designations_list() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 384)
+            .unwrap();
+        store
+            .designate_vector_property("Claim", "vector", 128)
+            .unwrap();
+
+        let desigs = store.vector_designations();
+        assert_eq!(desigs.len(), 2);
+        let labels: Vec<&str> = desigs.iter().map(|d| d.label.as_str()).collect();
+        assert!(labels.contains(&"Doc"));
+        assert!(labels.contains(&"Claim"));
+    }
+
+    #[test]
+    fn redcore_persists_vector_designation_through_reopen() {
+        let data_dir = unique_test_dir("vec-aof");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .designate_vector_property("Doc", "embedding", 3)
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "doc:1",
+                    ["Doc"],
+                    json!({ "embedding": [1.0, 0.0, 0.0] }),
+                ))
+                .unwrap();
+        }
+
+        {
+            let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+            let desigs = store.vector_designations();
+            assert_eq!(desigs.len(), 1);
+            assert_eq!(desigs[0].label, "Doc");
+            assert_eq!(desigs[0].dimension, 3);
+
+            let results = store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, "doc:1");
+        }
+
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[cfg(feature = "redis-store")]

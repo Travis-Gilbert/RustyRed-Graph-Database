@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde_json::json;
 use thg_core::store::RedisThgStore;
 use thg_core::{
-    sanitize_tenant_segment, EdgeRecord, GraphMutation, GraphMutationBatch, GraphRebuildReport,
-    GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction, GraphWriteResult,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
-    RedCoreOptions, RedisGraphStore, VerifyReport,
+    sanitize_tenant_segment, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
+    GraphRebuildReport, GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction,
+    GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    RedCoreGraphStore, RedCoreOptions, RedisGraphStore, VectorDesignation, VerifyReport,
 };
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
@@ -353,6 +353,65 @@ impl RedCoreTenantExecutor {
         self.with_snapshot(|snapshot| snapshot.property_keys())
     }
 
+    pub fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        self.with_snapshot(|snapshot| {
+            snapshot.epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+        })
+    }
+
+    pub fn designate_vector_property(
+        &self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        let mut writer = self.lock_writer()?;
+        writer.designate_vector_property(label, property_name, dimension)?;
+        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        *self.committed_snapshot.write().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_snapshot_lock_poisoned",
+                "RedCore committed snapshot lock poisoned",
+            )
+        })? = committed_snapshot;
+        Ok(())
+    }
+
+    pub fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        self.with_snapshot(|snapshot| snapshot.vector_designations())
+    }
+
+    pub fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.with_snapshot(|snapshot| snapshot.vector_search(label, property_name, query, k))?
+    }
+
+    pub fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.with_snapshot(|snapshot| {
+            snapshot.hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+        })?
+    }
+
     fn lock_writer(&self) -> GraphStoreResult<std::sync::MutexGuard<'_, RedCoreGraphStore>> {
         self.writer.lock().map_err(|_| {
             GraphStoreError::new(
@@ -498,6 +557,88 @@ impl TenantGraphStore {
             Self::Redis(store) => store.property_keys(),
         }
     }
+
+    pub fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        match self {
+            Self::RedCore(store) => {
+                store.epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+            }
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "epistemic_neighbors is not supported on Redis graph stores",
+            )),
+        }
+    }
+
+    pub fn designate_vector_property(
+        &self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        match self {
+            Self::RedCore(store) => {
+                store.designate_vector_property(label, property_name, dimension)
+            }
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "designate_vector_property is not supported on Redis graph stores",
+            )),
+        }
+    }
+
+    pub fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        match self {
+            Self::RedCore(store) => store.vector_designations(),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "vector_designations is not supported on Redis graph stores",
+            )),
+        }
+    }
+
+    pub fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        match self {
+            Self::RedCore(store) => store.vector_search(label, property_name, query, k),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "vector_search is not supported on Redis graph stores",
+            )),
+        }
+    }
+
+    pub fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        match self {
+            Self::RedCore(store) => {
+                store.hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+            }
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "unsupported_operation",
+                "hybrid_search is not supported on Redis graph stores",
+            )),
+        }
+    }
 }
 
 impl McpGraphBackend for TenantGraphStore {
@@ -535,6 +676,61 @@ impl McpGraphBackend for TenantGraphStore {
 
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         TenantGraphStore::property_keys(self)
+    }
+
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        TenantGraphStore::vector_designations(self)
+    }
+
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        TenantGraphStore::designate_vector_property(self, label, property_name, dimension)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        TenantGraphStore::vector_search(self, label, property_name, query, k)
+    }
+
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        TenantGraphStore::hybrid_search(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            alpha,
+        )
+    }
+
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        TenantGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth)
     }
 }
 

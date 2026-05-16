@@ -15,6 +15,8 @@ const SUPPORTED_CACHE_KINDS: &[&str] = &[
     "retrieval_plan",
     "semantic_answer_candidate",
     "modal_parse_result",
+    "vector_search_result",
+    "epistemic_traversal",
 ];
 
 #[derive(Clone, Debug, Deserialize)]

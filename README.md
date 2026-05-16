@@ -1,14 +1,48 @@
-# theseus_native / Rusty Red Graph Database
+# Rusty Red Graph Database
+
+Embedded property graph database with a first-class MCP agent port,
+multi-tenancy, HNSW vector search, confidence-weighted epistemic edges,
+and a graph-version-aware AI cache. Written in Rust.
+
+Designed for AI agents and GraphRAG workloads, not for replacing Neo4j.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
 
 Template ID pending: after creating or publishing the Railway template, replace `RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID` in the badge URL with the Railway template code.
 
-Rust + PyO3 accelerators for Theseus retrieval, plus the Rusty Red Graph
-Database runtime. `push_ppr` remains the retrieval accelerator; `thg-core` is
-the shared Database-as-Harness command executor and graph-store core;
-`thg-product-server` is the Railway/product HTTP server for Rusty Red; and
-`thg-mcp` is the first-class MCP agent port over the graph APIs.
+## What Rusty Red does
+
+- **Graph storage** with AOF/snapshot persistence, per-tenant isolation, single-writer serializable commits, and committed read snapshots
+- **HNSW vector search** on node properties via `instant-distance`, with hybrid scoring that blends vector similarity and graph proximity
+- **Epistemic edge types** (Supports, Contradicts, Tension, Derives, Cites) with confidence-weighted traversal across configurable hop depth
+- **MCP agent port** with scoped auth tokens, read-only and read-write modes, tool annotations, and structured tool/resource/prompt surfaces
+- **Graph-version-aware cache** (10 kinds) that detects stale entries when the underlying graph mutates
+- **Cypher subset** for read-only queries: single-hop MATCH with label/property filters, RETURN with aliases, LIMIT
+- **50x to 400x** faster Personalized PageRank than Python (ACL local-push algorithm, exposed via PyO3)
+
+## What you can't do yet
+
+These are on the roadmap, in roughly this priority order:
+
+1. Multi-hop Cypher patterns (`MATCH (a)-[:T*1..3]->(b)`) and path projection
+2. Write clauses in Cypher (`CREATE`, `MERGE`, `SET`, `DELETE`)
+3. Aggregations (`COUNT`, `SUM`, `AVG`) and `WITH` pipeline stages
+4. Full-text search (BM25 via tantivy)
+5. Transaction API on the HTTP surface (`/v1/transactions/begin|commit|rollback`)
+6. Bulk loader (`LOAD CSV` / `COPY FROM`)
+7. Graph algorithms over HTTP/MCP (PPR, connected components, community detection)
+8. Spatial indexing (H3/S2)
+
+## Crate structure
+
+| Crate | Purpose |
+|-------|---------|
+| `thg-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
+| `thg-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
+| `thg-product-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
+| `thg-server` | Standalone THG command server (non-product) |
+| `thg-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
+| root crate | PyO3 bindings for `push_ppr` and `ThgCoreExecutor` |
 
 The Rusty Red repository at
 `https://github.com/Travis-Gilbert/rusty-red-graph-database` is maintained as a
@@ -28,28 +62,14 @@ maturin develop --release
 
 This builds an `abi3-py312` wheel and installs it into the active Python environment. After this, `from theseus_native import push_ppr` works in any Python 3.12+ interpreter that shares the venv.
 
-## Rusty Red Graph Database product server
+## Product server
 
-Rusty Red is the productized THG runtime profile: it keeps the THG command model
-for existing harness flows while adding first-class graph node, edge, adjacency,
-exact scalar property index, GraphCache, stats, verify, and MCP routes. By
-default, it runs in `RUSTY_RED_MODE=embedded` with RedCore RAM-first storage and
-local AOF/snapshot persistence.
+The product server runs in `RUSTY_RED_MODE=embedded` with RedCore
+RAM-first storage and local AOF/snapshot persistence. It exposes graph
+operations, vector search, epistemic traversal, Cypher queries, and the
+graph-version cache over HTTP and MCP.
 
-It is not a raw Redis protocol, RedisGraph compatibility layer, FalkorDB
-replacement, or complete OpenCypher/GQL engine yet. `RUSTY_RED_MODE=redis` keeps
-legacy run/context THG state commands.
-
-It is also not release-ready as a full database yet. The current embedded
-RedCore path has AOF/snapshot recovery tests, staged `GraphMutationBatch` /
-`GraphTransaction` commits, pre-publish durability guards for AOF, snapshot, and
-manifest write failures, per-tenant single-writer execution, committed read
-snapshots, an internal read barrier, strict ACID config enforcement,
-per-directory `.redcore.lock` locking, fsynced temp/rename/dir snapshot and
-manifest writes, torn AOF tail truncation, previous-snapshot fallback with
-AOF replay, and rebuild-indexes admin tooling over canonical graph records.
-Railway restart/no-public-port evidence and the broader query/cache/search gates
-remain follow-up release gates.
+`RUSTY_RED_MODE=redis` is available for legacy THG state commands only.
 
 Run the product server locally:
 
@@ -102,17 +122,30 @@ POST /v1/tenants/{tenant_id}/graph/neighbors
 GET  /v1/tenants/{tenant_id}/graph/stats
 GET  /v1/tenants/{tenant_id}/graph/verify
 POST /v1/tenants/{tenant_id}/graph/rebuild-indexes
+POST /v1/tenants/{tenant_id}/graph/vector/search
+POST /v1/tenants/{tenant_id}/graph/vector/hybrid
+POST /v1/tenants/{tenant_id}/graph/vector/designate
+POST /v1/tenants/{tenant_id}/graph/epistemic/neighbors
 POST /v1/tenants/{tenant_id}/context/pack
 ```
 
-The shared THG command API also exposes the Rusty Red graph-store core through
-`THG.GRAPH.NODE.UPSERT`, `THG.GRAPH.EDGE.UPSERT`,
-`THG.GRAPH.NODES.QUERY`, `THG.GRAPH.NEIGHBORS`, `THG.GRAPH.STATS`,
-`THG.GRAPH.VERIFY`, and `THG.GRAPH.REBUILD_INDEXES`. This lets Context
-Theorem adopt Rusty Red-grade graph
-records, exact scalar property indexes, adjacency traversal, and verification
-through the existing THG command surface instead of depending on a separate
-runtime name. In this slice, run/context state commands remain Redis-mode.
+### MCP tools
+
+The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/call`):
+
+| Tool | Description |
+|------|-------------|
+| `thg.graph.node.upsert` | Create or update a node |
+| `thg.graph.edge.upsert` | Create or update an edge |
+| `thg.graph.nodes.query` | Query nodes by label and properties |
+| `thg.graph.neighbors` | Adjacency traversal |
+| `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
+| `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
+| `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
+| `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
+| `thg.graph.stats` | Graph statistics |
+| `thg.graph.verify` | Verify index integrity |
+| `thg.graph.rebuild_indexes` | Rebuild all derived indexes (admin) |
 
 The public query surface is now split cleanly:
 

@@ -15,12 +15,15 @@ pub mod store;
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
-pub use graph::{expand_bounded, paths_shortest, EdgeTuple};
+pub use graph::{
+    expand_bounded, expand_bounded_weighted, paths_shortest, paths_shortest_weighted, EdgeTuple,
+};
 pub use graph_store::{
-    sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery,
-    NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreStatus, VerifyProblem,
+    sanitize_tenant_segment, Direction, EdgeRecord, EpistemicType, GraphMutation,
+    GraphMutationBatch, GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
+    GraphStoreResult, GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, Provenance, RedCoreDurability, RedCoreGraphStore,
+    RedCoreOptions, RedCoreStatus, VectorDesignation, VectorIndex, VectorPoint, VerifyProblem,
     VerifyReport,
 };
 #[cfg(feature = "redis-store")]

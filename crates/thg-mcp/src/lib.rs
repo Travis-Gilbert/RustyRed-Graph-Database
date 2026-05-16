@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thg_core::{
-    Direction, EdgeRecord, GraphStats, GraphStoreError, GraphStoreResult, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, VerifyReport,
+    Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError, GraphStoreResult,
+    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
+    VectorDesignation, VerifyReport,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -18,6 +19,37 @@ pub trait McpGraphBackend {
     fn labels(&self) -> GraphStoreResult<Vec<String>>;
     fn edge_types(&self) -> GraphStoreResult<Vec<String>>;
     fn property_keys(&self) -> GraphStoreResult<Vec<String>>;
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()>;
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>>;
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>>;
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>>;
 }
 
 pub trait McpGraphProvider {
@@ -265,7 +297,7 @@ fn call_tool<P: McpGraphProvider>(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let tenant = tenant_from_args(&arguments, config);
-    let backend = provider.backend_for_tenant(&tenant)?;
+    let mut backend = provider.backend_for_tenant(&tenant)?;
 
     let payload = match name {
         "thg.graph.neighbors" => {
@@ -283,6 +315,129 @@ fn call_tool<P: McpGraphProvider>(
         "thg.graph.index_status" => index_status_payload(&tenant, &backend)?,
         "thg.graph.explain" => explain_payload(&tenant, &arguments),
         "thg.graph.query" => query_payload(&tenant, &backend, &arguments)?,
+        "thg.vector.search" => {
+            let property = arguments
+                .get("property")
+                .and_then(Value::as_str)
+                .ok_or_else(|| McpError::invalid_params("thg.vector.search requires property"))?;
+            let query = parse_f32_array(&arguments, "query")?;
+            let k = arguments
+                .get("k")
+                .and_then(Value::as_u64)
+                .unwrap_or(10) as usize;
+            let label = arguments.get("label").and_then(Value::as_str);
+            let results = backend.vector_search(label, property, &query, k)?;
+            json!({
+                "tenant": tenant,
+                "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
+                "stats": { "returned": results.len(), "k": k }
+            })
+        }
+        "thg.vector.hybrid" => {
+            let property = arguments
+                .get("property")
+                .and_then(Value::as_str)
+                .ok_or_else(|| McpError::invalid_params("thg.vector.hybrid requires property"))?;
+            let query = parse_f32_array(&arguments, "query")?;
+            let k = arguments
+                .get("k")
+                .and_then(Value::as_u64)
+                .unwrap_or(10) as usize;
+            let label = arguments.get("label").and_then(Value::as_str);
+            let graph_seeds: Vec<String> = arguments
+                .get("graph_seeds")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .ok_or_else(|| {
+                    McpError::invalid_params("thg.vector.hybrid requires graph_seeds")
+                })?;
+            let max_hops = arguments
+                .get("max_hops")
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as usize;
+            let alpha = arguments
+                .get("alpha")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.5) as f32;
+            let results =
+                backend.hybrid_search(label, property, &query, k, &graph_seeds, max_hops, alpha)?;
+            json!({
+                "tenant": tenant,
+                "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
+                "stats": { "returned": results.len(), "k": k, "alpha": alpha, "max_hops": max_hops }
+            })
+        }
+        "thg.vector.designate" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "mcp_read_only",
+                "message": "Write tools are unavailable while read-only mode is active."
+            })))
+        }
+        "thg.vector.designate" => {
+            let label = arguments
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| McpError::invalid_params("thg.vector.designate requires label"))?;
+            let property = arguments
+                .get("property")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    McpError::invalid_params("thg.vector.designate requires property")
+                })?;
+            let dimension = arguments
+                .get("dimension")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    McpError::invalid_params("thg.vector.designate requires dimension")
+                })? as usize;
+            backend.designate_vector_property(label, property, dimension)?;
+            json!({
+                "tenant": tenant,
+                "designated": { "label": label, "property": property, "dimension": dimension }
+            })
+        }
+        "thg.epistemic.neighbors" => {
+            let node_id = arguments
+                .get("node_id")
+                .or_else(|| arguments.get("nodeId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    McpError::invalid_params("thg.epistemic.neighbors requires node_id")
+                })?;
+            let epistemic_types: Option<Vec<EpistemicType>> = arguments
+                .get("epistemic_types")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.parse::<EpistemicType>())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .map_err(McpError::from)?;
+            let min_confidence = arguments.get("min_confidence").and_then(Value::as_f64);
+            let max_depth = arguments
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize);
+            let results = backend.epistemic_neighbors(
+                node_id,
+                epistemic_types.as_deref(),
+                min_confidence,
+                max_depth,
+            )?;
+            json!({
+                "tenant": tenant,
+                "node_id": node_id,
+                "results": results.iter().map(|(edge, node)| json!({"edge": edge, "node": node})).collect::<Vec<_>>(),
+                "stats": { "returned": results.len() }
+            })
+        }
         "thg.admin.verify" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
@@ -599,6 +754,22 @@ fn tenant_from_args(arguments: &Value, config: &McpServerConfig) -> String {
         .unwrap_or_else(|| config.default_tenant.clone())
 }
 
+fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|v| {
+                    v.as_f64()
+                        .map(|f| f as f32)
+                        .ok_or_else(|| McpError::invalid_params(format!("{key} must be an array of numbers")))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|| Err(McpError::invalid_params(format!("{key} is required and must be an array of numbers"))))
+}
+
 fn tool_result(payload: Value) -> Value {
     json!({
         "content": [{
@@ -768,6 +939,73 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
     ];
+    tools.push(tool(
+        "thg.vector.search",
+        "Run a pure vector similarity search using HNSW indexes. Returns top-k nearest nodes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "property": { "type": "string", "description": "Name of the vector property to search" },
+                "query": { "type": "array", "items": { "type": "number" }, "description": "Query vector" },
+                "k": { "type": "integer", "default": 10 },
+                "label": { "type": "string", "description": "Optional label filter" }
+            },
+            "required": ["property", "query"]
+        }),
+    ));
+    tools.push(tool(
+        "thg.vector.hybrid",
+        "Hybrid search blending vector similarity with graph proximity. Graph seeds anchor the graph-distance component.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "property": { "type": "string" },
+                "query": { "type": "array", "items": { "type": "number" } },
+                "k": { "type": "integer", "default": 10 },
+                "label": { "type": "string" },
+                "graph_seeds": { "type": "array", "items": { "type": "string" }, "description": "Node IDs to seed graph distance calculation" },
+                "max_hops": { "type": "integer", "default": 3 },
+                "alpha": { "type": "number", "default": 0.5, "description": "Blend weight: 0.0 = pure vector, 1.0 = pure graph" }
+            },
+            "required": ["property", "query", "graph_seeds"]
+        }),
+    ));
+    tools.push(tool(
+        "thg.epistemic.neighbors",
+        "Traverse epistemic-typed edges (supports, contradicts, refines, etc.) with optional confidence filtering.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "node_id": { "type": "string" },
+                "epistemic_types": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["supports", "contradicts", "tension", "derives", "cites"] }
+                },
+                "min_confidence": { "type": "number" },
+                "max_depth": { "type": "integer", "default": 1 }
+            },
+            "required": ["node_id"]
+        }),
+    ));
+    if !config.read_only {
+        tools.push(tool_write(
+            "thg.vector.designate",
+            "Designate a node property as a vector field with a fixed dimension. Creates HNSW index for that property.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "label": { "type": "string", "description": "Node label to attach the vector designation to" },
+                    "property": { "type": "string", "description": "Property name that holds vector data" },
+                    "dimension": { "type": "integer", "description": "Vector dimensionality" }
+                },
+                "required": ["label", "property", "dimension"]
+            }),
+        ));
+    }
     if config.allow_admin && !config.read_only {
         tools.push(tool(
             "thg.admin.verify",
@@ -798,6 +1036,19 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
         "inputSchema": input_schema,
         "annotations": {
             "readOnlyHint": true,
+            "destructiveHint": false,
+            "openWorldHint": false
+        }
+    })
+}
+
+fn tool_write(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": false,
             "destructiveHint": false,
             "openWorldHint": false
         }
@@ -898,6 +1149,61 @@ impl McpGraphBackend for InMemoryGraphStore {
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         Ok(InMemoryGraphStore::property_keys(self))
     }
+
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        Ok(InMemoryGraphStore::vector_designations(self))
+    }
+
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        InMemoryGraphStore::designate_vector_property(self, label, property_name, dimension)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        InMemoryGraphStore::vector_search(self, label, property_name, query, k)
+    }
+
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        InMemoryGraphStore::hybrid_search(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            alpha,
+        )
+    }
+
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        Ok(InMemoryGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth))
+    }
 }
 
 impl McpGraphBackend for RedCoreGraphStore {
@@ -935,6 +1241,61 @@ impl McpGraphBackend for RedCoreGraphStore {
 
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         RedCoreGraphStore::property_keys(self)
+    }
+
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        Ok(RedCoreGraphStore::vector_designations(self))
+    }
+
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        RedCoreGraphStore::designate_vector_property(self, label, property_name, dimension)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        RedCoreGraphStore::vector_search(self, label, property_name, query, k)
+    }
+
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        RedCoreGraphStore::hybrid_search(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            alpha,
+        )
+    }
+
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        Ok(RedCoreGraphStore::epistemic_neighbors(self, node_id, epistemic_types, min_confidence, max_depth))
     }
 }
 
@@ -974,6 +1335,67 @@ impl McpGraphBackend for thg_core::RedisGraphStore {
 
     fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
         thg_core::RedisGraphStore::property_keys(self)
+    }
+
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "Vector designations are not available on the Redis backend",
+        ))
+    }
+
+    fn designate_vector_property(
+        &mut self,
+        _label: &str,
+        _property_name: &str,
+        _dimension: usize,
+    ) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "Vector designation is not available on the Redis backend",
+        ))
+    }
+
+    fn vector_search(
+        &self,
+        _label: Option<&str>,
+        _property_name: &str,
+        _query: &[f32],
+        _k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "Vector search is not available on the Redis backend",
+        ))
+    }
+
+    fn hybrid_search(
+        &self,
+        _label: Option<&str>,
+        _property_name: &str,
+        _query: &[f32],
+        _k: usize,
+        _graph_seeds: &[String],
+        _max_hops: usize,
+        _alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "Hybrid search is not available on the Redis backend",
+        ))
+    }
+
+    fn epistemic_neighbors(
+        &self,
+        _node_id: &str,
+        _epistemic_types: Option<&[EpistemicType]>,
+        _min_confidence: Option<f64>,
+        _max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "Epistemic neighbors are not available on the Redis backend",
+        ))
     }
 }
 
