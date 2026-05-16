@@ -1,5 +1,6 @@
 use axum::{
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Query, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -2304,28 +2305,36 @@ async fn graph_algorithm_pagerank(
 
 // ===== Phase 3: Bulk loader =====
 //
-// JSONL-only for now (one record per line). CSV with headers is straightforward
-// to add later; JSONL keeps the contract simple and avoids ambiguity around
-// quoting/escaping for nested properties.
+// Streaming JSONL + CSV. The handler consumes the HTTP body as it arrives,
+// splits on newlines via `crate::bulk::LineSplitter`, parses each line via
+// the parsers in `crate::bulk`, and flushes mutations in `batch_size` chunks
+// (default 500) so a large body never blocks the worker on a single
+// transaction. CSV branches use `text/csv` Content-Type and read the first
+// row as header (or `?headers=...` query parameter); edges require
+// `?from_col=...&to_col=...` (or default JSONL fields).
 
-#[derive(Debug, Deserialize)]
-struct BulkNodesBody {
-    /// JSONL: one node per line. Each line must be `{"id": "...", "labels": [...], "properties": {...}}`.
-    jsonl: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BulkEdgesBody {
-    /// JSONL: one edge per line. Each line must be
-    /// `{"id": "...", "from_id": "...", "to_id": "...", "edge_type": "...", "properties": {...}}`.
-    jsonl: String,
+#[derive(Debug, Default, Deserialize)]
+pub struct BulkQuery {
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Comma-separated header list. If absent and Content-Type is text/csv,
+    /// the first row of the body is treated as the header row.
+    #[serde(default)]
+    pub headers: Option<String>,
+    /// CSV-only: name of the source column for edges.
+    #[serde(default)]
+    pub from_col: Option<String>,
+    /// CSV-only: name of the target column for edges.
+    #[serde(default)]
+    pub to_col: Option<String>,
 }
 
 async fn graph_bulk_nodes(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<BulkNodesBody>,
+    Query(query): Query<BulkQuery>,
+    body: Body,
 ) -> impl IntoResponse {
     if let Err(status) = require_scope(
         &headers,
@@ -2339,55 +2348,144 @@ async fn graph_bulk_nodes(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/jsonl")
+        .to_string();
+    let is_csv = content_type.starts_with("text/csv");
+
+    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bulk_body_read_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let batch_size = query.batch_size.unwrap_or(500).max(1);
+    let mut splitter = crate::bulk::LineSplitter::default();
+    let mut produced_lines = splitter.feed(&bytes);
+    produced_lines.extend(splitter.flush());
+
+    let mut csv_parser: Option<crate::bulk::CsvNodeParser> = None;
+    if is_csv {
+        if let Some(header_str) = query.headers.as_deref() {
+            csv_parser = Some(crate::bulk::CsvNodeParser::new(
+                header_str.split(',').map(|s| s.trim().to_string()).collect(),
+            ));
+        } else if !produced_lines.is_empty() {
+            let first = produced_lines.remove(0);
+            csv_parser = Some(crate::bulk::CsvNodeParser::new(
+                first.split(',').map(|s| s.trim().to_string()).collect(),
+            ));
+        }
+    }
+
     let mut inserted = 0usize;
     let mut failed = 0usize;
     let mut errors: Vec<Value> = Vec::new();
-    for (line_no, line) in body.jsonl.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parsed: Result<NodeRecord, _> = serde_json::from_str(trimmed);
-        let node = match parsed {
-            Ok(node) => node,
-            Err(err) => {
-                failed += 1;
-                if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": err.to_string() }));
-                }
-                continue;
-            }
+    let mut batches = 0usize;
+    let mut pending: Vec<thg_core::NodeRecord> = Vec::with_capacity(batch_size);
+
+    for (line_no, line) in produced_lines.iter().enumerate() {
+        let parsed = if is_csv {
+            csv_parser
+                .as_ref()
+                .map(|parser| parser.parse(line))
+                .unwrap_or_else(|| Err("csv parser not initialized".into()))
+        } else {
+            crate::bulk::jsonl_parse_node(line)
         };
-        match store.upsert_node(node.clone()) {
-            Ok(_) => {
-                inserted += 1;
-                state.observability.record_mutation();
-                state.maybe_index_node_spatially(&tenant_id, &node);
-                state.maybe_index_node_fulltext(&tenant_id, &node);
+        match parsed {
+            Ok(node) => {
+                pending.push(node);
+                if pending.len() >= batch_size {
+                    flush_node_batch(
+                        &mut store,
+                        &state,
+                        &tenant_id,
+                        &mut pending,
+                        &mut inserted,
+                        &mut failed,
+                        &mut errors,
+                    );
+                    batches += 1;
+                }
             }
             Err(err) => {
                 failed += 1;
                 if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": format!("{err:?}") }));
+                    errors.push(json!({ "line": line_no + 1, "error": err }));
                 }
             }
         }
     }
+
+    if !pending.is_empty() {
+        flush_node_batch(
+            &mut store,
+            &state,
+            &tenant_id,
+            &mut pending,
+            &mut inserted,
+            &mut failed,
+            &mut errors,
+        );
+        batches += 1;
+    }
+
     Json(json!({
         "ok": failed == 0,
         "tenant": tenant_id,
         "inserted": inserted,
         "failed": failed,
         "errors": errors,
+        "batches": batches,
     }))
     .into_response()
+}
+
+fn flush_node_batch(
+    store: &mut TenantGraphStore,
+    state: &AppState,
+    tenant_id: &str,
+    pending: &mut Vec<thg_core::NodeRecord>,
+    inserted: &mut usize,
+    failed: &mut usize,
+    errors: &mut Vec<Value>,
+) {
+    for node in pending.drain(..) {
+        match store.upsert_node(node.clone()) {
+            Ok(_) => {
+                *inserted += 1;
+                state.observability.record_mutation();
+                state.maybe_index_node_spatially(tenant_id, &node);
+                state.maybe_index_node_fulltext(tenant_id, &node);
+            }
+            Err(err) => {
+                *failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "node_id": node.id, "error": format!("{err:?}") }));
+                }
+            }
+        }
+    }
 }
 
 async fn graph_bulk_edges(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<BulkEdgesBody>,
+    Query(query): Query<BulkQuery>,
+    body: Body,
 ) -> impl IntoResponse {
     if let Err(status) = require_scope(
         &headers,
@@ -2401,46 +2499,157 @@ async fn graph_bulk_edges(
         Ok(s) => s,
         Err(error) => return store_unavailable_response(error),
     };
-    let mut inserted = 0usize;
-    let mut failed = 0usize;
-    let mut errors: Vec<Value> = Vec::new();
-    for (line_no, line) in body.jsonl.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/jsonl")
+        .to_string();
+    let is_csv = content_type.starts_with("text/csv");
+
+    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bulk_body_read_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
         }
-        let parsed: Result<EdgeRecord, _> = serde_json::from_str(trimmed);
-        let edge = match parsed {
-            Ok(edge) => edge,
-            Err(err) => {
-                failed += 1;
-                if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": err.to_string() }));
+    };
+
+    let batch_size = query.batch_size.unwrap_or(500).max(1);
+    let mut splitter = crate::bulk::LineSplitter::default();
+    let mut produced_lines = splitter.feed(&bytes);
+    produced_lines.extend(splitter.flush());
+
+    let mut csv_parser: Option<crate::bulk::CsvEdgeParser> = None;
+    if is_csv {
+        let from_col = query.from_col.as_deref().unwrap_or("from_id");
+        let to_col = query.to_col.as_deref().unwrap_or("to_id");
+        if let Some(header_str) = query.headers.as_deref() {
+            let header_vec: Vec<String> =
+                header_str.split(',').map(|s| s.trim().to_string()).collect();
+            match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
+                Ok(parser) => csv_parser = Some(parser),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "bulk_csv_header_invalid",
+                            "message": err,
+                        })),
+                    )
+                        .into_response();
                 }
-                continue;
             }
-        };
-        match store.upsert_edge(edge) {
-            Ok(_) => {
-                inserted += 1;
-                state.observability.record_mutation();
-            }
-            Err(err) => {
-                failed += 1;
-                if errors.len() < 32 {
-                    errors.push(json!({ "line": line_no + 1, "error": format!("{err:?}") }));
+        } else if !produced_lines.is_empty() {
+            let first = produced_lines.remove(0);
+            let header_vec: Vec<String> =
+                first.split(',').map(|s| s.trim().to_string()).collect();
+            match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
+                Ok(parser) => csv_parser = Some(parser),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "bulk_csv_header_invalid",
+                            "message": err,
+                        })),
+                    )
+                        .into_response();
                 }
             }
         }
     }
+
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut batches = 0usize;
+    let mut pending: Vec<thg_core::EdgeRecord> = Vec::with_capacity(batch_size);
+
+    for (line_no, line) in produced_lines.iter().enumerate() {
+        let parsed = if is_csv {
+            csv_parser
+                .as_ref()
+                .map(|parser| parser.parse(line))
+                .unwrap_or_else(|| Err("csv parser not initialized".into()))
+        } else {
+            crate::bulk::jsonl_parse_edge(line)
+        };
+        match parsed {
+            Ok(edge) => {
+                pending.push(edge);
+                if pending.len() >= batch_size {
+                    flush_edge_batch(
+                        &mut store,
+                        &state,
+                        &mut pending,
+                        &mut inserted,
+                        &mut failed,
+                        &mut errors,
+                    );
+                    batches += 1;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "line": line_no + 1, "error": err }));
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        flush_edge_batch(
+            &mut store,
+            &state,
+            &mut pending,
+            &mut inserted,
+            &mut failed,
+            &mut errors,
+        );
+        batches += 1;
+    }
+
     Json(json!({
         "ok": failed == 0,
         "tenant": tenant_id,
         "inserted": inserted,
         "failed": failed,
         "errors": errors,
+        "batches": batches,
     }))
     .into_response()
+}
+
+fn flush_edge_batch(
+    store: &mut TenantGraphStore,
+    state: &AppState,
+    pending: &mut Vec<thg_core::EdgeRecord>,
+    inserted: &mut usize,
+    failed: &mut usize,
+    errors: &mut Vec<Value>,
+) {
+    for edge in pending.drain(..) {
+        match store.upsert_edge(edge.clone()) {
+            Ok(_) => {
+                *inserted += 1;
+                state.observability.record_mutation();
+            }
+            Err(err) => {
+                *failed += 1;
+                if errors.len() < 32 {
+                    errors.push(json!({ "edge_id": edge.id, "error": format!("{err:?}") }));
+                }
+            }
+        }
+    }
 }
 
 // ===== Phase 5: Full-text endpoints =====
@@ -2723,7 +2932,7 @@ async fn graph_algorithm_communities(
 mod tests {
     use std::collections::BTreeMap;
 
-    use axum::body::to_bytes;
+    use axum::body::{to_bytes, Body};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
@@ -2731,9 +2940,10 @@ mod tests {
 
     use super::{
         execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        graph_error_status, is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
-        required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody,
+        graph_bulk_edges, graph_bulk_nodes, graph_error_status, is_cache_command, is_graph_command,
+        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
+        transaction_commit, transaction_rollback, BulkQuery, PublicCypherBody,
+        TransactionBeginBody, TransactionMutationBody,
     };
     use crate::{
         config::{Config, StorageMode},
@@ -3107,5 +3317,160 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let payload = response_payload_json(response).await;
         assert_eq!(payload["error"], "missing_tx_id");
+    }
+
+    // ===== Phase 3-B: streaming bulk loader tests =====
+
+    #[tokio::test]
+    async fn bulk_nodes_jsonl_streaming_inserts_two_nodes() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"n2\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        let response = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+        assert_eq!(payload["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_nodes_csv_streaming_uses_first_row_headers() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "id,label,path\nnA,Doc,src/a.rs\nnB,Doc,src/b.rs\n".to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("text/csv"));
+        let response = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_nodes_respects_explicit_batch_size_one_per_batch() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"n2\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        let response = graph_bulk_nodes(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery {
+                batch_size: Some(1),
+                headers: None,
+                from_col: None,
+                to_col: None,
+            }),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+        assert_eq!(payload["batches"], 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_jsonl_streaming_inserts_one_edge() {
+        let state = memory_product_state();
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers.clone(),
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let edges_body = Body::from(
+            "{\"id\":\"e1\",\"from_id\":\"a\",\"to_id\":\"b\",\"type\":\"CITES\",\"properties\":{}}\n"
+                .to_string(),
+        );
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            edges_body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_csv_requires_from_to_columns() {
+        let state = memory_product_state();
+        // seed source/target nodes first
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut nh = HeaderMap::new();
+        nh.insert("Content-Type", HeaderValue::from_static("application/jsonl"));
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edges".to_string()),
+            nh,
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let body = Body::from("id,src,dst,type\ne1,a,b,CITES\n".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("text/csv"));
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery {
+                batch_size: None,
+                headers: None,
+                from_col: Some("src".into()),
+                to_col: Some("dst".into()),
+            }),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 1);
     }
 }
