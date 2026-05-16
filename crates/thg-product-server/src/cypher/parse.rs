@@ -105,6 +105,7 @@ pub fn parse_cypher_pest(
         where_filter,
         returns,
         limit,
+        writes: Vec::new(),
     })
 }
 

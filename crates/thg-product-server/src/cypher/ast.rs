@@ -9,6 +9,49 @@ pub struct ParsedCypher {
     pub where_filter: Option<PropertyFilter>,
     pub returns: Vec<ReturnItem>,
     pub limit: usize,
+    /// Optional write clauses (§P3-A). Empty for read-only queries.
+    pub writes: Vec<WriteClause>,
+}
+
+#[derive(Clone, Debug)]
+pub enum SetExpr {
+    Literal(Value),
+    /// `n.prop + delta` style expression, kept symbolic so the executor can
+    /// evaluate against the current node value.
+    Increment {
+        base_binding: String,
+        base_key: String,
+        delta: Value,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MergeBranch {
+    pub sets: Vec<(String, String, SetExpr)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum WriteClause {
+    CreateNode {
+        node: NodePattern,
+    },
+    CreateEdge {
+        edge: EdgePattern,
+    },
+    Merge {
+        node: NodePattern,
+        on_create: Option<MergeBranch>,
+        on_match: Option<MergeBranch>,
+    },
+    Set {
+        binding: String,
+        key: String,
+        value: SetExpr,
+    },
+    Delete {
+        binding: String,
+        detach: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -123,8 +166,36 @@ mod tests {
             where_filter: None,
             returns: vec![ReturnItem::Variable("n".to_string())],
             limit: 10,
+            writes: Vec::new(),
         };
         assert_eq!(parsed.limit, 10);
+    }
+
+    #[test]
+    fn write_clause_variants_construct() {
+        use serde_json::json;
+        let create = WriteClause::CreateNode {
+            node: NodePattern {
+                binding: "n".into(),
+                label: Some("Doc".into()),
+                properties: BTreeMap::new(),
+            },
+        };
+        let set = WriteClause::Set {
+            binding: "n".into(),
+            key: "seen".into(),
+            value: SetExpr::Literal(json!(5)),
+        };
+        let delete = WriteClause::Delete {
+            binding: "n".into(),
+            detach: true,
+        };
+        assert!(matches!(create, WriteClause::CreateNode { .. }));
+        assert!(matches!(set, WriteClause::Set { .. }));
+        let WriteClause::Delete { detach, .. } = delete else {
+            panic!("expected delete")
+        };
+        assert!(detach);
     }
 
     #[test]
