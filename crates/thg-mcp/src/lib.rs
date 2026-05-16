@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thg_core::{
     Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError, GraphStoreResult,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
-    VectorDesignation, VerifyReport,
+    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    RedCoreGraphStore, VectorDesignation, VerifyReport,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -19,6 +21,24 @@ pub trait McpGraphBackend {
     fn labels(&self) -> GraphStoreResult<Vec<String>>;
     fn edge_types(&self) -> GraphStoreResult<Vec<String>>;
     fn property_keys(&self) -> GraphStoreResult<Vec<String>>;
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "list_edges is not supported by this MCP backend",
+        ))
+    }
+    fn upsert_node(&mut self, _node: NodeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "node bulk upsert is not supported by this MCP backend",
+        ))
+    }
+    fn upsert_edge(&mut self, _edge: EdgeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "edge bulk upsert is not supported by this MCP backend",
+        ))
+    }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
     fn designate_vector_property(
         &mut self,
@@ -43,6 +63,92 @@ pub trait McpGraphBackend {
         max_hops: usize,
         alpha: f32,
     ) -> GraphStoreResult<Vec<(String, f32)>>;
+    fn hybrid_scoring_config(&self) -> HybridScoringConfig {
+        HybridScoringConfig::default()
+    }
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.hybrid_search(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config.alpha,
+        )
+    }
+    fn designate_fulltext_property(
+        &mut self,
+        _label: &str,
+        _property: &str,
+    ) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "full-text designation is not supported by this MCP backend",
+        ))
+    }
+    fn fulltext_search(
+        &self,
+        _label: Option<&str>,
+        _property: &str,
+        _query: &str,
+        _k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "full-text search is not supported by this MCP backend",
+        ))
+    }
+    fn designate_spatial_property(
+        &mut self,
+        _label: &str,
+        _lat_property: &str,
+        _lon_property: &str,
+        _resolution: u8,
+    ) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "spatial designation is not supported by this MCP backend",
+        ))
+    }
+    fn spatial_radius_search(
+        &self,
+        _label: &str,
+        _lat_property: &str,
+        _lon_property: &str,
+        _lat: f64,
+        _lon: f64,
+        _radius_km: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "spatial radius search is not supported by this MCP backend",
+        ))
+    }
+    fn spatial_bbox_search(
+        &self,
+        _label: &str,
+        _lat_property: &str,
+        _lon_property: &str,
+        _min_lat: f64,
+        _min_lon: f64,
+        _max_lat: f64,
+        _max_lon: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "spatial bbox search is not supported by this MCP backend",
+        ))
+    }
     fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -50,6 +156,89 @@ pub trait McpGraphBackend {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>>;
+
+    /// Personalized PageRank. Default impl walks `list_edges()` to build the
+    /// adjacency map then calls `thg_core::personalized_pagerank`.
+    fn algo_ppr(
+        &self,
+        seeds: &HashMap<String, f64>,
+        alpha: f64,
+        epsilon: f64,
+        max_pushes: usize,
+    ) -> GraphStoreResult<HashMap<String, f64>> {
+        let edges = self.list_edges()?;
+        let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for edge in edges.iter() {
+            if edge.tombstone {
+                continue;
+            }
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push((edge.to_id.clone(), edge.effective_confidence()));
+        }
+        Ok(thg_core::personalized_pagerank(
+            &adjacency, seeds, alpha, epsilon, max_pushes,
+        ))
+    }
+
+    /// Connected components. Default impl uses `thg_core::connected_components`.
+    fn algo_components(&self, directed: bool) -> GraphStoreResult<Vec<Vec<String>>> {
+        let edges = self.list_edges()?;
+        Ok(thg_core::connected_components(&edges, directed))
+    }
+
+    /// Power-iteration PageRank. Default impl uses `thg_core::pagerank`.
+    fn algo_pagerank(
+        &self,
+        damping: f64,
+        max_iter: usize,
+        tolerance: f64,
+    ) -> GraphStoreResult<HashMap<String, f64>> {
+        let edges = self.list_edges()?;
+        Ok(thg_core::pagerank(&edges, damping, max_iter, tolerance))
+    }
+
+    /// Community detection + modularity via label-propagation. Default impl
+    /// uses `thg_core::label_propagation_communities` (the modern replacement
+    /// for the now-deprecated `louvain_communities` re-export).
+    fn algo_communities(&self) -> GraphStoreResult<(HashMap<String, u64>, f64)> {
+        let edges = self.list_edges()?;
+        Ok(thg_core::label_propagation_communities(&edges))
+    }
+
+    /// Bulk upsert NodeRecords. Default impl loops `upsert_node` per record;
+    /// concrete impls that have a faster batch primitive can override.
+    fn bulk_upsert_nodes(
+        &mut self,
+        records: Vec<NodeRecord>,
+    ) -> GraphStoreResult<(usize, usize)> {
+        let mut inserted = 0usize;
+        let mut failed = 0usize;
+        for record in records {
+            match self.upsert_node(record) {
+                Ok(_) => inserted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((inserted, failed))
+    }
+
+    /// Bulk upsert EdgeRecords. Default impl loops `upsert_edge` per record.
+    fn bulk_upsert_edges(
+        &mut self,
+        records: Vec<EdgeRecord>,
+    ) -> GraphStoreResult<(usize, usize)> {
+        let mut inserted = 0usize;
+        let mut failed = 0usize;
+        for record in records {
+            match self.upsert_edge(record) {
+                Ok(_) => inserted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((inserted, failed))
+    }
 }
 
 pub trait McpGraphProvider {
@@ -315,6 +504,187 @@ fn call_tool<P: McpGraphProvider>(
         "thg.graph.index_status" => index_status_payload(&tenant, &backend)?,
         "thg.graph.explain" => explain_payload(&tenant, &arguments),
         "thg.graph.query" => query_payload(&tenant, &backend, &arguments)?,
+        "thg.algorithm.ppr" => algorithm_ppr_payload(&tenant, &backend, &arguments)?,
+        "thg.algorithm.components" => algorithm_components_payload(&tenant, &backend, &arguments)?,
+        "thg.algorithm.pagerank" => algorithm_pagerank_payload(&tenant, &backend, &arguments)?,
+        "thg.algorithm.communities" => algorithm_communities_payload(&tenant, &backend)?,
+        "thg.fulltext.search" => {
+            let property = required_str(&arguments, "property", name)?;
+            let query = required_str(&arguments, "query", name)?;
+            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let label = arguments.get("label").and_then(Value::as_str);
+            let results = backend.fulltext_search(label, property, query, k)?;
+            json!({
+                "tenant": tenant,
+                "results": results.iter().map(|(node_id, score)| json!({"node_id": node_id, "score": score})).collect::<Vec<_>>(),
+                "stats": { "returned": results.len(), "k": k }
+            })
+        }
+        "thg.fulltext.designate" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "mcp_read_only",
+                "message": "Write tools are unavailable while read-only mode is active."
+            })))
+        }
+        "thg.fulltext.designate" => {
+            let label = required_str(&arguments, "label", name)?;
+            let property = required_str(&arguments, "property", name)?;
+            backend.designate_fulltext_property(label, property)?;
+            json!({
+                "tenant": tenant,
+                "designated": { "label": label, "property": property }
+            })
+        }
+        "thg.spatial.radius" => {
+            let label = required_str(&arguments, "label", name)?;
+            let lat_property = required_str(&arguments, "lat_property", name)?;
+            let lon_property = required_str(&arguments, "lon_property", name)?;
+            let lat = required_f64(&arguments, "lat", name)?;
+            let lon = required_f64(&arguments, "lon", name)?;
+            let radius_km = required_f64(&arguments, "radius_km", name)?;
+            let node_ids = backend.spatial_radius_search(
+                label,
+                lat_property,
+                lon_property,
+                lat,
+                lon,
+                radius_km,
+            )?;
+            json!({
+                "tenant": tenant,
+                "node_ids": node_ids,
+                "stats": { "returned": node_ids.len() }
+            })
+        }
+        "thg.spatial.bbox" => {
+            let label = required_str(&arguments, "label", name)?;
+            let lat_property = required_str(&arguments, "lat_property", name)?;
+            let lon_property = required_str(&arguments, "lon_property", name)?;
+            let min_lat = required_f64(&arguments, "min_lat", name)?;
+            let min_lon = required_f64(&arguments, "min_lon", name)?;
+            let max_lat = required_f64(&arguments, "max_lat", name)?;
+            let max_lon = required_f64(&arguments, "max_lon", name)?;
+            let node_ids = backend.spatial_bbox_search(
+                label,
+                lat_property,
+                lon_property,
+                min_lat,
+                min_lon,
+                max_lat,
+                max_lon,
+            )?;
+            json!({
+                "tenant": tenant,
+                "node_ids": node_ids,
+                "stats": { "returned": node_ids.len() }
+            })
+        }
+        "thg.spatial.designate" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "mcp_read_only",
+                "message": "Write tools are unavailable while read-only mode is active."
+            })))
+        }
+        "thg.spatial.designate" => {
+            let label = required_str(&arguments, "label", name)?;
+            let lat_property = required_str(&arguments, "lat_property", name)?;
+            let lon_property = required_str(&arguments, "lon_property", name)?;
+            let resolution = arguments
+                .get("resolution")
+                .and_then(Value::as_u64)
+                .unwrap_or(9)
+                .min(u8::MAX as u64) as u8;
+            backend.designate_spatial_property(label, lat_property, lon_property, resolution)?;
+            json!({
+                "tenant": tenant,
+                "designated": {
+                    "label": label,
+                    "lat_property": lat_property,
+                    "lon_property": lon_property,
+                    "resolution": resolution
+                }
+            })
+        }
+        "thg.bulk.nodes" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "mcp_read_only",
+                "message": "Write tools are unavailable while read-only mode is active."
+            })))
+        }
+        "thg.bulk.nodes" => {
+            let records = arguments
+                .get("nodes")
+                .or_else(|| arguments.get("records"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| McpError::invalid_params("thg.bulk.nodes requires nodes array"))?;
+            let mut inserted = 0usize;
+            let mut errors = Vec::new();
+            for (idx, raw) in records.iter().enumerate() {
+                match parse_node_record(raw) {
+                    Ok(node) => match backend.upsert_node(node.clone()) {
+                        Ok(()) => inserted += 1,
+                        Err(error) => errors.push(json!({
+                            "line": idx + 1,
+                            "code": error.code,
+                            "message": error.message,
+                            "record_id": node.id,
+                        })),
+                    },
+                    Err(error) => errors.push(json!({
+                        "line": idx + 1,
+                        "code": "invalid_node_record",
+                        "message": error.message,
+                    })),
+                }
+            }
+            json!({
+                "tenant": tenant,
+                "ok": errors.is_empty(),
+                "inserted": inserted,
+                "failed": errors.len(),
+                "errors": errors,
+            })
+        }
+        "thg.bulk.edges" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "mcp_read_only",
+                "message": "Write tools are unavailable while read-only mode is active."
+            })))
+        }
+        "thg.bulk.edges" => {
+            let records = arguments
+                .get("edges")
+                .or_else(|| arguments.get("records"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| McpError::invalid_params("thg.bulk.edges requires edges array"))?;
+            let mut inserted = 0usize;
+            let mut errors = Vec::new();
+            for (idx, raw) in records.iter().enumerate() {
+                match parse_edge_record(raw) {
+                    Ok(edge) => match backend.upsert_edge(edge.clone()) {
+                        Ok(()) => inserted += 1,
+                        Err(error) => errors.push(json!({
+                            "line": idx + 1,
+                            "code": error.code,
+                            "message": error.message,
+                            "record_id": edge.id,
+                        })),
+                    },
+                    Err(error) => errors.push(json!({
+                        "line": idx + 1,
+                        "code": "invalid_edge_record",
+                        "message": error.message,
+                    })),
+                }
+            }
+            json!({
+                "tenant": tenant,
+                "ok": errors.is_empty(),
+                "inserted": inserted,
+                "failed": errors.len(),
+                "errors": errors,
+            })
+        }
         "thg.vector.search" => {
             let property = arguments
                 .get("property")
@@ -357,13 +727,45 @@ fn call_tool<P: McpGraphProvider>(
             let alpha = arguments
                 .get("alpha")
                 .and_then(Value::as_f64)
-                .unwrap_or(0.5) as f32;
-            let results =
-                backend.hybrid_search(label, property, &query, k, &graph_seeds, max_hops, alpha)?;
+                .map(|value| value as f32);
+            let mut scoring = backend.hybrid_scoring_config();
+            if let Some(alpha) = alpha {
+                scoring = scoring.with_alpha(alpha);
+            }
+            if let Some(confidence_weighted) = arguments
+                .get("confidence_weighted_graph_distance")
+                .and_then(Value::as_bool)
+            {
+                scoring.confidence_weighted_graph_distance = confidence_weighted;
+            }
+            if let Some(weights) = arguments.get("edge_type_weights") {
+                scoring.edge_type_weights =
+                    serde_json::from_value(weights.clone()).map_err(|error| {
+                        McpError::invalid_params(format!(
+                            "edge_type_weights must be an object of number weights: {error}"
+                        ))
+                    })?;
+            }
+            let results = backend.hybrid_search_with_config(
+                label,
+                property,
+                &query,
+                k,
+                &graph_seeds,
+                max_hops,
+                &scoring,
+            )?;
             json!({
                 "tenant": tenant,
                 "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
-                "stats": { "returned": results.len(), "k": k, "alpha": alpha, "max_hops": max_hops }
+                "stats": {
+                    "returned": results.len(),
+                    "k": k,
+                    "alpha": scoring.alpha,
+                    "max_hops": max_hops,
+                    "confidence_weighted_graph_distance": scoring.confidence_weighted_graph_distance,
+                    "edge_type_weights": scoring.edge_type_weights
+                }
             })
         }
         "thg.vector.designate" if config.read_only => {
@@ -656,6 +1058,156 @@ fn query_payload(
     }))
 }
 
+fn algorithm_ppr_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let edges = backend.list_edges()?;
+    let seeds: HashMap<String, f64> = serde_json::from_value(
+        arguments
+            .get("seeds")
+            .cloned()
+            .ok_or_else(|| McpError::invalid_params("thg.algorithm.ppr requires seeds object"))?,
+    )
+    .map_err(|error| McpError::invalid_params(format!("seeds must be an object: {error}")))?;
+    let alpha = arguments
+        .get("alpha")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.15);
+    let epsilon = arguments
+        .get("epsilon")
+        .and_then(Value::as_f64)
+        .unwrap_or(1e-4);
+    let max_pushes = arguments
+        .get("max_pushes")
+        .and_then(Value::as_u64)
+        .unwrap_or(200_000) as usize;
+    let top_k = arguments
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .map(|k| k as usize);
+    let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for edge in edges.iter().filter(|edge| !edge.tombstone) {
+        adjacency
+            .entry(edge.from_id.clone())
+            .or_default()
+            .push((edge.to_id.clone(), edge.effective_confidence()));
+    }
+    let mut entries: Vec<(String, f64)> =
+        thg_core::personalized_pagerank(&adjacency, &seeds, alpha, epsilon, max_pushes)
+            .into_iter()
+            .collect();
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(k) = top_k {
+        entries.truncate(k);
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "alpha": alpha,
+        "epsilon": epsilon,
+        "scores": entries.into_iter().map(|(node_id, score)| json!({
+            "node_id": node_id,
+            "score": score,
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn algorithm_components_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let edges = backend.list_edges()?;
+    let directed = arguments
+        .get("directed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let components = thg_core::connected_components(&edges, directed);
+    Ok(json!({
+        "tenant": tenant,
+        "directed": directed,
+        "components": components,
+        "count": components.len(),
+    }))
+}
+
+fn algorithm_pagerank_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let edges = backend.list_edges()?;
+    let damping = arguments
+        .get("damping")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.85);
+    let max_iter = arguments
+        .get("max_iter")
+        .and_then(Value::as_u64)
+        .unwrap_or(100) as usize;
+    let tolerance = arguments
+        .get("tolerance")
+        .and_then(Value::as_f64)
+        .unwrap_or(1e-6);
+    let top_k = arguments
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .map(|k| k as usize);
+    let mut entries: Vec<(String, f64)> = thg_core::pagerank(&edges, damping, max_iter, tolerance)
+        .into_iter()
+        .collect();
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(k) = top_k {
+        entries.truncate(k);
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "damping": damping,
+        "scores": entries.into_iter().map(|(node_id, score)| json!({
+            "node_id": node_id,
+            "score": score,
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn algorithm_communities_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+) -> Result<Value, McpError> {
+    let edges = backend.list_edges()?;
+    let (community, modularity) = thg_core::label_propagation_communities(&edges);
+    let mut entries: Vec<Value> = community
+        .into_iter()
+        .map(|(node_id, community_id)| {
+            json!({
+                "node_id": node_id,
+                "community_id": community_id,
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a["node_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["node_id"].as_str().unwrap_or(""))
+    });
+    Ok(json!({
+        "tenant": tenant,
+        "algorithm": "label_propagation",
+        "communities": entries,
+        "modularity": modularity,
+    }))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Budget {
     max_nodes_returned: usize,
@@ -748,6 +1300,21 @@ fn tenant_from_args(arguments: &Value, config: &McpServerConfig) -> String {
         .unwrap_or_else(|| config.default_tenant.clone())
 }
 
+fn required_str<'a>(arguments: &'a Value, key: &str, tool_name: &str) -> Result<&'a str, McpError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params(format!("{tool_name} requires {key}")))
+}
+
+fn required_f64(arguments: &Value, key: &str, tool_name: &str) -> Result<f64, McpError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| McpError::invalid_params(format!("{tool_name} requires numeric {key}")))
+}
+
 fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
     arguments
         .get(key)
@@ -766,6 +1333,76 @@ fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
                 "{key} is required and must be an array of numbers"
             )))
         })
+}
+
+fn parse_node_record(raw: &Value) -> Result<NodeRecord, McpError> {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("node record requires string id"))?;
+    let labels = raw
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let properties = raw.get("properties").cloned().unwrap_or_else(|| json!({}));
+    if !properties.is_object() {
+        return Err(McpError::invalid_params(
+            "node properties must be an object",
+        ));
+    }
+    let mut node = NodeRecord::new(id, labels, properties);
+    node.tombstone = raw
+        .get("tombstone")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(node)
+}
+
+fn parse_edge_record(raw: &Value) -> Result<EdgeRecord, McpError> {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("edge record requires string id"))?;
+    let from_id = raw
+        .get("from_id")
+        .or_else(|| raw.get("fromId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("edge record requires string from_id"))?;
+    let to_id = raw
+        .get("to_id")
+        .or_else(|| raw.get("toId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("edge record requires string to_id"))?;
+    let edge_type = raw
+        .get("type")
+        .or_else(|| raw.get("edge_type"))
+        .or_else(|| raw.get("edgeType"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("edge record requires string type"))?;
+    let properties = raw.get("properties").cloned().unwrap_or_else(|| json!({}));
+    if !properties.is_object() {
+        return Err(McpError::invalid_params(
+            "edge properties must be an object",
+        ));
+    }
+    let mut edge = EdgeRecord::new(id, from_id, edge_type, to_id, properties);
+    edge.tombstone = raw
+        .get("tombstone")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    edge.confidence = raw.get("confidence").and_then(Value::as_f64);
+    Ok(edge)
 }
 
 fn tool_result(payload: Value) -> Value {
@@ -936,7 +1573,106 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "properties": { "tenant": { "type": "string" } }
             }),
         ),
+        tool(
+            "thg.algorithm.ppr",
+            "Run Personalized PageRank over the tenant graph.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "seeds": { "type": "object", "additionalProperties": { "type": "number" } },
+                    "alpha": { "type": "number", "default": 0.15 },
+                    "epsilon": { "type": "number", "default": 0.0001 },
+                    "max_pushes": { "type": "integer", "default": 200000 },
+                    "top_k": { "type": "integer" }
+                },
+                "required": ["seeds"]
+            }),
+        ),
+        tool(
+            "thg.algorithm.components",
+            "Run connected-components over the tenant graph.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "directed": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
+            "thg.algorithm.pagerank",
+            "Run global PageRank over the tenant graph.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "damping": { "type": "number", "default": 0.85 },
+                    "max_iter": { "type": "integer", "default": 100 },
+                    "tolerance": { "type": "number", "default": 0.000001 },
+                    "top_k": { "type": "integer" }
+                }
+            }),
+        ),
+        tool(
+            "thg.algorithm.communities",
+            "Run label-propagation community detection over the tenant graph.",
+            json!({
+                "type": "object",
+                "properties": { "tenant": { "type": "string" } }
+            }),
+        ),
     ];
+    tools.push(tool(
+        "thg.fulltext.search",
+        "Search a designated full-text node property.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "property": { "type": "string" },
+                "query": { "type": "string" },
+                "k": { "type": "integer", "default": 10 }
+            },
+            "required": ["property", "query"]
+        }),
+    ));
+    tools.push(tool(
+        "thg.spatial.radius",
+        "Search a designated spatial property within a radius in kilometers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "lat_property": { "type": "string" },
+                "lon_property": { "type": "string" },
+                "lat": { "type": "number" },
+                "lon": { "type": "number" },
+                "radius_km": { "type": "number" }
+            },
+            "required": ["label", "lat_property", "lon_property", "lat", "lon", "radius_km"]
+        }),
+    ));
+    tools.push(tool(
+        "thg.spatial.bbox",
+        "Search a designated spatial property within a bounding box.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "lat_property": { "type": "string" },
+                "lon_property": { "type": "string" },
+                "min_lat": { "type": "number" },
+                "min_lon": { "type": "number" },
+                "max_lat": { "type": "number" },
+                "max_lon": { "type": "number" }
+            },
+            "required": ["label", "lat_property", "lon_property", "min_lat", "min_lon", "max_lat", "max_lon"]
+        }),
+    ));
     tools.push(tool(
         "thg.vector.search",
         "Run a pure vector similarity search using HNSW indexes. Returns top-k nearest nodes.",
@@ -965,7 +1701,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "label": { "type": "string" },
                 "graph_seeds": { "type": "array", "items": { "type": "string" }, "description": "Node IDs to seed graph distance calculation" },
                 "max_hops": { "type": "integer", "default": 3 },
-                "alpha": { "type": "number", "default": 0.5, "description": "Blend weight: 0.0 = pure vector, 1.0 = pure graph" }
+                "alpha": { "type": "number", "default": 0.5, "description": "Blend weight: 0.0 = pure vector, 1.0 = pure graph" },
+                "confidence_weighted_graph_distance": { "type": "boolean", "default": true },
+                "edge_type_weights": { "type": "object", "additionalProperties": { "type": "number" } }
             },
             "required": ["property", "query", "graph_seeds"]
         }),
@@ -989,6 +1727,58 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     if !config.read_only {
+        tools.push(tool_write(
+            "thg.fulltext.designate",
+            "Designate a node property for full-text search.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "label": { "type": "string" },
+                    "property": { "type": "string" }
+                },
+                "required": ["label", "property"]
+            }),
+        ));
+        tools.push(tool_write(
+            "thg.spatial.designate",
+            "Designate latitude/longitude node properties for spatial search.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "label": { "type": "string" },
+                    "lat_property": { "type": "string" },
+                    "lon_property": { "type": "string" },
+                    "resolution": { "type": "integer", "default": 9 }
+                },
+                "required": ["label", "lat_property", "lon_property"]
+            }),
+        ));
+        tools.push(tool_write(
+            "thg.bulk.nodes",
+            "Bulk upsert node records from a JSON array.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "nodes": { "type": "array", "items": { "type": "object" } },
+                    "records": { "type": "array", "items": { "type": "object" } }
+                }
+            }),
+        ));
+        tools.push(tool_write(
+            "thg.bulk.edges",
+            "Bulk upsert edge records from a JSON array.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "edges": { "type": "array", "items": { "type": "object" } },
+                    "records": { "type": "array", "items": { "type": "object" } }
+                }
+            }),
+        ));
         tools.push(tool_write(
             "thg.vector.designate",
             "Designate a node property as a vector field with a fixed dimension. Creates HNSW index for that property.",
@@ -1148,6 +1938,18 @@ impl McpGraphBackend for InMemoryGraphStore {
         Ok(InMemoryGraphStore::property_keys(self))
     }
 
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        Ok(self.snapshot().edges)
+    }
+
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        InMemoryGraphStore::upsert_node(self, node).map(|_| ())
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        InMemoryGraphStore::upsert_edge(self, edge).map(|_| ())
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Ok(InMemoryGraphStore::vector_designations(self))
     }
@@ -1190,6 +1992,28 @@ impl McpGraphBackend for InMemoryGraphStore {
             graph_seeds,
             max_hops,
             alpha,
+        )
+    }
+
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        InMemoryGraphStore::hybrid_search_with_config(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
         )
     }
 
@@ -1247,6 +2071,18 @@ impl McpGraphBackend for RedCoreGraphStore {
         RedCoreGraphStore::property_keys(self)
     }
 
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        Ok(self.graph_snapshot().edges)
+    }
+
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        RedCoreGraphStore::upsert_node(self, node).map(|_| ())
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        RedCoreGraphStore::upsert_edge(self, edge).map(|_| ())
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Ok(RedCoreGraphStore::vector_designations(self))
     }
@@ -1289,6 +2125,28 @@ impl McpGraphBackend for RedCoreGraphStore {
             graph_seeds,
             max_hops,
             alpha,
+        )
+    }
+
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        RedCoreGraphStore::hybrid_search_with_config(
+            self,
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
         )
     }
 
@@ -1505,7 +2363,17 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "thg.graph.neighbors"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "thg.algorithm.pagerank"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "thg.fulltext.search"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "thg.spatial.radius"));
         assert!(!tools.iter().any(|tool| tool["name"] == "thg.admin.verify"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "thg.bulk.nodes"));
     }
 
     #[test]
@@ -1602,6 +2470,52 @@ mod tests {
             response["result"]["structuredContent"]["explain"]["plan"][1]["op"],
             "node_index_seek"
         );
+    }
+
+    #[test]
+    fn algorithm_tool_calls_run_over_graph_edges() {
+        let (provider, config) = fixture();
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "pagerank",
+                "method": "tools/call",
+                "params": {
+                    "name": "thg.algorithm.pagerank",
+                    "arguments": { "tenant": "smoke", "top_k": 2 }
+                }
+            }),
+        );
+
+        assert_eq!(
+            response["result"]["structuredContent"]["scores"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn read_write_tools_list_exposes_bulk_and_designation_tools() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "thg.bulk.nodes"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "thg.fulltext.designate"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "thg.spatial.designate"));
     }
 
     #[test]
@@ -1702,5 +2616,56 @@ mod tests {
 
         let text = response["result"]["contents"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"node:a\""));
+    }
+
+    // ---- §P6-B pb6.1 algo + bulk trait defaults --------------------------
+
+    fn store_with_two_components() -> InMemoryGraphStore {
+        // Two disconnected edges => two connected components: {a, b} and {c, d}.
+        // `connected_components` ignores nodes that don't appear in any edge,
+        // so a dangling node won't form its own component.
+        let mut store = InMemoryGraphStore::default();
+        store.upsert_node(NodeRecord::new("a", ["Doc"], json!({}))).unwrap();
+        store.upsert_node(NodeRecord::new("b", ["Doc"], json!({}))).unwrap();
+        store.upsert_node(NodeRecord::new("c", ["Doc"], json!({}))).unwrap();
+        store.upsert_node(NodeRecord::new("d", ["Doc"], json!({}))).unwrap();
+        store
+            .upsert_edge(EdgeRecord::new("e1", "a", "T", "b", json!({})))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new("e2", "c", "T", "d", json!({})))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn backend_components_returns_partition() {
+        use super::McpGraphBackend;
+        let store = store_with_two_components();
+        let components = store.algo_components(false).unwrap();
+        // {a, b} and {c}
+        assert_eq!(components.len(), 2);
+    }
+
+    #[test]
+    fn backend_pagerank_returns_score_map() {
+        use super::McpGraphBackend;
+        let store = store_with_two_components();
+        let ranks = store.algo_pagerank(0.85, 50, 1e-6).unwrap();
+        assert!(ranks.contains_key("a"));
+        assert!(ranks.contains_key("b"));
+    }
+
+    #[test]
+    fn backend_bulk_upsert_nodes_counts_inserts() {
+        use super::McpGraphBackend;
+        let mut store = InMemoryGraphStore::default();
+        let records = vec![
+            NodeRecord::new("x", ["Doc"], json!({})),
+            NodeRecord::new("y", ["Doc"], json!({})),
+        ];
+        let (inserted, failed) = store.bulk_upsert_nodes(records).unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(failed, 0);
     }
 }
