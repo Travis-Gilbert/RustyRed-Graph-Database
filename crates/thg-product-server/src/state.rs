@@ -18,6 +18,7 @@ use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
+use crate::observability::Observability;
 
 const GRAPH_TRANSACTION_TTL_MS: u64 = 5 * 60 * 1000;
 
@@ -32,6 +33,7 @@ struct GraphTransactionContext {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub observability: Observability,
     redcore_stores: Arc<Mutex<BTreeMap<String, Arc<RedCoreTenantExecutor>>>>,
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
@@ -42,6 +44,7 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         Self {
             config: Arc::new(config),
+            observability: Observability::default(),
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),

@@ -196,6 +196,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
         .route("/metrics", get(crate::metrics::metrics))
+        .route(
+            "/v1/diagnostics/slow_queries",
+            get(crate::metrics::slow_queries),
+        )
+        .route(
+            "/v1/diagnostics/config",
+            get(crate::metrics::diagnostics_config),
+        )
         .route("/v1/command", post(root_command))
         .route("/v1/batch", post(root_batch))
         .route("/v1/query", post(public_query))
@@ -683,9 +691,23 @@ async fn public_cypher(
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
     };
-    match execute_cypher_query(&store, &tenant_id, &body) {
+    state.observability.record_cypher();
+    let start = std::time::Instant::now();
+    let outcome = execute_cypher_query(&store, &tenant_id, &body);
+    let nanos = start.elapsed().as_nanos() as u64;
+    state.observability.record_query_timing(
+        "cypher",
+        body.query.chars().take(120).collect::<String>().as_str(),
+        nanos,
+        0,
+        0,
+    );
+    match outcome {
         Ok(payload) => Json(payload).into_response(),
-        Err(error) => query_surface_error_response(error),
+        Err(error) => {
+            state.observability.record_error();
+            query_surface_error_response(error)
+        }
     }
 }
 
@@ -712,8 +734,12 @@ async fn transaction_begin(
         };
     let tx_id = match state.begin_graph_transaction(&tenant_id) {
         Ok(tx_id) => tx_id,
-        Err(error) => return graph_store_error_response(transaction_state_error(error)),
+        Err(error) => {
+            state.observability.record_error();
+            return graph_store_error_response(transaction_state_error(error));
+        }
     };
+    state.observability.record_transaction_begin();
     Json(json!({
         "ok": true,
         "tenant": tenant_id,
@@ -752,8 +778,12 @@ async fn transaction_commit(
         };
     let transaction = match state.commit_graph_transaction(&tenant_id, tx_id) {
         Ok(transaction) => transaction,
-        Err(error) => return graph_store_error_response(transaction_state_error(error)),
+        Err(error) => {
+            state.observability.record_error();
+            return graph_store_error_response(transaction_state_error(error));
+        }
     };
+    state.observability.record_transaction_commit();
     Json(json!({
         "ok": true,
         "tenant": tenant_id,
@@ -791,8 +821,10 @@ async fn transaction_rollback(
             Err(error) => return query_surface_error_response(error),
         };
     if let Err(error) = state.rollback_graph_transaction(&tenant_id, tx_id) {
+        state.observability.record_error();
         return graph_store_error_response(transaction_state_error(error));
     }
+    state.observability.record_transaction_rollback();
     Json(json!({
         "ok": true,
         "tenant": tenant_id,
@@ -919,6 +951,7 @@ async fn graph_vector_search(
         Err(error) => return store_unavailable_response(error),
     };
 
+    state.observability.record_vector_search();
     let label_ref = body.label.as_deref();
     match store.vector_search(label_ref, &body.property, &body.query, body.k) {
         Ok(results) => {
@@ -931,7 +964,10 @@ async fn graph_vector_search(
                 .collect();
             Json(json!({ "ok": true, "results": items })).into_response()
         }
-        Err(error) => graph_store_error_response(error),
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
     }
 }
 
@@ -955,6 +991,7 @@ async fn graph_vector_hybrid(
         Err(error) => return store_unavailable_response(error),
     };
 
+    state.observability.record_vector_search();
     let label_ref = body.label.as_deref();
     match store.hybrid_search(
         label_ref,
@@ -975,7 +1012,10 @@ async fn graph_vector_hybrid(
                 .collect();
             Json(json!({ "ok": true, "results": items })).into_response()
         }
-        Err(error) => graph_store_error_response(error),
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
     }
 }
 
@@ -1037,8 +1077,14 @@ async fn graph_node_upsert(
         Err(error) => return store_unavailable_response(error),
     };
     match store.upsert_node(body.into_record()) {
-        Ok(result) => Json(json!({ "ok": true, "node": result })).into_response(),
-        Err(error) => graph_store_error_response(error),
+        Ok(result) => {
+            state.observability.record_mutation();
+            Json(json!({ "ok": true, "node": result })).into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
     }
 }
 
@@ -1112,8 +1158,14 @@ async fn graph_edge_upsert(
         Err(error) => return store_unavailable_response(error),
     };
     match store.upsert_edge(body.into_record()) {
-        Ok(result) => Json(json!({ "ok": true, "edge": result })).into_response(),
-        Err(error) => graph_store_error_response(error),
+        Ok(result) => {
+            state.observability.record_mutation();
+            Json(json!({ "ok": true, "edge": result })).into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
     }
 }
 

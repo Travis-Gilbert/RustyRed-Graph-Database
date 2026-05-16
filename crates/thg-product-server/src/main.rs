@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod graph_cache;
 mod metrics;
+mod observability;
 mod openapi;
 mod query_surface;
 mod router;
