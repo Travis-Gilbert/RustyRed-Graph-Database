@@ -1,14 +1,16 @@
-# Rusty Red Graph Database
+# RustyRed GraphDB
 
-Embedded property graph database with a first-class MCP agent port,
-multi-tenancy, HNSW vector search, confidence-weighted epistemic edges,
-and a graph-version-aware AI cache. Written in Rust.
+RustyRed is a remarkably fast Graph + Vector database.
+It runs entirely in RAM.
+Designed for modern workflows.
 
-Designed for AI agents and GraphRAG workloads, not for replacing Neo4j.
+Featuring GraphCache graph state-aware cache, a first-class MCP agent port, built in RAG for both graph and vector
+multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and an embedded property graph database.
+Written in Rust, the best way to write a database. In my humble opinion.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
 
-Template ID pending: after creating or publishing the Railway template, replace `RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID` in the badge URL with the Railway template code.
+Note put template ID here before making public  `RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID` in the badge URL with the Railway template code.
 
 ## What Rusty Red does
 
@@ -50,15 +52,9 @@ These are on the roadmap, in roughly this priority order:
 | `thg-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
 | root crate | PyO3 bindings for `push_ppr` and `ThgCoreExecutor` |
 
-The Rusty Red repository at
-`https://github.com/Travis-Gilbert/rusty-red-graph-database` is maintained as a
-`theseus_native` subtree export from the Theseus repository. The source of truth
-for edits remains this directory unless the extraction strategy changes
-deliberately.
-
 ## Build (local development)
 
-Requires Rust 1.78+ and `maturin >= 1.7`.
+Requires Rust 1.85+ and `maturin >= 1.7`.
 
 ```bash
 python3 -m pip install --user maturin
@@ -175,12 +171,6 @@ The public query surface is now split cleanly:
 startup-only tenant override details. Runtime mutation of tenant config is not
 supported in this slice.
 
-The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
-is exposed through HTTP and MCP even though the underlying storage engine is a
-database-style service. The OpenAPI contract is for the HTTP API; MCP tool,
-resource, and prompt metadata are discovered through the MCP endpoint and
-well-known manifests.
-
 Railway template readiness follows the public template guidance: use a GitHub
 source repo, keep the service root minimal, set `/ready` as the health check,
 wire Redis only for explicit `RUSTY_RED_MODE=redis` deployments through private
@@ -191,11 +181,6 @@ Railway template variable functions, and replace the badge placeholder above onc
 Railway assigns the final template URL.
 
 Railway can deploy this directory directly:
-
-```bash
-cd theseus_native
-railway up
-```
 
 The included `Dockerfile`, `railway.toml`, and `.railwayignore` are for the
 standalone Rusty Red subtree repository. The monorepo Railway template under
@@ -233,18 +218,6 @@ def push_ppr(
     max_pushes: int = 200_000,
 ) -> dict[int, float]: ...
 ```
-
-THG exports:
-
-```python
-from theseus_native import ThgCoreExecutor
-
-executor = ThgCoreExecutor()
-executor.execute_json('{"command":"THG.RUN.BEGIN","args":{"task":"demo"}}')
-executor.state_hash()
-```
-
-Matches `apps/notebook/sparse_ppr.py:push_ppr` exactly. ACL local-push personalized PageRank: alpha is the restart probability (Theseus convention), epsilon is the per-node convergence threshold, max_pushes caps total iterations to prevent pathological walks.
 
 ## Fallback semantics
 
@@ -293,12 +266,6 @@ Single-threaded, single-seed PPR queries on random sparse graphs (avg degree 4, 
 | 200K  | 0.0034s | 0.1753s | 51.3x |
 | 1M    | 0.0023s | 0.9573s | 413.9x (acceptance gate: must be >= 20x) |
 
-To re-run:
-
-```bash
-cd theseus_native
-python3 -m pytest tests/test_benchmarks.py -v -s
-```
 
 The fixture is generated with seed 42 for reproducibility. Numbers vary across hardware; the 20x floor is enforced on whatever runner executes the test.
 
