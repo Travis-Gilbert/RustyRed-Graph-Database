@@ -11,6 +11,48 @@ pub struct ParsedCypher {
     pub limit: usize,
     /// Optional write clauses (§P3-A). Empty for read-only queries.
     pub writes: Vec<WriteClause>,
+    /// Optional WITH pipeline clause (§P2-C).
+    pub with_clause: Option<WithClause>,
+    /// Optional ORDER BY clauses (§P2-C). Empty when not present.
+    pub order_by: Vec<OrderBy>,
+    /// Optional SKIP for paginated reads (§P2-C).
+    pub skip: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggOp {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone, Debug)]
+pub enum WithItem {
+    Field {
+        binding: String,
+        /// None means the whole node value (binding without `.property`).
+        key: Option<String>,
+        alias: String,
+    },
+    Aggregate {
+        op: AggOp,
+        binding: Option<String>,
+        key: Option<String>,
+        alias: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct WithClause {
+    pub items: Vec<WithItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderBy {
+    pub expression: String,
+    pub descending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +164,12 @@ pub enum ReturnItem {
         binding: String,
         expression: String,
     },
+    Aggregate {
+        op: AggOp,
+        binding: Option<String>,
+        key: Option<String>,
+        expression: String,
+    },
 }
 
 impl ReturnItem {
@@ -131,6 +179,7 @@ impl ReturnItem {
             Self::Property { expression, .. } => expression.as_str(),
             Self::Count { expression, .. } => expression.as_str(),
             Self::Path { expression, .. } => expression.as_str(),
+            Self::Aggregate { expression, .. } => expression.as_str(),
         }
     }
 }
@@ -167,8 +216,22 @@ mod tests {
             returns: vec![ReturnItem::Variable("n".to_string())],
             limit: 10,
             writes: Vec::new(),
+            with_clause: None,
+            order_by: Vec::new(),
+            skip: None,
         };
         assert_eq!(parsed.limit, 10);
+    }
+
+    #[test]
+    fn ast_aggregate_return_item_round_trip() {
+        let item = ReturnItem::Aggregate {
+            op: AggOp::Sum,
+            binding: Some("n".into()),
+            key: Some("score".into()),
+            expression: "sum(n.score)".into(),
+        };
+        assert_eq!(item.key(), "sum(n.score)");
     }
 
     #[test]

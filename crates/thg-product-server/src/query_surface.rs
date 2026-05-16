@@ -695,6 +695,12 @@ fn project_chain_row(
             ReturnItem::Count { .. } => {
                 unreachable!("count items handled at the executor level");
             }
+            ReturnItem::Aggregate { expression, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "aggregate_projection_pending",
+                    format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
+                ));
+            }
             ReturnItem::Path { binding, expression } => {
                 if chain.path_binding.as_deref() != Some(binding.as_str()) {
                     return Err(QuerySurfaceError::invalid(
@@ -748,6 +754,12 @@ fn project_var_length_row(
             }
             ReturnItem::Count { .. } => {
                 unreachable!("count items handled at the executor level");
+            }
+            ReturnItem::Aggregate { expression, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "aggregate_projection_pending",
+                    format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
+                ));
             }
             ReturnItem::Path { binding, expression } => {
                 if var.path_binding.as_deref() != Some(binding.as_str()) {
@@ -1403,6 +1415,16 @@ fn validate_return_items(
                     }
                 }
             }
+            ReturnItem::Aggregate { binding, .. } => {
+                if let Some(b) = binding {
+                    if !bindings.contains(&b.as_str()) {
+                        return Err(QuerySurfaceError::invalid(
+                            "invalid_return_binding",
+                            format!("aggregation binding {b} does not exist in the MATCH pattern"),
+                        ));
+                    }
+                }
+            }
             ReturnItem::Path { binding, .. } => {
                 if !bindings.contains(&binding.as_str()) {
                     return Err(QuerySurfaceError::invalid(
@@ -1694,6 +1716,12 @@ fn project_node_row(
                 // project_node_row is not called when returns are pure counts.
                 unreachable!("count items handled at the executor level");
             }
+            ReturnItem::Aggregate { expression, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "aggregate_projection_pending",
+                    format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
+                ));
+            }
             ReturnItem::Path { binding, .. } => {
                 return Err(QuerySurfaceError::unsupported(
                     "path_projection_on_node",
@@ -1742,6 +1770,12 @@ fn project_edge_row(
             }
             ReturnItem::Count { .. } => {
                 unreachable!("count items handled at the executor level");
+            }
+            ReturnItem::Aggregate { expression, .. } => {
+                return Err(QuerySurfaceError::unsupported(
+                    "aggregate_projection_pending",
+                    format!("SUM/AVG/MIN/MAX aggregations land in §P2-C pc.2.2: {expression}"),
+                ));
             }
             ReturnItem::Path { binding, .. } => {
                 return Err(QuerySurfaceError::unsupported(

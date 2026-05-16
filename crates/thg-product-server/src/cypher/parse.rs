@@ -128,6 +128,9 @@ fn parse_read_query(
         returns,
         limit,
         writes: Vec::new(),
+        with_clause: None,
+        order_by: Vec::new(),
+        skip: None,
     })
 }
 
@@ -179,6 +182,9 @@ fn parse_create_node_only(
                 returns: Vec::new(),
                 limit: 0,
                 writes: vec![WriteClause::CreateNode { node }],
+                with_clause: None,
+                order_by: Vec::new(),
+                skip: None,
             })
         }
         Rule::create_edge_form => {
@@ -216,6 +222,9 @@ fn parse_create_node_only(
                 returns: Vec::new(),
                 limit: 0,
                 writes: vec![WriteClause::CreateEdge { edge }],
+                with_clause: None,
+                order_by: Vec::new(),
+                skip: None,
             })
         }
         other => Err(QuerySurfaceError::invalid(
@@ -274,6 +283,9 @@ fn parse_merge_clause(
             on_create,
             on_match,
         }],
+        with_clause: None,
+        order_by: Vec::new(),
+        skip: None,
     })
 }
 
@@ -312,6 +324,9 @@ fn parse_match_with_set(
         returns: Vec::new(),
         limit: 0,
         writes,
+        with_clause: None,
+        order_by: Vec::new(),
+        skip: None,
     })
 }
 
@@ -364,6 +379,9 @@ fn parse_match_with_delete(
         returns: Vec::new(),
         limit: 0,
         writes: vec![WriteClause::Delete { binding, detach }],
+        with_clause: None,
+        order_by: Vec::new(),
+        skip: None,
     })
 }
 
