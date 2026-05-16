@@ -15,6 +15,128 @@ use std::sync::{Arc, Mutex};
 
 use thg_core::unix_ms;
 
+// §P7-A pa7.1: latency-histogram constants and helpers.
+
+/// Prometheus default latency buckets (in seconds). The default set covers
+/// the typical web-service latency band; we exclude infinity here and emit
+/// `+Inf` explicitly when rendering.
+pub const LATENCY_BUCKETS_SECONDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+// §cc.2: kind-name constants. Replace literal "cypher" / "algorithm:*" strings
+// at the record-query-timing call sites so renaming flows through grep, not
+// through string duplication.
+pub const KIND_CYPHER: &str = "cypher";
+pub const KIND_VECTOR_SEARCH: &str = "vector_search";
+pub const KIND_FULLTEXT_SEARCH: &str = "fulltext_search";
+pub const KIND_ALGO_PPR: &str = "algorithm:ppr";
+pub const KIND_ALGO_PAGERANK: &str = "algorithm:pagerank";
+pub const KIND_ALGO_COMPONENTS: &str = "algorithm:components";
+pub const KIND_ALGO_COMMUNITIES: &str = "algorithm:communities";
+
+/// Lock-free latency histogram. Bucket counters are cumulative (Prometheus
+/// semantics): each `_bucket{le="X"}` value is the count of observations
+/// whose value was less-than-or-equal to X.
+#[derive(Debug)]
+pub struct Histogram {
+    bucket_boundaries: &'static [f64],
+    bucket_counters: Vec<AtomicU64>,
+    sum_nanos: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    pub fn new(bucket_boundaries: &'static [f64]) -> Self {
+        // +1 slot for the +Inf overflow bucket.
+        let mut bucket_counters = Vec::with_capacity(bucket_boundaries.len() + 1);
+        for _ in 0..=bucket_boundaries.len() {
+            bucket_counters.push(AtomicU64::new(0));
+        }
+        Self {
+            bucket_boundaries,
+            bucket_counters,
+            sum_nanos: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn observe_nanos(&self, nanos: u64) {
+        self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let seconds = nanos as f64 / 1_000_000_000.0;
+        let bucket = self
+            .bucket_boundaries
+            .iter()
+            .position(|le| seconds <= *le)
+            .unwrap_or(self.bucket_boundaries.len());
+        for idx in bucket..self.bucket_counters.len() {
+            self.bucket_counters[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn sum_nanos(&self) -> u64 {
+        self.sum_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Append Prometheus exposition lines for this histogram.
+    pub fn render(&self, out: &mut String, name: &str, help: &str) {
+        out.push_str("# HELP ");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(help);
+        out.push('\n');
+        out.push_str("# TYPE ");
+        out.push_str(name);
+        out.push_str(" histogram\n");
+        for (idx, le) in self.bucket_boundaries.iter().enumerate() {
+            let count = self.bucket_counters[idx].load(Ordering::Relaxed);
+            out.push_str(name);
+            out.push_str("_bucket{le=\"");
+            out.push_str(&format_bucket_bound(*le));
+            out.push_str("\"} ");
+            out.push_str(&count.to_string());
+            out.push('\n');
+        }
+        let inf_count = self
+            .bucket_counters
+            .last()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        out.push_str(name);
+        out.push_str("_bucket{le=\"+Inf\"} ");
+        out.push_str(&inf_count.to_string());
+        out.push('\n');
+        let sum_seconds = self.sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        out.push_str(name);
+        out.push_str("_sum ");
+        out.push_str(&format!("{sum_seconds:.9}"));
+        out.push('\n');
+        out.push_str(name);
+        out.push_str("_count ");
+        out.push_str(&self.count.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+}
+
+fn format_bucket_bound(le: f64) -> String {
+    // Format with minimal trailing zeroes; Prometheus accepts both "0.005" and
+    // "5e-3" but readable scientific-notation is uncommon, so keep decimals.
+    if (le - le.round()).abs() < f64::EPSILON {
+        format!("{le:.0}")
+    } else {
+        let formatted = format!("{le:.3}");
+        // Trim trailing zeroes but keep at least one fractional digit.
+        let trimmed = formatted.trim_end_matches('0');
+        let trimmed = trimmed.trim_end_matches('.');
+        trimmed.to_string()
+    }
+}
+
 #[derive(Default)]
 struct CounterSet {
     total_requests: AtomicU64,
@@ -51,6 +173,10 @@ pub struct Observability {
     counters: Arc<CounterSet>,
     slow_queries: Arc<Mutex<Vec<SlowQuery>>>,
     timings: Arc<Mutex<BTreeMap<String, TimingWindow>>>,
+    /// §P7-A pa7.2: per-kind latency histograms. Kinds align with the timing
+    /// labels so `record_latency_sample` can observe into both surfaces with
+    /// one lookup.
+    histograms: Arc<Mutex<BTreeMap<String, Arc<Histogram>>>>,
     slow_query_threshold_nanos: u64,
     slow_query_capacity: usize,
     slow_query_log: Option<String>,
@@ -82,6 +208,7 @@ impl Observability {
             counters: Arc::new(CounterSet::default()),
             slow_queries: Arc::new(Mutex::new(Vec::with_capacity(slow_query_capacity))),
             timings: Arc::new(Mutex::new(BTreeMap::new())),
+            histograms: Arc::new(Mutex::new(BTreeMap::new())),
             slow_query_threshold_nanos,
             slow_query_capacity,
             slow_query_log,
@@ -220,16 +347,24 @@ impl Observability {
     }
 
     fn record_latency_sample(&self, kind: &str, nanos: u64) {
-        let Ok(mut timings) = self.timings.lock() else {
-            return;
-        };
-        let window = timings
-            .entry(kind.chars().take(64).collect())
-            .or_insert_with(TimingWindow::default);
-        if window.samples.len() >= self.slow_query_capacity {
-            window.samples.remove(0);
+        let truncated: String = kind.chars().take(64).collect();
+        if let Ok(mut timings) = self.timings.lock() {
+            let window = timings
+                .entry(truncated.clone())
+                .or_insert_with(TimingWindow::default);
+            if window.samples.len() >= self.slow_query_capacity {
+                window.samples.remove(0);
+            }
+            window.samples.push(nanos);
         }
-        window.samples.push(nanos);
+        // §P7-A pa7.2: also observe into the per-kind histogram so /metrics
+        // can expose P50/P95/P99 buckets alongside the slow-query samples.
+        if let Ok(mut histograms) = self.histograms.lock() {
+            let histogram = histograms
+                .entry(truncated)
+                .or_insert_with(|| Arc::new(Histogram::new(LATENCY_BUCKETS_SECONDS)));
+            histogram.observe_nanos(nanos);
+        }
     }
 
     fn emit_slow_query(&self, entry: &SlowQuery) {
@@ -399,7 +534,35 @@ impl Observability {
                 );
             }
         }
+        // §P7-A pa7.1 + pa7.2: emit one Prometheus histogram per recorded kind.
+        // Algorithm kinds use the `kind` suffix in the metric name to keep
+        // the `algorithm_latency_seconds{kind=...}` convention even though we
+        // emit one series per kind here.
+        if let Ok(histograms) = self.histograms.lock() {
+            for (kind, histogram) in histograms.iter() {
+                let metric_name = histogram_metric_name(kind);
+                histogram.render(
+                    &mut out,
+                    &metric_name,
+                    &format!("Latency histogram (seconds) for {kind}"),
+                );
+            }
+        }
         out
+    }
+}
+
+fn histogram_metric_name(kind: &str) -> String {
+    // Map kind labels to Prometheus metric names:
+    // - "cypher" -> "thg_cypher_latency_seconds"
+    // - "vector_search" -> "thg_vector_search_latency_seconds"
+    // - "fulltext_search" -> "thg_fulltext_search_latency_seconds"
+    // - "algorithm:ppr" -> "thg_algorithm_latency_seconds_ppr" (one metric
+    //   per algorithm kind so dashboards can compare per-algorithm budgets)
+    if let Some(rest) = kind.strip_prefix("algorithm:") {
+        format!("thg_algorithm_latency_seconds_{rest}")
+    } else {
+        format!("thg_{kind}_latency_seconds")
     }
 }
 
@@ -518,5 +681,52 @@ mod tests {
         assert_eq!(raw.lines().count(), 1);
         assert!(raw.contains("\"kind\":\"cypher\""));
         std::fs::remove_file(path).ok();
+    }
+
+    // ---- §P7-A pa7.1 histogram unit tests --------------------------------
+
+    #[test]
+    fn histogram_observe_increments_correct_bucket() {
+        let h = Histogram::new(LATENCY_BUCKETS_SECONDS);
+        h.observe_nanos(1_500_000); // 1.5 ms -> bucket 0.005 (and higher)
+        h.observe_nanos(50_000_000); // 50 ms -> bucket 0.05 (and higher)
+        h.observe_nanos(2_500_000_000); // 2.5 s -> bucket 2.5 (and higher)
+        assert_eq!(h.count(), 3);
+        assert_eq!(h.sum_nanos(), 1_500_000 + 50_000_000 + 2_500_000_000);
+    }
+
+    #[test]
+    fn histogram_render_emits_bucket_sum_and_count_lines() {
+        let h = Histogram::new(LATENCY_BUCKETS_SECONDS);
+        h.observe_nanos(3_000_000); // 3 ms
+        let mut out = String::new();
+        h.render(&mut out, "thg_test_latency_seconds", "test latency histogram");
+        assert!(out.contains("thg_test_latency_seconds_bucket{le=\"0.005\"}"));
+        assert!(out.contains("thg_test_latency_seconds_bucket{le=\"+Inf\"} 1"));
+        assert!(out.contains("thg_test_latency_seconds_sum "));
+        assert!(out.contains("thg_test_latency_seconds_count 1"));
+        assert!(out.contains("# TYPE thg_test_latency_seconds histogram"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_cypher_histogram_after_timing_recorded() {
+        let obs = Observability::default();
+        obs.record_query_timing(KIND_CYPHER, "MATCH (n) RETURN n", 12_000_000, 0, 0);
+        let prom = obs.render_prometheus();
+        assert!(
+            prom.contains("thg_cypher_latency_seconds_count 1"),
+            "expected cypher histogram count in /metrics output:\n{prom}",
+        );
+        assert!(prom.contains("# TYPE thg_cypher_latency_seconds histogram"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_algorithm_histogram_per_kind() {
+        let obs = Observability::default();
+        obs.record_query_timing(KIND_ALGO_PAGERANK, "pagerank", 4_000_000, 0, 0);
+        obs.record_query_timing(KIND_ALGO_COMPONENTS, "components", 7_000_000, 0, 0);
+        let prom = obs.render_prometheus();
+        assert!(prom.contains("thg_algorithm_latency_seconds_pagerank_count 1"));
+        assert!(prom.contains("thg_algorithm_latency_seconds_components_count 1"));
     }
 }
