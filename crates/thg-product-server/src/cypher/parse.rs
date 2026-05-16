@@ -6,8 +6,8 @@ use pest_derive::Parser;
 use serde_json::Value;
 
 use crate::cypher::ast::{
-    CypherPattern, EdgeChain, EdgePattern, EdgeStep, EdgeVarLength, NodePattern, ParsedCypher,
-    PropertyFilter, ReturnItem,
+    CypherPattern, EdgeChain, EdgePattern, EdgeStep, EdgeVarLength, MergeBranch, NodePattern,
+    ParsedCypher, PropertyFilter, ReturnItem, SetExpr, WriteClause,
 };
 use crate::query_surface::QuerySurfaceError;
 
@@ -39,30 +39,34 @@ pub fn parse_cypher_pest(
         .next()
         .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty pest output"))?;
 
-    // The new grammar wraps clauses in `read_query` or `write_query`. Unwrap
-    // to find the body whose clauses we iterate. write_query bodies are not
-    // yet built into the AST: pa3.1.3 will add `parse_write_query`. For now
-    // we surface a typed "pending" error so callers can distinguish
-    // unsupported-yet from invalid.
     let body_pair = query_pair
         .into_inner()
         .find(|p| matches!(p.as_rule(), Rule::read_query | Rule::write_query))
         .ok_or_else(|| {
             QuerySurfaceError::invalid("invalid_cypher_query", "missing query body")
         })?;
-    if matches!(body_pair.as_rule(), Rule::write_query) {
-        return Err(QuerySurfaceError::unsupported(
-            "write_clauses_pending",
-            "CREATE / MERGE / SET / DELETE parse but the AST builder lands in §P3-A pa3.1.3",
-        ));
+    // Clone the normalized string before passing the body pair onward. The
+    // pest Pair holds `&str` slices into `normalized`, so we cannot move the
+    // String while the Pair is still in scope.
+    let normalized_owned = normalized.clone();
+    match body_pair.as_rule() {
+        Rule::read_query => parse_read_query(normalized_owned, body_pair, params),
+        Rule::write_query => parse_write_query(normalized_owned, body_pair, params),
+        _ => unreachable!(),
     }
+}
 
+fn parse_read_query(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
     let mut pattern: Option<CypherPattern> = None;
     let mut where_filter: Option<PropertyFilter> = None;
     let mut returns: Vec<ReturnItem> = Vec::new();
     let mut limit: usize = DEFAULT_LIMIT;
 
-    for inner in body_pair.into_inner() {
+    for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::match_clause => {
                 pattern = Some(parse_match(inner, params)?);
@@ -125,6 +129,337 @@ pub fn parse_cypher_pest(
         limit,
         writes: Vec::new(),
     })
+}
+
+fn parse_write_query(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| QuerySurfaceError::invalid("invalid_cypher_query", "empty write query"))?;
+    match inner.as_rule() {
+        Rule::create_node_only => parse_create_node_only(normalized, inner, params),
+        Rule::merge_clause => parse_merge_clause(normalized, inner, params),
+        Rule::match_with_set => parse_match_with_set(normalized, inner, params),
+        Rule::match_with_delete => parse_match_with_delete(normalized, inner, params),
+        other => Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            format!("unsupported write rule: {other:?}"),
+        )),
+    }
+}
+
+fn parse_create_node_only(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let create_target = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target")
+        })?;
+    let target_inner = create_target
+        .into_inner()
+        .next()
+        .ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "CREATE missing target inner")
+        })?;
+    match target_inner.as_rule() {
+        Rule::node_pattern => {
+            let node = parse_node_pattern(target_inner, params)?;
+            Ok(ParsedCypher {
+                normalized,
+                pattern: CypherPattern::Node(node.clone()),
+                where_filter: None,
+                returns: Vec::new(),
+                limit: 0,
+                writes: vec![WriteClause::CreateNode { node }],
+            })
+        }
+        Rule::create_edge_form => {
+            let mut iter = target_inner.into_inner();
+            let left_pair = iter
+                .next()
+                .ok_or_else(|| {
+                    QuerySurfaceError::invalid(
+                        "invalid_cypher_query",
+                        "CREATE edge missing left node",
+                    )
+                })?;
+            let left = parse_node_pattern(left_pair, params)?;
+            let continuation = iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "CREATE edge missing relation")
+            })?;
+            let mut cont_iter = continuation.into_inner();
+            let rel_pair = cont_iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "missing CREATE rel type")
+            })?;
+            let edge_type = parse_rel_type(rel_pair)?;
+            let right_pair = cont_iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "missing CREATE right node")
+            })?;
+            let right = parse_node_pattern(right_pair, params)?;
+            let edge = EdgePattern {
+                left: left.clone(),
+                edge_type,
+                right: right.clone(),
+            };
+            Ok(ParsedCypher {
+                normalized,
+                pattern: CypherPattern::Edge(edge.clone()),
+                where_filter: None,
+                returns: Vec::new(),
+                limit: 0,
+                writes: vec![WriteClause::CreateEdge { edge }],
+            })
+        }
+        other => Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            format!("unexpected CREATE target: {other:?}"),
+        )),
+    }
+}
+
+fn parse_merge_clause(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let mut node: Option<NodePattern> = None;
+    let mut on_create: Option<MergeBranch> = None;
+    let mut on_match: Option<MergeBranch> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::node_pattern => {
+                node = Some(parse_node_pattern(child, params)?);
+            }
+            Rule::merge_branch => {
+                let raw = child.as_str();
+                let is_on_create = raw.to_ascii_uppercase().contains("ON CREATE");
+                let mut sub = child.into_inner();
+                let set_list = sub
+                    .next()
+                    .ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_cypher_query",
+                            "MERGE branch missing SET",
+                        )
+                    })?;
+                let branch = parse_set_list(set_list, params)?;
+                if is_on_create {
+                    on_create = Some(branch);
+                } else {
+                    on_match = Some(branch);
+                }
+            }
+            _ => {}
+        }
+    }
+    let node = node.ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "MERGE missing node pattern")
+    })?;
+    Ok(ParsedCypher {
+        normalized,
+        pattern: CypherPattern::Node(node.clone()),
+        where_filter: None,
+        returns: Vec::new(),
+        limit: 0,
+        writes: vec![WriteClause::Merge {
+            node,
+            on_create,
+            on_match,
+        }],
+    })
+}
+
+fn parse_match_with_set(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let mut pattern: Option<CypherPattern> = None;
+    let mut where_filter: Option<PropertyFilter> = None;
+    let mut set_list_pair: Option<Pair<Rule>> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::match_clause => pattern = Some(parse_match(child, params)?),
+            Rule::where_clause => where_filter = Some(parse_where(child, params)?),
+            Rule::set_list => set_list_pair = Some(child),
+            _ => {}
+        }
+    }
+    let pattern = pattern.ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "SET requires MATCH clause")
+    })?;
+    let set_list = set_list_pair.ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "missing SET list")
+    })?;
+    let branch = parse_set_list(set_list, params)?;
+    let writes: Vec<WriteClause> = branch
+        .sets
+        .into_iter()
+        .map(|(binding, key, value)| WriteClause::Set { binding, key, value })
+        .collect();
+    Ok(ParsedCypher {
+        normalized,
+        pattern,
+        where_filter,
+        returns: Vec::new(),
+        limit: 0,
+        writes,
+    })
+}
+
+fn parse_match_with_delete(
+    normalized: String,
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ParsedCypher, QuerySurfaceError> {
+    let mut pattern: Option<CypherPattern> = None;
+    let mut where_filter: Option<PropertyFilter> = None;
+    let mut delete: Option<(String, bool)> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::match_clause => pattern = Some(parse_match(child, params)?),
+            Rule::where_clause => where_filter = Some(parse_where(child, params)?),
+            Rule::delete_form => {
+                let form = child.into_inner().next().ok_or_else(|| {
+                    QuerySurfaceError::invalid(
+                        "invalid_cypher_query",
+                        "delete form missing inner rule",
+                    )
+                })?;
+                let detach = matches!(form.as_rule(), Rule::detach_delete);
+                let binding = form
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| {
+                        QuerySurfaceError::invalid(
+                            "invalid_cypher_query",
+                            "DELETE missing target binding",
+                        )
+                    })?
+                    .as_str()
+                    .to_string();
+                delete = Some((binding, detach));
+            }
+            _ => {}
+        }
+    }
+    let pattern = pattern.ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "DELETE requires MATCH clause")
+    })?;
+    let (binding, detach) = delete.ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "DELETE clause missing")
+    })?;
+    Ok(ParsedCypher {
+        normalized,
+        pattern,
+        where_filter,
+        returns: Vec::new(),
+        limit: 0,
+        writes: vec![WriteClause::Delete { binding, detach }],
+    })
+}
+
+fn parse_set_list(
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<MergeBranch, QuerySurfaceError> {
+    let mut sets: Vec<(String, String, SetExpr)> = Vec::new();
+    for child in pair.into_inner() {
+        if !matches!(child.as_rule(), Rule::set_assignment) {
+            continue;
+        }
+        let mut iter = child.into_inner();
+        let path_pair = iter.next().ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "SET missing property path")
+        })?;
+        let mut idents = path_pair.into_inner();
+        let binding = idents
+            .next()
+            .ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "SET path missing binding")
+            })?
+            .as_str()
+            .to_string();
+        let key = idents
+            .next()
+            .ok_or_else(|| {
+                QuerySurfaceError::invalid("invalid_cypher_query", "SET path missing key")
+            })?
+            .as_str()
+            .to_string();
+        let value_pair = iter.next().ok_or_else(|| {
+            QuerySurfaceError::invalid("invalid_cypher_query", "SET missing right-hand side")
+        })?;
+        let value = parse_set_value_expr(value_pair, params)?;
+        sets.push((binding, key, value));
+    }
+    Ok(MergeBranch { sets })
+}
+
+fn parse_set_value_expr(
+    pair: Pair<Rule>,
+    params: &BTreeMap<String, Value>,
+) -> Result<SetExpr, QuerySurfaceError> {
+    let inner = pair.into_inner().next().ok_or_else(|| {
+        QuerySurfaceError::invalid("invalid_cypher_query", "empty SET value")
+    })?;
+    match inner.as_rule() {
+        Rule::increment_expr => {
+            let mut iter = inner.into_inner();
+            let path_pair = iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid(
+                    "invalid_cypher_query",
+                    "increment missing base path",
+                )
+            })?;
+            let mut idents = path_pair.into_inner();
+            let base_binding = idents
+                .next()
+                .ok_or_else(|| {
+                    QuerySurfaceError::invalid(
+                        "invalid_cypher_query",
+                        "increment missing binding",
+                    )
+                })?
+                .as_str()
+                .to_string();
+            let base_key = idents
+                .next()
+                .ok_or_else(|| {
+                    QuerySurfaceError::invalid(
+                        "invalid_cypher_query",
+                        "increment missing key",
+                    )
+                })?
+                .as_str()
+                .to_string();
+            let delta_pair = iter.next().ok_or_else(|| {
+                QuerySurfaceError::invalid(
+                    "invalid_cypher_query",
+                    "increment missing delta",
+                )
+            })?;
+            let delta = parse_value(delta_pair, params)?;
+            Ok(SetExpr::Increment {
+                base_binding,
+                base_key,
+                delta,
+            })
+        }
+        Rule::value => Ok(SetExpr::Literal(parse_value(inner, params)?)),
+        other => Err(QuerySurfaceError::invalid(
+            "invalid_cypher_query",
+            format!("unsupported SET value rule: {other:?}"),
+        )),
+    }
 }
 
 fn normalize_query(query: &str) -> String {
@@ -754,6 +1089,91 @@ mod parse_to_ast_tests {
             parsed.returns[0],
             ReturnItem::Path { ref binding, .. } if binding == "p"
         ));
+    }
+
+    #[test]
+    fn parse_create_node_emits_write_clause() {
+        let parsed = parse_cypher_pest(
+            "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(parsed.writes.len(), 1);
+        let WriteClause::CreateNode { node } = &parsed.writes[0] else {
+            panic!("expected CreateNode write clause");
+        };
+        assert_eq!(node.label.as_deref(), Some("Doc"));
+        assert_eq!(node.properties.get("id").unwrap(), &serde_json::json!("a"));
+    }
+
+    #[test]
+    fn parse_merge_with_on_create_and_on_match_emits_merge_clause() {
+        let parsed = parse_cypher_pest(
+            "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(parsed.writes.len(), 1);
+        let WriteClause::Merge {
+            node,
+            on_create,
+            on_match,
+        } = &parsed.writes[0]
+        else {
+            panic!("expected Merge write clause");
+        };
+        assert_eq!(node.label.as_deref(), Some("Doc"));
+        let on_create = on_create.as_ref().expect("on_create branch present");
+        let on_match = on_match.as_ref().expect("on_match branch present");
+        assert_eq!(on_create.sets.len(), 1);
+        let (_, _, on_match_expr) = &on_match.sets[0];
+        assert!(matches!(on_match_expr, SetExpr::Increment { .. }));
+    }
+
+    #[test]
+    fn parse_match_set_emits_set_clause() {
+        let parsed = parse_cypher_pest(
+            "MATCH (n:Doc {id: 'a'}) SET n.flag = true",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(parsed.writes.len(), 1);
+        let WriteClause::Set {
+            binding,
+            key,
+            value,
+        } = &parsed.writes[0]
+        else {
+            panic!("expected Set write clause");
+        };
+        assert_eq!(binding, "n");
+        assert_eq!(key, "flag");
+        assert!(matches!(value, SetExpr::Literal(_)));
+    }
+
+    #[test]
+    fn parse_match_delete_emits_delete_clause() {
+        let parsed =
+            parse_cypher_pest("MATCH (n:Doc {id: 'a'}) DELETE n", &BTreeMap::new()).unwrap();
+        assert_eq!(parsed.writes.len(), 1);
+        let WriteClause::Delete { binding, detach } = &parsed.writes[0] else {
+            panic!("expected Delete write clause");
+        };
+        assert_eq!(binding, "n");
+        assert!(!*detach);
+    }
+
+    #[test]
+    fn parse_match_detach_delete_emits_detach_flag() {
+        let parsed = parse_cypher_pest(
+            "MATCH (n:Doc {id: 'a'}) DETACH DELETE n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let WriteClause::Delete { detach, .. } = &parsed.writes[0] else {
+            panic!("expected Delete write clause");
+        };
+        assert!(*detach);
     }
 }
 
