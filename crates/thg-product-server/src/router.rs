@@ -285,6 +285,18 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/graph/algorithms/communities",
             post(graph_algorithm_communities),
         )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/designate",
+            post(graph_spatial_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/radius",
+            post(graph_spatial_radius),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/bbox",
+            post(graph_spatial_bbox),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -1092,9 +1104,12 @@ async fn graph_node_upsert(
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
     };
-    match store.upsert_node(body.into_record()) {
+    let record = body.into_record();
+    let spatial_clone = record.clone();
+    match store.upsert_node(record) {
         Ok(result) => {
             state.observability.record_mutation();
+            state.maybe_index_node_spatially(&tenant_id, &spatial_clone);
             Json(json!({ "ok": true, "node": result })).into_response()
         }
         Err(error) => {
@@ -2268,6 +2283,150 @@ async fn graph_algorithm_pagerank(
             .collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+// ===== Phase 8: Spatial endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct SpatialDesignateBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    #[serde(default = "default_h3_resolution")]
+    resolution: u8,
+}
+
+fn default_h3_resolution() -> u8 {
+    8
+}
+
+#[derive(Debug, Deserialize)]
+struct SpatialRadiusBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    lat: f64,
+    lon: f64,
+    radius_km: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpatialBboxBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+}
+
+async fn graph_spatial_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    match state.designate_spatial_property(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.resolution,
+    ) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "label": body.label,
+            "lat_property": body.lat_property,
+            "lon_property": body.lon_property,
+            "resolution": body.resolution,
+        }))
+        .into_response(),
+        Err(error) => {
+            state.observability.record_error();
+            store_unavailable_response(error)
+        }
+    }
+}
+
+async fn graph_spatial_radius(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialRadiusBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_spatial_search();
+    match state.spatial_radius_search(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.lat,
+        body.lon,
+        body.radius_km,
+    ) {
+        Ok(ids) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "count": ids.len(),
+            "node_ids": ids,
+        }))
+        .into_response(),
+        Err(error) => store_unavailable_response(error),
+    }
+}
+
+async fn graph_spatial_bbox(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialBboxBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_spatial_search();
+    match state.spatial_bbox_search(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.min_lat,
+        body.min_lon,
+        body.max_lat,
+        body.max_lon,
+    ) {
+        Ok(ids) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "count": ids.len(),
+            "node_ids": ids,
+        }))
+        .into_response(),
+        Err(error) => store_unavailable_response(error),
+    }
 }
 
 async fn graph_algorithm_communities(

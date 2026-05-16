@@ -12,7 +12,8 @@ use thg_core::{
     sanitize_tenant_segment, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
     GraphRebuildReport, GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction,
     GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    RedCoreGraphStore, RedCoreOptions, RedisGraphStore, VectorDesignation, VerifyReport,
+    RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialDesignation, SpatialIndex,
+    VectorDesignation, VerifyReport,
 };
 use thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 
@@ -30,6 +31,10 @@ struct GraphTransactionContext {
     mutations: GraphMutationBatch,
 }
 
+/// Per-tenant Phase 8 spatial indexes. Keyed by tenant_id then by
+/// (label, lat_property, lon_property).
+type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), SpatialIndex>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -38,6 +43,7 @@ pub struct AppState {
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
     next_graph_txn_id: Arc<AtomicU64>,
+    spatial_indexes: Arc<Mutex<SpatialIndexes>>,
 }
 
 impl AppState {
@@ -49,7 +55,156 @@ impl AppState {
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
+            spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    // ===== Phase 8: spatial designation + indexing =====
+
+    pub fn designate_spatial_property(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        resolution: u8,
+    ) -> Result<(), StoreAccessError> {
+        if !(0..=15).contains(&resolution) {
+            return Err(StoreAccessError::unsupported(format!(
+                "spatial resolution {resolution} is outside 0..=15"
+            )));
+        }
+        let store = self.tenant_graph_store(tenant_id)?;
+        let designation = SpatialDesignation {
+            label: label.to_string(),
+            lat_property: lat_property.to_string(),
+            lon_property: lon_property.to_string(),
+            resolution,
+        };
+        let mut index = SpatialIndex::for_designation(designation.clone());
+        // Bulk-index any existing nodes for the label.
+        let nodes = store
+            .query_nodes(NodeQuery {
+                label: Some(label.to_string()),
+                ..NodeQuery::default()
+            })
+            .map_err(StoreAccessError::from)?;
+        for node in nodes {
+            if let (Some(lat), Some(lon)) = (
+                node.properties
+                    .get(lat_property)
+                    .and_then(|v| v.as_f64()),
+                node.properties
+                    .get(lon_property)
+                    .and_then(|v| v.as_f64()),
+            ) {
+                let _ = index.upsert(&node.id, lat, lon);
+            }
+        }
+        let mut indexes = self
+            .spatial_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("spatial index lock poisoned"))?;
+        indexes
+            .entry(tenant_id.to_string())
+            .or_default()
+            .insert(
+                (
+                    label.to_string(),
+                    lat_property.to_string(),
+                    lon_property.to_string(),
+                ),
+                index,
+            );
+        Ok(())
+    }
+
+    /// Index a node into any designations for its label whose lat+lon
+    /// properties are present. Called on the write path.
+    pub fn maybe_index_node_spatially(&self, tenant_id: &str, node: &NodeRecord) {
+        let Ok(mut indexes) = self.spatial_indexes.lock() else {
+            return;
+        };
+        let Some(tenant_map) = indexes.get_mut(tenant_id) else {
+            return;
+        };
+        for ((label, lat_prop, lon_prop), index) in tenant_map.iter_mut() {
+            if !node.labels.iter().any(|l| l == label) {
+                continue;
+            }
+            let lat = node.properties.get(lat_prop).and_then(|v| v.as_f64());
+            let lon = node.properties.get(lon_prop).and_then(|v| v.as_f64());
+            if let (Some(lat), Some(lon)) = (lat, lon) {
+                let _ = index.upsert(&node.id, lat, lon);
+            }
+        }
+    }
+
+    pub fn spatial_radius_search(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> Result<Vec<String>, StoreAccessError> {
+        let indexes = self
+            .spatial_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("spatial index lock poisoned"))?;
+        let key = (
+            label.to_string(),
+            lat_property.to_string(),
+            lon_property.to_string(),
+        );
+        let Some(tenant_map) = indexes.get(tenant_id) else {
+            return Err(StoreAccessError::unsupported(
+                "no spatial designations for this tenant",
+            ));
+        };
+        let Some(index) = tenant_map.get(&key) else {
+            return Err(StoreAccessError::unsupported(
+                "spatial designation not found; call /spatial/designate first",
+            ));
+        };
+        index
+            .radius_search(lat, lon, radius_km)
+            .map_err(|e| StoreAccessError::unsupported(e.message()))
+    }
+
+    pub fn spatial_bbox_search(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+    ) -> Result<Vec<String>, StoreAccessError> {
+        let indexes = self
+            .spatial_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("spatial index lock poisoned"))?;
+        let key = (
+            label.to_string(),
+            lat_property.to_string(),
+            lon_property.to_string(),
+        );
+        let Some(tenant_map) = indexes.get(tenant_id) else {
+            return Err(StoreAccessError::unsupported(
+                "no spatial designations for this tenant",
+            ));
+        };
+        let Some(index) = tenant_map.get(&key) else {
+            return Err(StoreAccessError::unsupported(
+                "spatial designation not found; call /spatial/designate first",
+            ));
+        };
+        Ok(index.bbox_search(min_lat, min_lon, max_lat, max_lon))
     }
 
     pub fn begin_graph_transaction(&self, tenant_id: &str) -> Result<String, StoreAccessError> {

@@ -9,6 +9,7 @@ pub mod errors;
 pub mod executor;
 pub mod graph;
 pub mod graph_store;
+pub mod spatial;
 pub mod state;
 pub mod store;
 
@@ -30,4 +31,5 @@ pub use graph_store::{
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
+pub use spatial::{SpatialDesignation, SpatialError, SpatialIndex};
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
