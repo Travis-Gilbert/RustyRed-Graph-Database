@@ -2,10 +2,10 @@
 
 RustyRed is a remarkably fast Graph + Vector database.
 It runs entirely in RAM.
-Designed for modern workflows.
+Designed to help humans and their agents work well together.
 
-Featuring GraphCache graph state-aware cache, a first-class MCP agent port, built in RAG for both graph and vector
-multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and an embedded property graph database.
+Featuring GraphCache graph state-aware cache, a first-class MCP agent port, built-in-RAG both graph and vector
+multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and document storage.
 Written in Rust, the best way to write a database. In my humble opinion.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
