@@ -10,11 +10,11 @@ rust-version = "1.85"
 [workspace]
 members = [
     ".",
-    "crates/thg-core",
-    "crates/thg-mcp",
-    "crates/thg-server",
-    "crates/thg-product-server",
-    "crates/thg-resp-server",
+    "crates/rustyred-core",
+    "crates/rustyred-mcp",
+    "crates/rustyred-compat-server",
+    "crates/rustyred-server",
+    "crates/rustyred-resp-server",
 ]
 resolver = "2"
 
@@ -27,7 +27,7 @@ pyo3 = { version = "0.22.5", features = ["abi3-py312", "extension-module"] }
 numpy = "0.22"
 serde_json = "1.0"
 sha2 = "0.10"
-thg-core = { path = "crates/thg-core" }
+rustyred-core = { path = "crates/rustyred-core" }
 egg = "0.10"
 datafrog = "2.0"
 

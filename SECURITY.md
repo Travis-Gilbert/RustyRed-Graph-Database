@@ -21,7 +21,7 @@ In this posture:
 - `/v1/*` and `/mcp` reject requests that do not present a valid
   bearer token from `RUSTY_RED_API_TOKENS`.
 - `/health`, `/ready`, `/openapi.json`, `/.well-known/agent.json`,
-  `/.well-known/mcp/thg.json`, and `/metrics` remain unauthenticated;
+  `/.well-known/mcp/rustyred.json`, and `/metrics` remain unauthenticated;
   they expose no tenant data or mutable surface.
 - MCP starts in read-only mode. Write tools are unreachable until the
   operator explicitly enables them.

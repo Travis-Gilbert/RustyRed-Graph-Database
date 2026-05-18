@@ -20,7 +20,7 @@ mod cmh;
 mod graph_export;
 mod push_ppr;
 mod search_kernel;
-mod thg;
+mod rustyred;
 
 use pyo3::prelude::*;
 
@@ -55,8 +55,8 @@ fn rusty_red_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_kernel::search_cosine_topk, m)?)?;
     m.add_function(wrap_pyfunction!(graph_export::graph_remap_ids_batch, m)?)?;
     m.add_function(wrap_pyfunction!(graph_export::graph_pack_edges_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(thg::thg_expand_bounded, m)?)?;
-    m.add_function(wrap_pyfunction!(thg::thg_paths_shortest, m)?)?;
-    m.add_class::<thg::ThgCoreExecutor>()?;
+    m.add_function(wrap_pyfunction!(rustyred::rustyred_expand_bounded, m)?)?;
+    m.add_function(wrap_pyfunction!(rustyred::rustyred_paths_shortest, m)?)?;
+    m.add_class::<rustyred::RustyredCoreExecutor>()?;
     Ok(())
 }

@@ -1,0 +1,10 @@
+[package]
+name = "rustyred-resp-server"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+redis-protocol = "5"
+serde_json = "1.0"
+rustyred-core = { path = "../rustyred-core", features = ["redis-store"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }

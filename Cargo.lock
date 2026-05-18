@@ -1664,9 +1664,70 @@ dependencies = [
  "egg",
  "numpy",
  "pyo3",
+ "rustyred-core",
  "serde_json",
  "sha2",
- "thg-core",
+]
+
+[[package]]
+name = "rustyred-compat-server"
+version = "0.4.0"
+dependencies = [
+ "rustyred-core",
+ "serde_json",
+]
+
+[[package]]
+name = "rustyred-core"
+version = "0.4.0"
+dependencies = [
+ "fs2",
+ "h3o",
+ "instant-distance",
+ "redis",
+ "s2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tantivy",
+]
+
+[[package]]
+name = "rustyred-mcp"
+version = "0.4.0"
+dependencies = [
+ "rustyred-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustyred-resp-server"
+version = "0.4.0"
+dependencies = [
+ "redis-protocol",
+ "rustyred-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rustyred-server"
+version = "0.4.0"
+dependencies = [
+ "axum",
+ "http",
+ "pest",
+ "pest_derive",
+ "redis",
+ "rustyred-core",
+ "rustyred-mcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2065,67 +2126,6 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "thg-core"
-version = "0.4.0"
-dependencies = [
- "fs2",
- "h3o",
- "instant-distance",
- "redis",
- "s2",
- "serde",
- "serde_json",
- "sha2",
- "tantivy",
-]
-
-[[package]]
-name = "thg-mcp"
-version = "0.4.0"
-dependencies = [
- "serde",
- "serde_json",
- "thg-core",
-]
-
-[[package]]
-name = "thg-product-server"
-version = "0.4.0"
-dependencies = [
- "axum",
- "http",
- "pest",
- "pest_derive",
- "redis",
- "serde",
- "serde_json",
- "thg-core",
- "thg-mcp",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "thg-resp-server"
-version = "0.4.0"
-dependencies = [
- "redis-protocol",
- "serde_json",
- "thg-core",
- "tokio",
-]
-
-[[package]]
-name = "thg-server"
-version = "0.4.0"
-dependencies = [
- "serde_json",
- "thg-core",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@ Note put template ID here before making public  `RUSTY_RED_GRAPH_DATABASE_TEMPLA
 ## What Rusty Red does
 
 - **Graph storage** with AOF/snapshot persistence, per-tenant isolation, single-writer serializable commits, and committed read snapshots
-- **Stable, versioned on-disk format** with `thg-upgrade-format` migrations between releases (no export/re-import on upgrade)
+- **Stable, versioned on-disk format** with `rustyred-upgrade-format` migrations between releases (no export/re-import on upgrade)
 - **HNSW vector search** on node properties via `instant-distance`, with hybrid scoring that blends vector similarity and graph proximity
 - **Inverted-index BM25 full-text search** with automatic indexing on node upserts
 - **H3 spatial index** on node lat/lon properties with radius and bounding-box queries
@@ -45,11 +45,11 @@ These are on the roadmap, in roughly this priority order:
 
 | Crate | Purpose |
 |-------|---------|
-| `thg-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
-| `thg-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
-| `thg-product-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
-| `thg-server` | Standalone compatibility command server |
-| `thg-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
+| `rustyred-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
+| `rustyred-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
+| `rustyred-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
+| `rustyred-compat-server` | Standalone compatibility command server |
+| `rustyred-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
 | root crate | PyO3 compatibility bindings for native graph/search helpers |
 
 ## Build (local development)
@@ -78,7 +78,7 @@ second Rusty Red service.
 Run the product server locally:
 
 ```bash
-RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p thg-product-server
+RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
 ```
 
 Strict local durability mode is explicit:
@@ -90,12 +90,12 @@ RUSTY_RED_TXN_ISOLATION=serializable \
 RUSTY_RED_STRICT_ACID=true \
 RUSTY_RED_DURABILITY=aof_always \
 RUSTY_RED_DATA_DIR=data/rusty-red \
-cargo run -p thg-product-server
+cargo run -p rustyred-server
 ```
 
 Core routes are documented by `GET /openapi.json`. The OpenAPI document is
 generated from the product server crate version and currently covers every
-canonical route in `crates/thg-product-server/src/router.rs`.
+canonical route in `crates/rustyred-server/src/router.rs`.
 
 Canonical routes:
 
@@ -103,7 +103,7 @@ Canonical routes:
 GET  /health
 GET  /ready
 GET  /openapi.json
-GET  /.well-known/mcp/thg.json
+GET  /.well-known/mcp/rustyred.json
 GET  /.well-known/agent.json
 POST /mcp
 GET  /metrics
@@ -163,16 +163,16 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 
 | Tool | Description |
 |------|-------------|
-| `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
-| `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
-| `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms: PPR, connected components, PageRank, label-propagation communities |
-| `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces |
-| `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
-| `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
-| `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
-| `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
-| `thg.fulltext.designate` (alias: `thg.graph.fulltext.designate`) / `thg.spatial.designate` (`thg.graph.spatial.designate`) / `thg.bulk.nodes` (`thg.graph.bulk.nodes`) / `thg.bulk.edges` (`thg.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools |
-| `thg.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
+| `rustyred.graph.query` / `rustyred.graph.explain` / `rustyred.graph.neighbors` | Bounded native graph reads and plan inspection |
+| `rustyred.graph.schema` / `rustyred.graph.index_status` | Graph schema and index-health reads |
+| `rustyred.algorithm.ppr` (alias: `rustyred.algo.ppr`) / `rustyred.algorithm.components` (`rustyred.algo.components`) / `rustyred.algorithm.pagerank` (`rustyred.algo.pagerank`) / `rustyred.algorithm.communities` (`rustyred.algo.communities`) | Graph algorithms: PPR, connected components, PageRank, label-propagation communities |
+| `rustyred.fulltext.search` (alias: `rustyred.graph.fulltext.search`) / `rustyred.spatial.radius` (`rustyred.graph.spatial.radius`) / `rustyred.spatial.bbox` (`rustyred.graph.spatial.bbox`) | Full-text and spatial read surfaces |
+| `rustyred.vector.search` | HNSW nearest-neighbor search on vector properties |
+| `rustyred.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
+| `rustyred.vector.designate` | Register a vector property for HNSW indexing (write) |
+| `rustyred.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
+| `rustyred.fulltext.designate` (alias: `rustyred.graph.fulltext.designate`) / `rustyred.spatial.designate` (`rustyred.graph.spatial.designate`) / `rustyred.bulk.nodes` (`rustyred.graph.bulk.nodes`) / `rustyred.bulk.edges` (`rustyred.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools |
+| `rustyred.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
 
 The public query surface is now split cleanly:
 
@@ -232,10 +232,10 @@ RUSTY_RED_MCP_ALLOW_ADMIN=false
 ## Compatibility command server
 
 The product server is the recommended deployment target. A smaller compatibility
-HTTP command server also lives in `crates/thg-server`:
+HTTP command server also lives in `crates/rustyred-compat-server`:
 
 ```bash
-cargo run -p thg-server -- --host 127.0.0.1 --port 7379
+cargo run -p rustyred-compat-server -- --host 127.0.0.1 --port 7379
 ```
 
 Endpoints:
