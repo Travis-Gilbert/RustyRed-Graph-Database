@@ -16,13 +16,18 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/thg-product-server /usr/local/bin/rusty-red-graph-server
 
+# Security-by-default. RUSTY_RED_REQUIRE_AUTH=true means /v1/* and /mcp
+# refuse unauthenticated requests; operators must provision scoped
+# tokens via RUSTY_RED_API_TOKENS (see README + SECURITY.md). For
+# trusted-network or single-tenant deployments, set REQUIRE_AUTH=false
+# at the Railway environment level — never bake it back into the image.
 ENV RUSTY_RED_HOST="[::]" \
     RUSTY_RED_MODE="embedded" \
     RUSTY_RED_DATA_DIR="/app/data/rusty-red" \
     RUSTY_RED_REQUIRE_VOLUME=true \
     RUSTY_RED_DURABILITY="aof_everysec" \
     RUSTY_RED_SNAPSHOT_INTERVAL_WRITES="1000" \
-    RUSTY_RED_REQUIRE_AUTH=false \
+    RUSTY_RED_REQUIRE_AUTH=true \
     RUSTY_RED_KEY_PREFIX="rusty-red:tenant" \
     RUSTY_RED_SERVICE_NAME="rusty-red-graph-database" \
     RUSTY_RED_API_TITLE="Rusty Red Graph Database API" \
