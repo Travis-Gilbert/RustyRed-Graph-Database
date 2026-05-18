@@ -1,11 +1,8 @@
 //! Continuous Agent Memory Harness (CMH) native helpers.
 //!
-//! Exposes two PyO3 functions used by
-//! ``apps.orchestrate.runtime.memory_canonical`` and
-//! ``apps.orchestrate.runtime.handoff_compiler``. The corresponding
-//! Python implementations remain in place as graceful fallbacks per the
-//! `push_ppr` pattern (see `apps/notebook/sparse_ppr.py`). Byte-parity
-//! is enforced by `theseus_native/tests/test_cmh_parity.py`.
+//! Exposes byte-stable helper functions for callers that need identical
+//! hashes across Rust and Python hosts. Byte-parity is enforced by
+//! `tests/test_cmh_parity.py`.
 //!
 //! Why Rust here, given Python's hashlib is already C-backed?
 //!
@@ -13,11 +10,7 @@
 //! machine: at single-call granularity, **Python is faster than Rust**
 //! for these hashers (Py 1.85us vs Rust 3.60us per call). The PyO3
 //! boundary crossing costs more than the work saved because each
-//! function does only two SHA256 rounds + a string concat. As a
-//! result, the Python paths in
-//! `apps/orchestrate/runtime/memory_canonical.py::_atom_id` and
-//! `apps/orchestrate/runtime/handoff_compiler.py::_state_hash` do NOT
-//! route through this module in production — they remain pure Python.
+//! function does only two SHA256 rounds + a string concat.
 //!
 //! This module is retained for three real-but-narrow reasons:
 //!
@@ -35,7 +28,7 @@
 //!      the Python contract.
 //!
 //!   3. **Second source of truth for parity tests**:
-//!      `theseus_native/tests/test_cmh_parity.py` cross-checks the
+//!      `tests/test_cmh_parity.py` cross-checks the
 //!      Python implementation against this Rust reference so that any
 //!      future refactor of the Python impl cannot silently change the
 //!      output digest.
@@ -68,9 +61,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Normalize body text the same way Python's
-/// ``memory_canonical._body_hash`` does:
-///   ``" ".join(str(text or "").lower().split())``
+/// Normalize body text the same way the Python reference helper does:
+/// ``" ".join(str(text or "").lower().split())``.
 fn normalize_body(text: &str) -> String {
     text.split_whitespace()
         .map(|chunk| chunk.to_lowercase())
@@ -84,11 +76,10 @@ pub fn cmh_body_hash(text: &str) -> String {
     sha256_hex(normalize_body(text).as_bytes())
 }
 
-/// Deterministic atom id v1 used by ``memory_canonical._atom_id``.
+/// Deterministic atom id v1.
 ///
-/// Encoding mirrors the Python implementation exactly so the
-/// canonicalize pipeline can emit byte-identical ids regardless of
-/// which language ran it.
+/// Encoding mirrors the Python reference exactly so callers can emit
+/// byte-identical ids regardless of which language ran it.
 #[pyfunction]
 pub fn cmh_atom_id_v1(workstream_id: &str, kind: &str, body: &str) -> String {
     let mut keyed = String::with_capacity(workstream_id.len() + kind.len() + 66);

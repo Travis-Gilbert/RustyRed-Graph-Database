@@ -242,7 +242,7 @@ pub fn paths_shortest_weighted(
 
 // ===== Phase 6: Graph algorithms =====
 
-/// ACL local-push Personalized PageRank (matches `theseus_native::push_ppr`).
+/// ACL local-push Personalized PageRank (matches `rusty_red_native::push_ppr`).
 ///
 /// `adjacency` maps source node id to `(target, weight)` pairs. `seeds` maps
 /// node id to initial residual mass; values should sum to ~1.0. Returns

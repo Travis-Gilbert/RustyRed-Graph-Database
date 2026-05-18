@@ -302,8 +302,7 @@ mod tests {
 
     #[test]
     fn make_spatial_backend_defaults_to_h3() {
-        let backend =
-            make_spatial_backend_from_value(fixture_designation(), "").unwrap();
+        let backend = make_spatial_backend_from_value(fixture_designation(), "").unwrap();
         assert_eq!(backend.designation().label, "Place");
     }
 

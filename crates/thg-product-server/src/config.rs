@@ -183,7 +183,7 @@ impl Config {
             .or_else(|_| env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let redis_key_prefix = env_first(&["RUSTY_RED_KEY_PREFIX", "THG_REDIS_KEY_PREFIX"])
-            .unwrap_or_else(|_| "theseus:thg:tenant".to_string());
+            .unwrap_or_else(|_| "rusty-red:tenant".to_string());
         let require_auth = env_first(&["RUSTY_RED_REQUIRE_AUTH", "THG_REQUIRE_AUTH"])
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
@@ -200,9 +200,9 @@ impl Config {
             .filter_map(ApiToken::parse)
             .collect();
         let service_name = env_first(&["RUSTY_RED_SERVICE_NAME", "THG_SERVICE_NAME"])
-            .unwrap_or_else(|_| "thg-product".to_string());
+            .unwrap_or_else(|_| "rusty-red-graph-database".to_string());
         let api_title = env_first(&["RUSTY_RED_API_TITLE", "THG_API_TITLE"])
-            .unwrap_or_else(|_| "Theorem Context THG API".to_string());
+            .unwrap_or_else(|_| "Rusty Red Graph Database API".to_string());
         let public_url = env_first(&["RUSTY_RED_PUBLIC_URL", "THG_PUBLIC_URL"]).ok();
         let mcp_enabled = env_bool(&["RUSTY_RED_MCP_ENABLED", "THG_MCP_ENABLED"], true);
         let mcp_read_only = env_bool(&["RUSTY_RED_MCP_READ_ONLY", "THG_MCP_READ_ONLY"], true);

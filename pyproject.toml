@@ -3,9 +3,9 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "theseus_native"
-version = "0.1.0"
-description = "Native (Rust + PyO3) accelerators for Theseus retrieval. push_ppr is the first export."
+name = "rusty_red_native"
+version = "0.4.0"
+description = "Rusty Red GraphDB engine, product server, MCP adapter, and PyO3 compatibility accelerators."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -20,6 +20,6 @@ classifiers = [
 ]
 
 [tool.maturin]
-module-name = "theseus_native"
+module-name = "rusty_red_native"
 features = ["pyo3/extension-module"]
 strip = true

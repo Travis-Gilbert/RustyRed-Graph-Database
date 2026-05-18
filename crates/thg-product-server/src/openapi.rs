@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
+const API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
     let tenant_parameter = json!({
         "name": "tenant_id",
@@ -37,16 +39,16 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
         "openapi": "3.1.0",
         "info": {
             "title": state.config.api_title.as_str(),
-            "version": "0.1.0",
+            "version": API_VERSION,
             "description": "Rusty Red Graph Database HTTP API. This document describes the graph/run/context HTTP surface and the MCP transport endpoint; it is not a RedisGraph, FalkorDB, or raw Redis protocol specification."
         },
         "tags": [
             { "name": "operations", "description": "Health, readiness, metrics, and discovery." },
             { "name": "mcp", "description": "Streamable HTTP MCP agent port over Rusty Red graph APIs." },
-            { "name": "runs", "description": "THG-compatible run and batch command runtime." },
+            { "name": "runs", "description": "Rusty Red compatibility command runtime." },
             { "name": "graph", "description": "First-class graph node, edge, adjacency, index, and verification routes." },
             { "name": "transactions", "description": "Open and commit staged transaction workflows for Cypher writes." },
-            { "name": "context", "description": "Context pack writes used by Context Theorem harness flows." }
+            { "name": "context", "description": "Context pack writes for graph-backed agent workflows." }
         ],
         "security": [{ "bearerAuth": [] }],
         "paths": {
@@ -248,7 +250,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/command": {
                 "post": {
                     "tags": ["runs"],
-                    "summary": "Execute a THG-compatible command using explicit or default tenant policy",
+                    "summary": "Execute a compatibility command using explicit or default tenant policy",
                     "description": "Product-facing alias for command execution. When tenant_id is omitted, the configured default tenant is used.",
                     "requestBody": {
                         "required": true,
@@ -270,7 +272,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/batch": {
                 "post": {
                     "tags": ["runs"],
-                    "summary": "Execute multiple THG-compatible commands using explicit or default tenant policy",
+                    "summary": "Execute multiple compatibility commands using explicit or default tenant policy",
                     "description": "Product-facing alias for batch execution. When tenant_id is omitted, the configured default tenant is used.",
                     "requestBody": {
                         "required": true,
@@ -439,7 +441,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/cypher/explain": {
                 "post": {
                     "tags": ["graph"],
-                    "summary": "Explain the first read-only OpenCypher-compatible subset",
+                    "summary": "Explain the bounded OpenCypher-compatible subset",
                     "description": "Parses the same bounded `/v1/cypher` subset and returns plan plus compatibility-matrix details without executing writes or unsupported operators.",
                     "requestBody": {
                         "required": true,
@@ -637,7 +639,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/tenants/{tenant_id}/command": {
                 "post": {
                     "tags": ["runs"],
-                    "summary": "Execute a THG-compatible command",
+                    "summary": "Execute a compatibility command",
                     "parameters": [tenant_parameter.clone()],
                     "requestBody": {
                         "required": true,
@@ -658,7 +660,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             "/v1/tenants/{tenant_id}/batch": {
                 "post": {
                     "tags": ["runs"],
-                    "summary": "Execute multiple THG-compatible commands",
+                    "summary": "Execute multiple compatibility commands",
                     "parameters": [tenant_parameter.clone()],
                     "requestBody": {
                         "required": true,
@@ -916,6 +918,352 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/tenants/{tenant_id}/graph/vector/designate": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Designate a vector property",
+                    "description": "Registers a node label/property pair as a fixed-dimension HNSW vector field. Existing matching nodes are indexed during designation; later node upserts refresh the index.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/VectorDesignateRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/DesignationResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/vector/search": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Search vector indexes",
+                    "description": "Runs an HNSW nearest-neighbor search over the designated vector property. Results include distance and the current node record when available.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/VectorSearchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SearchResultsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/vector/hybrid": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Search vector indexes with graph proximity scoring",
+                    "description": "Blends vector similarity with graph-distance scores from explicit graph seeds. Per-request scoring overrides can adjust alpha, confidence weighting, and edge-type weights.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/HybridSearchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/HybridResultsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/epistemic-neighbors": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Traverse confidence-weighted epistemic edges",
+                    "description": "Returns neighboring graph nodes reachable through optional epistemic edge-type and confidence filters.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/EpistemicNeighborsRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/EpistemicNeighborsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/algorithms/ppr": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run Personalized PageRank",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AlgorithmPprRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/AlgorithmScoresResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/algorithms/components": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Compute connected components",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AlgorithmComponentsRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/ComponentsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/algorithms/pagerank": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run global PageRank",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AlgorithmPageRankRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/AlgorithmScoresResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/algorithms/communities": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Detect label-propagation communities",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AlgorithmCommunitiesRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/CommunitiesResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/designate": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Designate a spatial index",
+                    "description": "Registers latitude/longitude node properties for the configured spatial backend. Upserts of matching nodes refresh the index.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialDesignateRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SpatialDesignationResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/radius": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a spatial radius query",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialRadiusRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SpatialIdsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/bbox": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a spatial bounding-box query",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialBboxRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SpatialIdsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/fulltext/designate": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Designate a full-text index",
+                    "description": "Registers a node label/property pair for the configured full-text backend and indexes existing matching nodes.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/FullTextDesignateRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/DesignationResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/fulltext/search": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Search a full-text index",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/FullTextSearchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SearchResultsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/bulk/nodes": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Bulk load graph nodes",
+                    "description": "Accepts newline-delimited JSON node records or CSV. CSV uses the first row as headers unless the `headers` query parameter is provided. Mutations flush in batches and return line-level errors.",
+                    "parameters": [
+                        tenant_parameter.clone(),
+                        { "name": "batch_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": 500 } },
+                        { "name": "headers", "in": "query", "schema": { "type": "string" }, "description": "Optional comma-separated CSV headers." }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/jsonl": { "schema": { "type": "string" } },
+                            "text/csv": { "schema": { "type": "string" } }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/BulkIngestResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/bulk/edges": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Bulk load graph edges",
+                    "description": "Accepts newline-delimited JSON edge records or CSV. CSV uses `from_id` and `to_id` columns by default; override those names with `from_col` and `to_col`.",
+                    "parameters": [
+                        tenant_parameter.clone(),
+                        { "name": "batch_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": 500 } },
+                        { "name": "headers", "in": "query", "schema": { "type": "string" }, "description": "Optional comma-separated CSV headers." },
+                        { "name": "from_col", "in": "query", "schema": { "type": "string", "default": "from_id" } },
+                        { "name": "to_col", "in": "query", "schema": { "type": "string", "default": "to_id" } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/jsonl": { "schema": { "type": "string" } },
+                            "text/csv": { "schema": { "type": "string" } }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/BulkIngestResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/context/pack": {
                 "post": {
                     "tags": ["context"],
@@ -936,17 +1284,6 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "503": { "$ref": "#/components/responses/StoreUnavailable" }
                     }
                 }
-            },
-            "/metrics": {
-                "get": {
-                    "tags": ["operations"],
-                    "summary": "Read operational metrics",
-                    "responses": {
-                        "200": { "description": "Prometheus-style metrics or operational metric text." },
-                        "401": { "$ref": "#/components/responses/Unauthorized" },
-                        "403": { "$ref": "#/components/responses/Forbidden" }
-                    }
-                }
             }
         },
         "components": {
@@ -959,7 +1296,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             },
             "responses": {
                 "CommandResponse": {
-                    "description": "THG-compatible command response.",
+                    "description": "Rusty Red compatibility command response.",
                     "content": {
                         "application/json": {
                             "schema": { "type": "object", "additionalProperties": true }
@@ -988,6 +1325,86 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "content": {
                         "application/json": {
                             "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                        }
+                    }
+                },
+                "DesignationResponse": {
+                    "description": "Index designation acknowledgement.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/DesignationResponseBody" }
+                        }
+                    }
+                },
+                "SpatialDesignationResponse": {
+                    "description": "Spatial index designation acknowledgement.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/SpatialDesignationResponseBody" }
+                        }
+                    }
+                },
+                "SearchResultsResponse": {
+                    "description": "Search result list.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/SearchResultsResponseBody" }
+                        }
+                    }
+                },
+                "HybridResultsResponse": {
+                    "description": "Hybrid vector/graph search result list.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/HybridResultsResponseBody" }
+                        }
+                    }
+                },
+                "EpistemicNeighborsResponse": {
+                    "description": "Epistemic neighbor traversal result.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/EpistemicNeighborsResponseBody" }
+                        }
+                    }
+                },
+                "AlgorithmScoresResponse": {
+                    "description": "Node-score algorithm result.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/AlgorithmScoresResponseBody" }
+                        }
+                    }
+                },
+                "ComponentsResponse": {
+                    "description": "Connected-components result.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/ComponentsResponseBody" }
+                        }
+                    }
+                },
+                "CommunitiesResponse": {
+                    "description": "Community detection result.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/CommunitiesResponseBody" }
+                        }
+                    }
+                },
+                "SpatialIdsResponse": {
+                    "description": "Spatial query result.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/SpatialIdsResponseBody" }
+                        }
+                    }
+                },
+                "BulkIngestResponse": {
+                    "description": "Bulk ingest report.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/BulkIngestResponseBody" }
                         }
                     }
                 },
@@ -1244,7 +1661,9 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                                 "context_pack",
                                 "retrieval_plan",
                                 "semantic_answer_candidate",
-                                "modal_parse_result"
+                                "modal_parse_result",
+                                "vector_search_result",
+                                "epistemic_traversal"
                             ]
                         },
                         "key": {},
@@ -1275,7 +1694,9 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                                 "context_pack",
                                 "retrieval_plan",
                                 "semantic_answer_candidate",
-                                "modal_parse_result"
+                                "modal_parse_result",
+                                "vector_search_result",
+                                "epistemic_traversal"
                             ]
                         },
                         "key": {},
@@ -1498,6 +1919,376 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/NeighborHit" }
                         }
+                    },
+                    "additionalProperties": false
+                },
+                "VectorDesignateRequest": {
+                    "type": "object",
+                    "required": ["label", "property", "dimension"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "dimension": { "type": "integer", "minimum": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                "VectorSearchRequest": {
+                    "type": "object",
+                    "required": ["query", "property"],
+                    "properties": {
+                        "query": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "minItems": 1
+                        },
+                        "k": { "type": "integer", "minimum": 1, "default": 10 },
+                        "label": { "type": "string" },
+                        "property": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "HybridSearchRequest": {
+                    "type": "object",
+                    "required": ["query", "property", "graph_seeds"],
+                    "properties": {
+                        "query": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "minItems": 1
+                        },
+                        "k": { "type": "integer", "minimum": 1, "default": 10 },
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "graph_seeds": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "default": []
+                        },
+                        "max_hops": { "type": "integer", "minimum": 0, "default": 3 },
+                        "alpha": { "type": "number" },
+                        "confidence_weighted_graph_distance": { "type": "boolean" },
+                        "edge_type_weights": {
+                            "type": "object",
+                            "additionalProperties": { "type": "number" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "EpistemicNeighborsRequest": {
+                    "type": "object",
+                    "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string" },
+                        "epistemic_types": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["Supports", "Contradicts", "Tension", "Derives", "Cites"]
+                            }
+                        },
+                        "min_confidence": { "type": "number" },
+                        "max_depth": { "type": "integer", "minimum": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                "AlgorithmPprRequest": {
+                    "type": "object",
+                    "required": ["seeds"],
+                    "properties": {
+                        "seeds": {
+                            "type": "object",
+                            "additionalProperties": { "type": "number" }
+                        },
+                        "alpha": { "type": "number", "default": 0.15 },
+                        "epsilon": { "type": "number", "default": 0.0001 },
+                        "max_pushes": { "type": "integer", "minimum": 1, "default": 200000 },
+                        "top_k": { "type": "integer", "minimum": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                "AlgorithmComponentsRequest": {
+                    "type": "object",
+                    "properties": {
+                        "directed": { "type": "boolean", "default": false }
+                    },
+                    "additionalProperties": false
+                },
+                "AlgorithmPageRankRequest": {
+                    "type": "object",
+                    "properties": {
+                        "damping": { "type": "number", "default": 0.85 },
+                        "max_iter": { "type": "integer", "minimum": 1, "default": 100 },
+                        "tolerance": { "type": "number", "default": 0.000001 },
+                        "top_k": { "type": "integer", "minimum": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                "AlgorithmCommunitiesRequest": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "SpatialDesignateRequest": {
+                    "type": "object",
+                    "required": ["label", "lat_property", "lon_property"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "lat_property": { "type": "string" },
+                        "lon_property": { "type": "string" },
+                        "resolution": { "type": "integer", "minimum": 0, "default": 8 }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialRadiusRequest": {
+                    "type": "object",
+                    "required": ["label", "lat_property", "lon_property", "lat", "lon", "radius_km"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "lat_property": { "type": "string" },
+                        "lon_property": { "type": "string" },
+                        "lat": { "type": "number" },
+                        "lon": { "type": "number" },
+                        "radius_km": { "type": "number", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialBboxRequest": {
+                    "type": "object",
+                    "required": ["label", "lat_property", "lon_property", "min_lat", "min_lon", "max_lat", "max_lon"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "lat_property": { "type": "string" },
+                        "lon_property": { "type": "string" },
+                        "min_lat": { "type": "number" },
+                        "min_lon": { "type": "number" },
+                        "max_lat": { "type": "number" },
+                        "max_lon": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "FullTextDesignateRequest": {
+                    "type": "object",
+                    "required": ["label", "property"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "FullTextSearchRequest": {
+                    "type": "object",
+                    "required": ["property", "query"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "query": { "type": "string" },
+                        "k": { "type": "integer", "minimum": 1, "default": 10 }
+                    },
+                    "additionalProperties": false
+                },
+                "DesignationResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "label", "property"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "dimension": { "type": "integer", "minimum": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialDesignationResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "label", "lat_property", "lon_property", "resolution"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "label": { "type": "string" },
+                        "lat_property": { "type": "string" },
+                        "lon_property": { "type": "string" },
+                        "resolution": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "SearchResultHit": {
+                    "type": "object",
+                    "required": ["node_id"],
+                    "properties": {
+                        "node_id": { "type": "string" },
+                        "distance": { "type": "number" },
+                        "score": { "type": "number" },
+                        "node": {
+                            "oneOf": [
+                                { "$ref": "#/components/schemas/NodeRecord" },
+                                { "type": "null" }
+                            ]
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "SearchResultsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "results"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "results": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SearchResultHit" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "HybridResultsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "results", "scoring"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "results": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SearchResultHit" }
+                        },
+                        "scoring": {
+                            "type": "object",
+                            "properties": {
+                                "alpha": { "type": "number" },
+                                "confidence_weighted_graph_distance": { "type": "boolean" },
+                                "edge_type_weights": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "number" }
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "EpistemicNeighborsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "results"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["edge", "node"],
+                                "properties": {
+                                    "edge": { "$ref": "#/components/schemas/EdgeRecord" },
+                                    "node": { "$ref": "#/components/schemas/NodeRecord" }
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "NodeScore": {
+                    "type": "object",
+                    "required": ["node_id", "score"],
+                    "properties": {
+                        "node_id": { "type": "string" },
+                        "score": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "AlgorithmScoresResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "scores"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "alpha": { "type": "number" },
+                        "epsilon": { "type": "number" },
+                        "damping": { "type": "number" },
+                        "scores": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/NodeScore" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "ComponentsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "directed", "components", "count"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "directed": { "type": "boolean" },
+                        "components": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "count": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "CommunityHit": {
+                    "type": "object",
+                    "required": ["node_id", "community_id"],
+                    "properties": {
+                        "node_id": { "type": "string" },
+                        "community_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "CommunitiesResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "algorithm", "communities", "modularity"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "algorithm": { "const": "label_propagation" },
+                        "communities": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/CommunityHit" }
+                        },
+                        "modularity": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialIdsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "count", "node_ids"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "count": { "type": "integer", "minimum": 0 },
+                        "node_ids": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "BulkError": {
+                    "type": "object",
+                    "required": ["line", "code", "message"],
+                    "properties": {
+                        "line": { "type": "integer", "minimum": 1 },
+                        "code": { "type": "string" },
+                        "message": { "type": "string" },
+                        "record_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "BulkIngestResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "inserted", "failed", "errors", "batches"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "inserted": { "type": "integer", "minimum": 0 },
+                        "failed": { "type": "integer", "minimum": 0 },
+                        "errors": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/BulkError" }
+                        },
+                        "batches": { "type": "integer", "minimum": 0 }
                     },
                     "additionalProperties": false
                 },
@@ -1828,32 +2619,56 @@ mod tests {
 
         let Json(document) = openapi(State(state)).await;
 
-        assert!(document
-            .pointer("/paths/~1v1~1tenants~1{tenant_id}~1graph~1rebuild-indexes/post")
-            .is_some());
-        assert!(document.pointer("/paths/~1v1~1query/post").is_some());
-        assert!(document.pointer("/paths/~1v1~1cypher/post").is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1cypher~1explain/post")
-            .is_some());
-        assert!(document.pointer("/paths/~1metrics/get").is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1diagnostics~1slow_queries/get")
-            .is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1diagnostics~1config/get")
-            .is_some());
-        assert!(document.pointer("/paths/~1v1~1cache~1check/post").is_some());
-        assert!(document.pointer("/paths/~1v1~1cache~1put/post").is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1transactions~1begin/post")
-            .is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1transactions~1commit/post")
-            .is_some());
-        assert!(document
-            .pointer("/paths/~1v1~1transactions~1rollback/post")
-            .is_some());
+        assert_eq!(
+            document.pointer("/info/version"),
+            Some(&serde_json::Value::String(
+                env!("CARGO_PKG_VERSION").to_string()
+            ))
+        );
+
+        for (path, method) in [
+            ("/metrics", "get"),
+            ("/v1/diagnostics/slow_queries", "get"),
+            ("/v1/diagnostics/config", "get"),
+            ("/v1/query", "post"),
+            ("/v1/cypher", "post"),
+            ("/v1/cypher/explain", "post"),
+            ("/v1/transactions/begin", "post"),
+            ("/v1/transactions/commit", "post"),
+            ("/v1/transactions/rollback", "post"),
+            ("/v1/cache/check", "post"),
+            ("/v1/cache/put", "post"),
+            ("/v1/tenants/{tenant_id}/graph/rebuild-indexes", "post"),
+            ("/v1/tenants/{tenant_id}/graph/vector/designate", "post"),
+            ("/v1/tenants/{tenant_id}/graph/vector/search", "post"),
+            ("/v1/tenants/{tenant_id}/graph/vector/hybrid", "post"),
+            ("/v1/tenants/{tenant_id}/graph/epistemic-neighbors", "post"),
+            ("/v1/tenants/{tenant_id}/graph/algorithms/ppr", "post"),
+            (
+                "/v1/tenants/{tenant_id}/graph/algorithms/components",
+                "post",
+            ),
+            ("/v1/tenants/{tenant_id}/graph/algorithms/pagerank", "post"),
+            (
+                "/v1/tenants/{tenant_id}/graph/algorithms/communities",
+                "post",
+            ),
+            ("/v1/tenants/{tenant_id}/graph/spatial/designate", "post"),
+            ("/v1/tenants/{tenant_id}/graph/spatial/radius", "post"),
+            ("/v1/tenants/{tenant_id}/graph/spatial/bbox", "post"),
+            ("/v1/tenants/{tenant_id}/graph/fulltext/designate", "post"),
+            ("/v1/tenants/{tenant_id}/graph/fulltext/search", "post"),
+            ("/v1/tenants/{tenant_id}/graph/bulk/nodes", "post"),
+            ("/v1/tenants/{tenant_id}/graph/bulk/edges", "post"),
+        ] {
+            let encoded_path = path.replace('/', "~1");
+            let pointer = format!("/paths/{encoded_path}/{method}");
+            assert!(
+                document.pointer(&pointer).is_some(),
+                "missing OpenAPI path {path} {method}"
+            );
+        }
+
         assert_eq!(
             document.pointer("/components/schemas/RebuildIndexesResponse/properties/rebuild/$ref"),
             Some(&serde_json::Value::String(

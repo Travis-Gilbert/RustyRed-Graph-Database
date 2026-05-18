@@ -1657,6 +1657,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "rusty_red_native"
+version = "0.4.0"
+dependencies = [
+ "datafrog",
+ "egg",
+ "numpy",
+ "pyo3",
+ "serde_json",
+ "sha2",
+ "thg-core",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2055,21 +2068,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "theseus_native"
-version = "0.3.0"
-dependencies = [
- "datafrog",
- "egg",
- "numpy",
- "pyo3",
- "serde_json",
- "sha2",
- "thg-core",
-]
-
-[[package]]
 name = "thg-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fs2",
  "h3o",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "thg-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "thg-product-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "http",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "thg-resp-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "redis-protocol",
  "serde_json",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "thg-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "thg-core",

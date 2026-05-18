@@ -34,8 +34,7 @@ struct GraphTransactionContext {
 
 /// Per-tenant Phase 8 spatial indexes. Keyed by tenant_id then by
 /// (label, lat_property, lon_property).
-type SpatialIndexes =
-    BTreeMap<String, BTreeMap<(String, String, String), Box<dyn SpatialBackend>>>;
+type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), Box<dyn SpatialBackend>>>;
 
 /// Per-tenant Phase 5 full-text indexes. Keyed by tenant_id then by
 /// (label, property).
@@ -567,7 +566,7 @@ impl AppState {
     pub fn mcp_config(&self) -> McpServerConfig {
         McpServerConfig {
             name: self.config.service_name.clone(),
-            version: "0.3.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,

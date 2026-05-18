@@ -254,7 +254,7 @@ impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
             name: "rusty-red-graph-database".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             default_tenant: "default".to_string(),
             read_only: true,
             allow_admin: false,

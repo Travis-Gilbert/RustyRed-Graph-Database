@@ -1,8 +1,8 @@
 [package]
 name = "thg-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Model Context Protocol adapter for the Theorem HotGraph graph database."
+description = "Model Context Protocol adapter for Rusty Red Graph Database."
 license = "MIT"
 rust-version = "1.85"
 

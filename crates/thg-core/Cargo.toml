@@ -1,8 +1,8 @@
 [package]
 name = "thg-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Theorem HotGraph core command executor and state machine."
+description = "Rusty Red core command executor and graph state machine."
 license = "MIT"
 rust-version = "1.85"
 

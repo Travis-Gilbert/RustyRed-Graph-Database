@@ -27,7 +27,7 @@ Note put template ID here before making public  `RUSTY_RED_GRAPH_DATABASE_TEMPLA
 - **JSONL bulk loader** for nodes and edges
 - **Observability**: Prometheus `/metrics` (17 counters), slow-query ring buffer at `/v1/diagnostics/slow_queries`
 - **HTTP transaction API**: `/v1/transactions/begin|commit|rollback` with snapshot isolation
-- **50x to 400x** faster Personalized PageRank than Python (ACL local-push algorithm, exposed via PyO3)
+- **Native algorithm helpers** exposed through the root PyO3 compatibility crate, including ACL local-push Personalized PageRank
 
 ## What you can't do yet
 
@@ -39,7 +39,7 @@ These are on the roadmap, in roughly this priority order:
 4. `REMOVE` clauses
 5. CSV/JSONL `LOAD CSV` syntactic form (JSONL bulk endpoints exist already)
 6. Distributed snapshot replication
-7. Spatial S2 cell index (H3 ships today)
+7. Per-query spatial backend selection; H3 ships by default and S2 is available behind the `s2` feature plus `RUSTY_RED_SPATIAL_BACKEND=s2`
 
 ## Crate structure
 
@@ -48,9 +48,9 @@ These are on the roadmap, in roughly this priority order:
 | `thg-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
 | `thg-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
 | `thg-product-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
-| `thg-server` | Standalone THG command server (non-product) |
+| `thg-server` | Standalone compatibility command server |
 | `thg-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
-| root crate | PyO3 bindings for `push_ppr` and `ThgCoreExecutor` |
+| root crate | PyO3 compatibility bindings for native graph/search helpers |
 
 ## Build (local development)
 
@@ -58,11 +58,11 @@ Requires Rust 1.85+ and `maturin >= 1.7`.
 
 ```bash
 python3 -m pip install --user maturin
-cd theseus_native
+cargo check --workspace
 maturin develop --release
 ```
 
-This builds an `abi3-py312` wheel and installs it into the active Python environment. After this, `from theseus_native import push_ppr` works in any Python 3.12+ interpreter that shares the venv.
+`cargo check --workspace` validates the Rust workspace. `maturin develop --release` builds the root `abi3-py312` compatibility wheel into the active Python environment.
 
 ## Product server
 
@@ -71,12 +71,13 @@ RAM-first storage and local AOF/snapshot persistence. It exposes graph
 operations, vector search, epistemic traversal, Cypher queries, and the
 graph-version cache over HTTP and MCP.
 
-`RUSTY_RED_MODE=redis` is available for legacy THG state commands only.
+`RUSTY_RED_MODE=redis` is available only for legacy compatibility deployments.
+The normal Rusty Red service does not require Redis, FalkorDB, Memgraph, or any
+second Rusty Red service.
 
 Run the product server locally:
 
 ```bash
-cd theseus_native
 RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p thg-product-server
 ```
 
@@ -92,19 +93,28 @@ RUSTY_RED_DATA_DIR=data/rusty-red \
 cargo run -p thg-product-server
 ```
 
-Core routes:
+Core routes are documented by `GET /openapi.json`. The OpenAPI document is
+generated from the product server crate version and currently covers every
+canonical route in `crates/thg-product-server/src/router.rs`.
+
+Canonical routes:
 
 ```text
 GET  /health
 GET  /ready
 GET  /openapi.json
 GET  /.well-known/mcp/thg.json
+GET  /.well-known/agent.json
 POST /mcp
+GET  /metrics
 POST /v1/command
 POST /v1/batch
 POST /v1/query
 POST /v1/cypher
 POST /v1/cypher/explain
+POST /v1/transactions/begin
+POST /v1/transactions/commit
+POST /v1/transactions/rollback
 POST /v1/cache/put
 POST /v1/cache/get
 POST /v1/cache/check
@@ -127,7 +137,7 @@ POST /v1/tenants/{tenant_id}/graph/rebuild-indexes
 POST /v1/tenants/{tenant_id}/graph/vector/search
 POST /v1/tenants/{tenant_id}/graph/vector/hybrid
 POST /v1/tenants/{tenant_id}/graph/vector/designate
-POST /v1/tenants/{tenant_id}/graph/epistemic/neighbors
+POST /v1/tenants/{tenant_id}/graph/epistemic-neighbors
 POST /v1/tenants/{tenant_id}/graph/algorithms/ppr
 POST /v1/tenants/{tenant_id}/graph/algorithms/components
 POST /v1/tenants/{tenant_id}/graph/algorithms/pagerank
@@ -144,6 +154,9 @@ GET  /v1/diagnostics/config
 POST /v1/tenants/{tenant_id}/context/pack
 ```
 
+`GET /health/` and `GET /ready/` are trailing-slash aliases for deployment
+probes.
+
 ### MCP tools
 
 The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/call`):
@@ -152,13 +165,13 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 |------|-------------|
 | `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
 | `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
-| `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms (PPR, connected components, PageRank, label-propagation communities). §P6-B SPEC names accepted as aliases. |
-| `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces. §P6-B SPEC names accepted as aliases. |
+| `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms: PPR, connected components, PageRank, label-propagation communities |
+| `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces |
 | `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
 | `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
 | `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
 | `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
-| `thg.fulltext.designate` (alias: `thg.graph.fulltext.designate`) / `thg.spatial.designate` (`thg.graph.spatial.designate`) / `thg.bulk.nodes` (`thg.graph.bulk.nodes`) / `thg.bulk.edges` (`thg.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools. §P6-B SPEC names accepted as aliases. |
+| `thg.fulltext.designate` (alias: `thg.graph.fulltext.designate`) / `thg.spatial.designate` (`thg.graph.spatial.designate`) / `thg.bulk.nodes` (`thg.graph.bulk.nodes`) / `thg.bulk.edges` (`thg.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools |
 | `thg.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
 
 The public query surface is now split cleanly:
@@ -171,66 +184,57 @@ The public query surface is now split cleanly:
 startup-only tenant override details. Runtime mutation of tenant config is not
 supported in this slice.
 
-Railway template readiness follows the public template guidance: use a GitHub
-source repo, keep the service root minimal, set `/ready` as the health check,
-wire Redis only for explicit `RUSTY_RED_MODE=redis` deployments through private
-networking/reference variables, attach persistent storage to stateful dependencies,
-set `RUSTY_RED_REQUIRE_VOLUME=true` for embedded Railway deployments so `/ready`
-fails when the mounted volume is absent, generate any public-ingress tokens with
-Railway template variable functions, and replace the badge placeholder above once
-Railway assigns the final template URL.
+## Railway template
 
-Railway can deploy this directory directly:
+Railway can deploy this repository directly as one web service:
 
-The included `Dockerfile`, `railway.toml`, and `.railwayignore` are for the
-standalone Rusty Red subtree repository. The monorepo Railway template under
-`railway-templates/rusty-red-graph-database/` remains useful when deploying
-from the full Theseus repository.
+- Build with the included `Dockerfile`.
+- Use `/ready` as the health check.
+- Attach one persistent volume mounted at `/app/data/rusty-red`.
+- Keep `RUSTY_RED_MODE=embedded`.
+- Keep `RUSTY_RED_REQUIRE_VOLUME=true` so `/ready` fails if the volume is missing.
+- For public ingress, set `RUSTY_RED_REQUIRE_AUTH=true` and provide scoped `RUSTY_RED_API_TOKENS`.
+- Replace the badge placeholder once Railway assigns the final public template URL.
 
-## Build (release wheels)
+The template should not require Redis or a second service. Redis variables are
+still accepted for explicit legacy deployments, but they are not part of the
+standalone Rusty Red template path.
 
-CI builds Linux x86_64 manylinux2014 wheels via `.github/workflows/build_native_wheels.yml`. macOS arm64 is built locally for now (Travis's M1); CI build for Darwin is out of scope for the first cut.
+## Downstream integrations
 
-Use `scripts/verify_thg_release.sh` from the repository root for the THG
-runtime/product release check. The verifier intentionally uses package-targeted
-Cargo release builds for the THG server binaries and uses `maturin` for the root
-PyO3 extension:
+This repository is the upstream source for versioned Rusty Red releases.
+Product integrations can consume it as a downstream `git subtree` and keep
+their own deployment adapters or private overlays downstream. The included
+`.github/workflows/sync-downstream.yml` can open downstream sync PRs after
+pushes to `main` when `DOWNSTREAM_SYNC_REPOSITORY` and `DOWNSTREAM_SYNC_TOKEN`
+are configured in repository settings.
 
-```bash
-scripts/verify_thg_release.sh
-scripts/verify_thg_release.sh --develop  # install into the active Python env
+See `docs/downstream-sync.md` for the setup contract and the local subtree sync
+command.
+
+## Docker defaults
+
+The bundled image runs `rusty-red-graph-server` with these important defaults:
+
+```text
+RUSTY_RED_HOST=[::]
+RUSTY_RED_MODE=embedded
+RUSTY_RED_DATA_DIR=/app/data/rusty-red
+RUSTY_RED_REQUIRE_VOLUME=true
+RUSTY_RED_DURABILITY=aof_everysec
+RUSTY_RED_SNAPSHOT_INTERVAL_WRITES=1000
+RUSTY_RED_REQUIRE_AUTH=false
+RUSTY_RED_MCP_ENABLED=true
+RUSTY_RED_MCP_READ_ONLY=true
+RUSTY_RED_MCP_ALLOW_ADMIN=false
 ```
 
-Do not use `cargo build --manifest-path theseus_native/Cargo.toml --workspace
---release` as the native release check on macOS. That command attempts to link
-the root PyO3 `cdylib` as a plain Cargo artifact and can fail with undefined
-Python symbols even when the THG binaries and `maturin` wheel path are healthy.
+## Compatibility command server
 
-## Public API
-
-```python
-def push_ppr(
-    adjacency: dict[int, list[tuple[int, float]]],
-    seeds: dict[int, float],
-    *,
-    alpha: float = 0.15,
-    epsilon: float = 1e-4,
-    max_pushes: int = 200_000,
-) -> dict[int, float]: ...
-```
-
-## Fallback semantics
-
-`apps/notebook/sparse_ppr.py` is the dispatcher. It tries `from theseus_native import push_ppr` first; on ImportError, or when `THESEUS_DISABLE_NATIVE=1` is set in the environment at call time, it routes to the pure-Python `_python_push_ppr` defined in the same file. The fallback exists indefinitely (per ADR 0001 follow-up) so dev environments without the wheel still function.
-
-The wrapper logs once at WARNING level on the first import that finds the wheel missing: `theseus_native unavailable, using Python push_ppr`. Subsequent imports do not re-log.
-
-## THG standalone HTTP server
-
-Phase 1 standalone mode lives in `crates/thg-server`:
+The product server is the recommended deployment target. A smaller compatibility
+HTTP command server also lives in `crates/thg-server`:
 
 ```bash
-cd theseus_native
 cargo run -p thg-server -- --host 127.0.0.1 --port 7379
 ```
 
@@ -245,11 +249,21 @@ POST /v1/command
 POST /v1/batch
 ```
 
-Django selects embedded or remote THG with:
+## Python compatibility bindings
 
-```bash
-THG_MODE=in_process
-THG_MODE=remote_http THG_HTTP_URL=http://localhost:7379
+The root crate exposes native helper functions through PyO3 for Python 3.12+.
+These bindings are not required for the Railway template. The most important
+algorithm helper is:
+
+```python
+def push_ppr(
+    adjacency: dict[int, list[tuple[int, float]]],
+    seeds: dict[int, float],
+    *,
+    alpha: float = 0.15,
+    epsilon: float = 1e-4,
+    max_pushes: int = 200_000,
+) -> dict[int, float]: ...
 ```
 
 ## Algorithm reference
@@ -258,7 +272,9 @@ Andersen, R., Chung, F., and Lang, K. (2006). Local Graph Partitioning using Pag
 
 ## Benchmarks
 
-Single-threaded, single-seed PPR queries on random sparse graphs (avg degree 4, alpha 0.15, epsilon 1e-4), captured on the developer's M1 Max via the harness in `tests/test_benchmarks.py`:
+Single-threaded, single-seed PPR queries on random sparse graphs (average
+degree 4, alpha 0.15, epsilon 1e-4), captured on an M1 Max via
+`tests/test_benchmarks.py`:
 
 | Nodes | Native | Python | Speedup |
 |-------|--------|--------|---------|

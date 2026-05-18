@@ -1,80 +1,39 @@
-"""Property-based parity test for theseus_native.push_ppr.
-
-For every generated (adjacency, seeds, alpha, epsilon) input, the native
-and Python implementations must agree within 1e-5 relative tolerance per
-node. Acceptance criterion 6 in docs/plans/theseus-native-push-ppr/
-design-doc.md.
-
-The test toggles between code paths by setting THESEUS_DISABLE_NATIVE in
-the environment. Reading is at call time (per Stage 2 dispatcher), so
-no re-import is needed between toggles. Both code paths are exercised
-inside the same hypothesis example.
-
-Skip semantics:
-- If theseus_native is not importable, the entire module skips.
-- If apps.notebook.sparse_ppr is not importable (e.g. the test runs
-  outside the Django repo), the entire module skips.
-"""
+"""Property-based parity tests for rusty_red_native.push_ppr."""
 
 from __future__ import annotations
 
-import os
 import random
-import sys
 from typing import Dict, List, Tuple
-from unittest.mock import patch
 
 import pytest
+from ppr_reference import python_push_ppr
 
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import HealthCheck, given, settings, strategies as st  # noqa: E402
 
-# Skip the whole module if either the native wheel or the dispatcher is
-# not importable. This keeps the file safe to run in any context.
-theseus_native = pytest.importorskip("theseus_native")
-
-try:
-    # The dispatcher lives in the Index-API repo. It may not be on
-    # sys.path when running pytest directly inside theseus_native/. We
-    # prepend the repo root so the import resolves.
-    _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
-    # apps.notebook.sparse_ppr is intentionally Django-free (no model
-    # imports, only logging + os + collections). It loads in a bare
-    # interpreter without django.setup().
-    from apps.notebook import sparse_ppr  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    sparse_ppr = None  # type: ignore[assignment]
-    pytestmark = pytest.mark.skip(reason="apps.notebook.sparse_ppr not importable")
-
+rusty_red_native = pytest.importorskip("rusty_red_native")
 
 Adjacency = Dict[int, List[Tuple[int, float]]]
 Seeds = Dict[int, float]
 
 
 def _build_random_sparse_graph(num_nodes: int, avg_degree: float, rng: random.Random) -> Adjacency:
-    """Generate a sparse undirected weighted graph with avg_degree edges/node.
-
-    Node IDs are sampled from a non-contiguous range (multiplied by a
-    prime) so the test exercises arbitrary integer keys, mimicking
-    Theseus PKs.
-    """
+    """Generate a sparse undirected weighted graph with arbitrary integer IDs."""
     node_ids = [(i + 1) * 31 for i in range(num_nodes)]
-    adj: Adjacency = {nid: [] for nid in node_ids}
+    adj: Adjacency = {node_id: [] for node_id in node_ids}
     target_edges = int(num_nodes * avg_degree // 2)
     for _ in range(target_edges):
         u, v = rng.sample(node_ids, 2)
-        w = rng.uniform(0.1, 1.0)
-        adj[u].append((v, w))
-        adj[v].append((u, w))
+        weight = rng.uniform(0.1, 1.0)
+        adj[u].append((v, weight))
+        adj[v].append((u, weight))
     return adj
 
 
 def _build_seeds(node_ids: List[int], num_seeds: int, rng: random.Random) -> Seeds:
     chosen = rng.sample(node_ids, min(num_seeds, len(node_ids)))
     weight = 1.0 / len(chosen)
-    return {nid: weight for nid in chosen}
+    return {node_id: weight for node_id in chosen}
 
 
 def _assert_dicts_close(
@@ -83,21 +42,15 @@ def _assert_dicts_close(
     rel_tol: float,
     abs_tol: float,
 ) -> None:
-    """Per-key relative-tolerance check.
-
-    Uses absolute tolerance as a floor for keys whose expected value is
-    near zero (e.g., 1e-7), where a 1e-5 relative comparison would be
-    spuriously strict.
-    """
     keys = set(got) | set(expected)
     diffs: List[Tuple[int, float, float, float]] = []
-    for k in keys:
-        a = got.get(k, 0.0)
-        b = expected.get(k, 0.0)
+    for key in keys:
+        a = got.get(key, 0.0)
+        b = expected.get(key, 0.0)
         denom = max(abs(b), abs(a), abs_tol)
         rel = abs(a - b) / denom
         if rel > rel_tol:
-            diffs.append((k, a, b, rel))
+            diffs.append((key, a, b, rel))
     assert not diffs, (
         f"native vs python disagree on {len(diffs)} nodes "
         f"(showing up to 10): {diffs[:10]}"
@@ -129,14 +82,8 @@ def test_native_matches_python_within_tolerance(
     adj = _build_random_sparse_graph(num_nodes, avg_degree, rng)
     seeds = _build_seeds(list(adj.keys()), num_seeds, rng)
 
-    # Native path: no env var set.
-    env_native = {k: v for k, v in os.environ.items() if k != "THESEUS_DISABLE_NATIVE"}
-    with patch.dict(os.environ, env_native, clear=True):
-        native = sparse_ppr.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
-
-    # Python path: force fallback.
-    with patch.dict(os.environ, {"THESEUS_DISABLE_NATIVE": "1"}):
-        python = sparse_ppr.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
+    native = rusty_red_native.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
+    python = python_push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
 
     _assert_dicts_close(native, python, rel_tol=1e-5, abs_tol=1e-9)
 
@@ -160,28 +107,18 @@ def test_native_matches_python_at_100k_nodes(
     alpha: float,
     epsilon: float,
 ) -> None:
-    """Same parity check at 100K nodes. Bounded to 5 examples for runtime."""
     rng = random.Random(seed)
     adj = _build_random_sparse_graph(100_000, avg_degree, rng)
     seeds = _build_seeds(list(adj.keys()), num_seeds, rng)
 
-    env_native = {k: v for k, v in os.environ.items() if k != "THESEUS_DISABLE_NATIVE"}
-    with patch.dict(os.environ, env_native, clear=True):
-        native = sparse_ppr.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
-    with patch.dict(os.environ, {"THESEUS_DISABLE_NATIVE": "1"}):
-        python = sparse_ppr.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
+    native = rusty_red_native.push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
+    python = python_push_ppr(adj, seeds, alpha=alpha, epsilon=epsilon)
 
     _assert_dicts_close(native, python, rel_tol=1e-5, abs_tol=1e-9)
 
 
-def _build_les_mis_like_adjacency() -> Adjacency:
-    """Two communities + bridge, matching the fixture in
-    apps/notebook/tests/test_sparse_ppr.py:_build_les_mis_like_adjacency.
-
-    Verifying parity on the same fixture the Django suite uses anchors
-    the native impl to the production test surface.
-    """
-    adj: Adjacency = {n: [] for n in range(10)}
+def _build_two_community_adjacency() -> Adjacency:
+    adj: Adjacency = {node: [] for node in range(10)}
     edges: List[Tuple[int, int, float]] = []
     for i in range(5):
         for j in range(i + 1, 5):
@@ -190,25 +127,20 @@ def _build_les_mis_like_adjacency() -> Adjacency:
         for j in range(i + 1, 10):
             edges.append((i, j, 1.0))
     edges.append((4, 5, 0.3))
-    for u, v, w in edges:
-        adj[u].append((v, w))
-        adj[v].append((u, w))
+    for u, v, weight in edges:
+        adj[u].append((v, weight))
+        adj[v].append((u, weight))
     return adj
 
 
-def test_les_mis_fixture_parity() -> None:
-    """Native and Python agree on the fixture used by the Django test suite."""
-    adj = _build_les_mis_like_adjacency()
+def test_two_community_fixture_parity() -> None:
+    adj = _build_two_community_adjacency()
     seeds = {0: 1.0}
 
-    env_native = {k: v for k, v in os.environ.items() if k != "THESEUS_DISABLE_NATIVE"}
-    with patch.dict(os.environ, env_native, clear=True):
-        native = sparse_ppr.push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
-    with patch.dict(os.environ, {"THESEUS_DISABLE_NATIVE": "1"}):
-        python = sparse_ppr.push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
+    native = rusty_red_native.push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
+    python = python_push_ppr(adj, seeds, alpha=0.15, epsilon=1e-4)
 
     _assert_dicts_close(native, python, rel_tol=1e-5, abs_tol=1e-9)
 
-    # Top-5 set must match the existing NETWORKX_TOP5_NODES expectation.
-    top5_native = {nid for nid, _ in sorted(native.items(), key=lambda x: -x[1])[:5]}
+    top5_native = {node_id for node_id, _ in sorted(native.items(), key=lambda x: -x[1])[:5]}
     assert top5_native == {0, 1, 2, 3, 4}

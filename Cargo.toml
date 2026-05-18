@@ -1,10 +1,10 @@
 [package]
-name = "theseus_native"
-version = "0.3.0"
+name = "rusty_red_native"
+version = "0.4.0"
 edition = "2021"
-description = "Native (Rust + PyO3) accelerators for Theseus retrieval. push_ppr is the first export."
+description = "Rusty Red GraphDB engine, product server, MCP adapter, and PyO3 compatibility accelerators."
 license = "MIT"
-repository = "https://github.com/Travis-Gilbert/index-api"
+repository = "https://github.com/Travis-Gilbert/RustyRed-Graph-Database"
 rust-version = "1.85"
 
 [workspace]
@@ -19,7 +19,7 @@ members = [
 resolver = "2"
 
 [lib]
-name = "theseus_native"
+name = "rusty_red_native"
 crate-type = ["cdylib"]
 
 [dependencies]

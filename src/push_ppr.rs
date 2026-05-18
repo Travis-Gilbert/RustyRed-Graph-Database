@@ -1,7 +1,6 @@
 //! ACL local-push personalized PageRank.
 //!
-//! Port of `apps/notebook/sparse_ppr.py:push_ppr`. The algorithm is
-//! Andersen-Chung-Lang local push:
+//! Andersen-Chung-Lang local-push algorithm:
 //!
 //!   1. Seed residual r[u] = seeds[u].
 //!   2. While the queue is non-empty and pushes < max_pushes:
@@ -29,8 +28,8 @@
 //! touch a node we sum its edge weights; subsequent reads come from
 //! the cache.
 //!
-//! The Python reference is canonical: all numerical decisions match it
-//! within float-rounding tolerance. Any divergence is a bug in this file.
+//! The test reference is canonical for numerical decisions; any divergence
+//! outside float-rounding tolerance is a bug in this file.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -106,8 +105,7 @@ fn fetch_neighbors(adjacency: &Bound<'_, PyDict>, u: i64) -> PyResult<Option<Vec
 /// `push_ppr(adjacency, seeds, *, alpha=0.15, epsilon=1e-4, max_pushes=200_000)
 /// -> dict[int, float]`.
 ///
-/// Matches `apps/notebook/sparse_ppr.py:push_ppr` semantically. See the
-/// module docstring for the algorithm.
+/// See the module docstring for the algorithm.
 #[pyfunction]
 #[pyo3(signature = (adjacency, seeds, *, alpha=0.15, epsilon=1e-4, max_pushes=200_000))]
 pub fn push_ppr<'py>(

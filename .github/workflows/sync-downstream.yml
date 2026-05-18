@@ -1,0 +1,120 @@
+name: Sync Downstream Integrations
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Subtree operation mode.
+        required: false
+        default: pull
+        type: choice
+        options:
+          - pull
+          - add
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Open downstream sync PR
+    runs-on: ubuntu-latest
+    env:
+      SYNC_TARGET_PATH: ${{ vars.DOWNSTREAM_SYNC_PATH || 'vendor/rusty-red' }}
+      SYNC_BRANCH: ${{ vars.DOWNSTREAM_SYNC_BRANCH || 'main' }}
+      SYNC_MODE: ${{ inputs.mode || vars.DOWNSTREAM_SYNC_MODE || 'pull' }}
+      UPSTREAM_REMOTE: https://github.com/${{ github.repository }}.git
+      UPSTREAM_REF: ${{ github.ref_name || 'main' }}
+    steps:
+      - name: Check downstream sync configuration
+        id: config
+        env:
+          SYNC_REPOSITORY: ${{ vars.DOWNSTREAM_SYNC_REPOSITORY }}
+          SYNC_TOKEN: ${{ secrets.DOWNSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SYNC_REPOSITORY" || -z "$SYNC_TOKEN" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Downstream sync is not configured; set DOWNSTREAM_SYNC_REPOSITORY and DOWNSTREAM_SYNC_TOKEN."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "repository=$SYNC_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 0
+
+      - name: Check out downstream
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.config.outputs.repository }}
+          token: ${{ secrets.DOWNSTREAM_SYNC_TOKEN }}
+          ref: ${{ env.SYNC_BRANCH }}
+          path: downstream
+
+      - name: Sync subtree
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: downstream
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="rusty-red-sync/${GITHUB_SHA::12}"
+          git checkout -B "$branch"
+          ../source/scripts/sync-downstream-subtree.sh \
+            --downstream . \
+            --prefix "$SYNC_TARGET_PATH" \
+            --remote "$UPSTREAM_REMOTE" \
+            --ref "$UPSTREAM_REF" \
+            --mode "$SYNC_MODE"
+          if git diff --quiet "origin/$SYNC_BRANCH...HEAD"; then
+            echo "No downstream sync changes."
+            exit 0
+          fi
+          git push --force-with-lease origin "$branch"
+
+      - name: Open or update downstream PR
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: downstream
+        env:
+          GH_TOKEN: ${{ secrets.DOWNSTREAM_SYNC_TOKEN }}
+          SYNC_REPOSITORY: ${{ steps.config.outputs.repository }}
+        run: |
+          set -euo pipefail
+          branch="rusty-red-sync/${GITHUB_SHA::12}"
+          if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "No sync branch was pushed."
+            exit 0
+          fi
+
+          body_file="$(mktemp)"
+          {
+            echo "Syncs Rusty Red upstream changes from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
+            echo
+            echo "- Upstream ref: ${UPSTREAM_REF}"
+            echo "- Downstream path: ${SYNC_TARGET_PATH}"
+            echo "- Mode: ${SYNC_MODE}"
+          } > "$body_file"
+
+          title="chore(rusty-red): sync upstream ${GITHUB_SHA::12}"
+          if gh pr view "$branch" --repo "$SYNC_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --repo "$SYNC_REPOSITORY" \
+              --title "$title" \
+              --body-file "$body_file"
+          else
+            gh pr create \
+              --repo "$SYNC_REPOSITORY" \
+              --base "$SYNC_BRANCH" \
+              --head "$branch" \
+              --title "$title" \
+              --body-file "$body_file"
+          fi

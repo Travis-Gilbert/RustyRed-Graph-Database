@@ -281,8 +281,7 @@ mod tests {
 
     #[test]
     fn make_fulltext_backend_defaults_to_hand_rolled() {
-        let backend =
-            make_fulltext_backend_from_value(fixture_designation(), "").unwrap();
+        let backend = make_fulltext_backend_from_value(fixture_designation(), "").unwrap();
         assert_eq!(backend.designation().label, "Doc");
         assert_eq!(backend.doc_count(), 0);
     }
