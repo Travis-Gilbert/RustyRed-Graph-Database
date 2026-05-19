@@ -36,14 +36,41 @@ resulting risk.
 
 Authentication is bearer-token. Tokens are configured via the
 `RUSTY_RED_API_TOKENS` environment variable as a comma-separated
-list, each entry of the form `<token>:<scope>[,<scope>...]` where
-the supported scopes are:
+list. Each entry has the form:
+
+```
+<secret>=<scope>|<scope>|...
+```
+
+`<secret>` is the bearer token presented by clients; `<scope>` is a
+permission string. Pipes separate scopes within one entry, commas
+separate entries.
+
+Example (one admin token):
+
+```
+RUSTY_RED_API_TOKENS=6267f6...fed5=graph:read|graph:write|admin:read|run:read|run:write
+```
+
+Supported canonical scopes:
 
 | Scope | Grants |
 |---|---|
-| `read` | All `GET` routes and read-only `POST` queries (`/v1/query`, `/v1/cypher` with non-mutating clauses, `/v1/cache/get`, etc.). |
-| `write` | All `read` plus mutating routes (`/v1/cypher` with `CREATE`/`MERGE`/`SET`/`DELETE`, `/v1/tenants/{id}/graph/nodes`, bulk ingest, etc.). |
-| `admin` | All `write` plus `/v1/tenants/{id}/graph/rebuild-indexes`, `/v1/tenants/{id}/graph/verify`, and the MCP admin tool surface (only when `RUSTY_RED_MCP_ALLOW_ADMIN=true`). |
+| `graph:read` | All read routes on the graph: `/v1/query`, `/v1/cypher` with non-mutating clauses, `/v1/tenants/{id}/graph/nodes/{node_id}` (GET), `/v1/tenants/{id}/graph/stats`, `/v1/tenants/{id}/graph/vector/search`, `/v1/tenants/{id}/graph/fulltext/search`, `/v1/tenants/{id}/graph/spatial/radius`, etc. |
+| `graph:write` | All `graph:read` plus mutating routes: `/v1/cypher` with `CREATE`/`MERGE`/`SET`/`DELETE`, `/v1/tenants/{id}/graph/nodes` (POST), `/v1/tenants/{id}/graph/edges` (POST), `/v1/tenants/{id}/graph/bulk/nodes`, `/v1/tenants/{id}/graph/bulk/edges`, `/v1/cache/put`, `/v1/cache/invalidate`. |
+| `context:read` | `/v1/tenants/{id}/context/pack`. |
+| `admin:read` | `/v1/tenants/{id}/graph/verify`, `/v1/tenants/{id}/graph/rebuild-indexes`, `/v1/diagnostics/config`, and the MCP admin tool surface (only when `RUSTY_RED_MCP_ALLOW_ADMIN=true`). |
+| `run:read` / `run:write` | The legacy compat-server's run-lifecycle routes (`/v1/runs/{id}`, etc.). Only meaningful with the legacy server. |
+
+Scope aliases are also accepted for backward compatibility:
+`rustyred:graph:read`, `rustyred:graph:query`, `rustyred:graph:index:read`
+all map to `graph:read`; `rustyred:graph:write:propose` and
+`rustyred:graph:write:apply` both map to `graph:write`;
+`rustyred:graph:context` maps to `context:read`;
+`rustyred:graph:admin:verify` maps to `admin:read`.
+
+A `*` scope in any entry grants all of the above and should be used
+sparingly — operator emergency access, not application tokens.
 
 Tokens are matched against the `Authorization: Bearer <token>` header
 in HTTP requests and against the MCP `auth` parameter for the `/mcp`
@@ -52,8 +79,8 @@ random data; we recommend generating them with
 `openssl rand -hex 32`. Rotate tokens by editing the env and
 restarting the service — there is no in-band token rotation API.
 
-Tokens **do not** carry per-tenant scope. A token with `write` can
-write to any tenant whose data lives in this Rusty Red instance.
+Tokens **do not** carry per-tenant scope. A token with `graph:write`
+can write to any tenant whose data lives in this Rusty Red instance.
 Multi-tenant deployments that need per-tenant scoping should run
 one Rusty Red instance per tenant or front the service with an
 external auth layer that issues per-tenant signed requests.
