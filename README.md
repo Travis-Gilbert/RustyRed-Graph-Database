@@ -54,7 +54,17 @@ These are on the roadmap, in roughly this priority order:
 
 ## Build (local development)
 
-Requires Rust 1.85+ and `maturin >= 1.7`.
+Requires Rust 1.85+ and `maturin >= 1.7`. The repo also pulls
+`theorem-protos` as a submodule for the gRPC contract — make sure
+submodules are initialized after clone:
+
+```bash
+git clone --recurse-submodules https://github.com/Travis-Gilbert/RustyRed-Graph-Database.git
+# or, if you already cloned without --recurse-submodules:
+git submodule update --init
+```
+
+Then:
 
 ```bash
 python3 -m pip install --user maturin
@@ -62,7 +72,10 @@ cargo check --workspace
 maturin develop --release
 ```
 
-`cargo check --workspace` validates the Rust workspace. `maturin develop --release` builds the root `abi3-py312` compatibility wheel into the active Python environment.
+`cargo check --workspace` validates the Rust workspace (including the
+tonic gRPC server scaffolded against `theorem-protos/rustyred/v1/`).
+`maturin develop --release` builds the root `abi3-py312` compatibility
+wheel into the active Python environment.
 
 ## Product server
 

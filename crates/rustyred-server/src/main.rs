@@ -5,6 +5,7 @@ mod bulk;
 mod config;
 mod cypher;
 mod graph_cache;
+mod grpc;
 mod metrics;
 mod observability;
 mod openapi;
@@ -29,7 +30,16 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .map_err(|exc| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{exc}")))?;
     let state = AppState::new(config);
-    let app = router::build_router(state);
+
+    // Build the HTTP router (existing) and the gRPC routes (new). Both
+    // serve from the same TCP listener via tonic 0.12's axum-router
+    // bridge: Routes::into_axum_router() returns an axum Router that
+    // routes `Content-Type: application/grpc*` requests to the gRPC
+    // services, which we merge with the HTTP router so non-gRPC traffic
+    // continues to flow through the existing handlers unchanged.
+    let http_router = router::build_router(state.clone());
+    let grpc_router = grpc::build_grpc_routes(state).into_axum_router();
+    let app = http_router.merge(grpc_router);
 
     tracing::info!("RUSTYRED_PRODUCT_READY {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
