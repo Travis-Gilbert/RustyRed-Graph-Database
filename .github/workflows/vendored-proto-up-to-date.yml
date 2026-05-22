@@ -1,0 +1,36 @@
+name: Vendored proto up to date
+
+# Ensures vendor/proto/rustyred/v1/rustyred.proto stays byte-identical to
+# the theorem-protos submodule. The vendored copy is what
+# crates/rustyred-server/build.rs compiles in Docker / Railway builds;
+# if it drifts from the submodule, hermetic builds silently disagree
+# with what developers see locally. See
+# docs/adr/0001-vendored-proto-for-railway-build.md.
+
+on:
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'vendor/proto/**'
+      - 'scripts/sync-vendored-proto.sh'
+      - '.github/workflows/vendored-proto-up-to-date.yml'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Vendored proto matches submodule
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run sync script in check mode
+        run: scripts/sync-vendored-proto.sh --check
