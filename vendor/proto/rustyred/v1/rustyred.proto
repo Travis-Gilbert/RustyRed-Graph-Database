@@ -1,0 +1,622 @@
+// Copyright 2026 Travis Gilbert. MIT licensed.
+//
+// RustyRed-GraphDB gRPC contract.
+//
+// This is the standalone OSS database surface — graph + vector + fulltext +
+// spatial operations over a multi-tenant in-memory graph store. The same
+// engine substrate underlies the theorems-harness product (Theseus fork);
+// this proto is the standalone OSS contract, and theorems_harness.v1 is
+// the fork's contract. They are sibling contracts, not parent-child.
+//
+// Versioning: rustyred.v1 is the first stable contract. Method additions
+// are backward-compatible; removals and breaking changes ship as v2.
+//
+// See https://github.com/Travis-Gilbert/RustyRed-Graph-Database for the
+// reference implementation and the OpenAPI mirror at /openapi.json.
+
+syntax = "proto3";
+
+package rustyred.v1;
+
+
+// ============================================================================
+// Service: GraphDatabase
+// ============================================================================
+//
+// The primary service. All graph, vector, fulltext, spatial, algorithm, and
+// cache operations live here. Tenant scoping is explicit on every request
+// that operates on per-tenant state; cross-tenant aggregates are not part
+// of v1.
+
+service GraphDatabase {
+  // ---- Lifecycle (cheap, no tenant scope) -----------------------------------
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+
+  // ---- Native query surface (tenant-scoped) --------------------------------
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Cypher(CypherRequest) returns (CypherResponse);
+  rpc CypherExplain(CypherRequest) returns (CypherExplainResponse);
+
+  // ---- Transactions --------------------------------------------------------
+  rpc BeginTransaction(BeginTxnRequest) returns (BeginTxnResponse);
+  rpc CommitTransaction(CommitTxnRequest) returns (CommitTxnResponse);
+  rpc RollbackTransaction(RollbackTxnRequest) returns (RollbackTxnResponse);
+
+  // ---- Node + edge primitives ---------------------------------------------
+  rpc UpsertNode(UpsertNodeRequest) returns (Node);
+  rpc UpsertEdge(UpsertEdgeRequest) returns (Edge);
+  rpc GetNode(GetNodeRequest) returns (Node);
+  rpc GetEdge(GetEdgeRequest) returns (Edge);
+  rpc QueryNodes(QueryNodesRequest) returns (NodeList);
+  rpc Neighbors(NeighborsRequest) returns (NeighborList);
+
+  // ---- Bulk ingest ---------------------------------------------------------
+  rpc BulkInsertNodes(BulkNodesRequest) returns (BulkInsertResponse);
+  rpc BulkInsertEdges(BulkEdgesRequest) returns (BulkInsertResponse);
+
+  // ---- Vector search -------------------------------------------------------
+  rpc VectorSearch(VectorSearchRequest) returns (VectorSearchResponse);
+  rpc VectorHybridSearch(VectorHybridRequest) returns (VectorSearchResponse);
+  rpc DesignateVectorProperty(DesignateVectorRequest) returns (DesignateAck);
+
+  // ---- Full-text search ----------------------------------------------------
+  rpc FulltextSearch(FulltextSearchRequest) returns (FulltextSearchResponse);
+  rpc DesignateFulltextProperty(DesignateFulltextRequest) returns (DesignateAck);
+
+  // ---- Spatial -------------------------------------------------------------
+  rpc SpatialRadius(SpatialRadiusRequest) returns (SpatialResponse);
+  rpc SpatialBoundingBox(SpatialBboxRequest) returns (SpatialResponse);
+  rpc DesignateSpatialProperty(DesignateSpatialRequest) returns (DesignateAck);
+
+  // ---- Epistemic traversal -------------------------------------------------
+  rpc EpistemicNeighbors(EpistemicNeighborsRequest) returns (EpistemicNeighborsResponse);
+
+  // ---- Graph algorithms ----------------------------------------------------
+  rpc PersonalizedPageRank(PPRRequest) returns (PPRResponse);
+  rpc PageRank(PageRankRequest) returns (PageRankResponse);
+  rpc ConnectedComponents(ComponentsRequest) returns (ComponentsResponse);
+  rpc Communities(CommunitiesRequest) returns (CommunitiesResponse);
+
+  // ---- Stats + diagnostics -------------------------------------------------
+  rpc GraphStats(GraphStatsRequest) returns (GraphStatsResponse);
+  rpc GraphVerify(GraphVerifyRequest) returns (VerifyReport);
+  rpc RebuildIndexes(RebuildIndexesRequest) returns (RebuildIndexesResponse);
+
+  // ---- Cache (graph-version-aware) -----------------------------------------
+  rpc CachePut(CachePutRequest) returns (CacheAck);
+  rpc CacheGet(CacheGetRequest) returns (CacheGetResponse);
+  rpc CacheCheck(CacheCheckRequest) returns (CacheCheckResponse);
+  rpc CacheExplain(CacheCheckRequest) returns (CacheExplainResponse);
+  rpc CacheInvalidate(CacheInvalidateRequest) returns (CacheAck);
+  rpc CacheStats(CacheStatsRequest) returns (CacheStatsResponse);
+}
+
+
+// ============================================================================
+// Common messages
+// ============================================================================
+
+// Property — generic JSON-ish value. Uses oneof so consumers can avoid the
+// `google.protobuf.Value` import dependency. Add types as needed.
+message Property {
+  oneof value {
+    string string_val = 1;
+    int64 int_val = 2;
+    double double_val = 3;
+    bool bool_val = 4;
+    bytes bytes_val = 5;
+    // JSON-encoded fallback for complex types (lists, nested maps, vectors).
+    // Implementations should prefer the typed variants when possible.
+    string json_val = 6;
+  }
+}
+
+message PropertyMap {
+  map<string, Property> properties = 1;
+}
+
+message Node {
+  string id = 1;
+  repeated string labels = 2;
+  PropertyMap properties = 3;
+}
+
+message Edge {
+  string id = 1;
+  string type = 2;
+  string source_id = 3;
+  string target_id = 4;
+  PropertyMap properties = 5;
+}
+
+message NodeList {
+  repeated Node nodes = 1;
+}
+
+message EdgeList {
+  repeated Edge edges = 1;
+}
+
+message NeighborHit {
+  Node node = 1;
+  Edge edge = 2;
+  double score = 3;
+}
+
+message NeighborList {
+  repeated NeighborHit neighbors = 1;
+}
+
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+message HealthRequest {}
+message HealthResponse {
+  string status = 1;          // "ok" or error reason
+  string version = 2;         // semver of the running server
+}
+
+message ReadyRequest {}
+message ReadyResponse {
+  bool ready = 1;
+  // Non-ready reasons: "volume_missing", "loading_aof", "rebuilding_index", ...
+  string reason = 2;
+}
+
+
+// ============================================================================
+// Native query surface
+// ============================================================================
+
+enum QueryKind {
+  QUERY_KIND_UNSPECIFIED = 0;
+  QUERY_KIND_NODE_MATCH = 1;
+  QUERY_KIND_NEIGHBORS = 2;
+}
+
+message QueryRequest {
+  string tenant_id = 1;
+  QueryKind kind = 2;
+  // JSON-encoded query body, structured per the OpenAPI schema. v2 should
+  // promote this to typed oneof messages once the query surface stabilizes.
+  string body_json = 3;
+}
+
+message QueryResponse {
+  string result_json = 1;        // JSON-encoded result
+  uint32 result_count = 2;
+  uint64 graph_version = 3;
+}
+
+message CypherRequest {
+  string tenant_id = 1;
+  string cypher = 2;
+  string parameters_json = 3;    // JSON-encoded parameters
+  // Optional transaction id; when set, the operation joins the active txn.
+  string transaction_id = 4;
+}
+
+message CypherResponse {
+  string result_json = 1;
+  uint32 result_count = 2;
+  uint64 graph_version = 3;
+}
+
+message CypherExplainResponse {
+  string plan_json = 1;          // Structured plan
+  string narrative = 2;          // Human-readable explanation
+}
+
+
+// ============================================================================
+// Transactions
+// ============================================================================
+
+message BeginTxnRequest {
+  string tenant_id = 1;
+  // Optional client-side request id for idempotency.
+  string idempotency_key = 2;
+}
+
+message BeginTxnResponse {
+  string transaction_id = 1;
+  uint64 snapshot_graph_version = 2;
+}
+
+message CommitTxnRequest {
+  string tenant_id = 1;
+  string transaction_id = 2;
+}
+
+message CommitTxnResponse {
+  uint64 new_graph_version = 1;
+  uint32 nodes_written = 2;
+  uint32 edges_written = 3;
+}
+
+message RollbackTxnRequest {
+  string tenant_id = 1;
+  string transaction_id = 2;
+}
+
+message RollbackTxnResponse {
+  bool rolled_back = 1;
+}
+
+
+// ============================================================================
+// Node + edge primitives
+// ============================================================================
+
+message UpsertNodeRequest {
+  string tenant_id = 1;
+  Node node = 2;
+  string transaction_id = 3;     // optional
+}
+
+message UpsertEdgeRequest {
+  string tenant_id = 1;
+  Edge edge = 2;
+  string transaction_id = 3;     // optional
+}
+
+message GetNodeRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+}
+
+message GetEdgeRequest {
+  string tenant_id = 1;
+  string edge_id = 2;
+}
+
+message QueryNodesRequest {
+  string tenant_id = 1;
+  repeated string labels = 2;            // any-of match
+  PropertyMap property_filter = 3;       // all-of match
+  uint32 limit = 4;
+  string cursor = 5;                     // pagination
+}
+
+message NeighborsRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  enum Direction {
+    DIRECTION_UNSPECIFIED = 0;
+    DIRECTION_OUT = 1;
+    DIRECTION_IN = 2;
+    DIRECTION_BOTH = 3;
+  }
+  Direction direction = 3;
+  repeated string edge_types = 4;        // empty = any
+  uint32 limit = 5;
+}
+
+
+// ============================================================================
+// Bulk ingest
+// ============================================================================
+
+message BulkNodesRequest {
+  string tenant_id = 1;
+  repeated Node nodes = 2;
+  string transaction_id = 3;     // optional
+}
+
+message BulkEdgesRequest {
+  string tenant_id = 1;
+  repeated Edge edges = 2;
+  string transaction_id = 3;     // optional
+}
+
+message BulkInsertResponse {
+  uint32 inserted_count = 1;
+  uint32 skipped_count = 2;
+  repeated string skipped_ids = 3;
+  uint64 new_graph_version = 4;
+}
+
+
+// ============================================================================
+// Vector search
+// ============================================================================
+
+message VectorSearchRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  repeated double query_vector = 4;
+  uint32 k = 5;
+}
+
+message VectorSearchResponse {
+  repeated VectorHit hits = 1;
+}
+
+message VectorHit {
+  Node node = 1;
+  double distance = 2;
+  double score = 3;
+}
+
+message VectorHybridRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  repeated double query_vector = 4;
+  uint32 k = 5;
+  // Optional graph-proximity boosting parameters.
+  double graph_proximity_weight = 6;
+  string seed_node_id = 7;
+}
+
+message DesignateVectorRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  uint32 dimension = 4;
+}
+
+message DesignateAck {
+  bool designated = 1;
+  string reason = 2;
+}
+
+
+// ============================================================================
+// Full-text search
+// ============================================================================
+
+message FulltextSearchRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  string query = 4;
+  uint32 limit = 5;
+}
+
+message FulltextSearchResponse {
+  repeated FulltextHit hits = 1;
+}
+
+message FulltextHit {
+  Node node = 1;
+  double bm25_score = 2;
+  repeated string highlights = 3;
+}
+
+message DesignateFulltextRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+}
+
+
+// ============================================================================
+// Spatial
+// ============================================================================
+
+message SpatialRadiusRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  double center_lat = 4;
+  double center_lon = 5;
+  double radius_meters = 6;
+  uint32 limit = 7;
+}
+
+message SpatialBboxRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+  double min_lat = 4;
+  double min_lon = 5;
+  double max_lat = 6;
+  double max_lon = 7;
+  uint32 limit = 8;
+}
+
+message SpatialResponse {
+  repeated SpatialHit hits = 1;
+}
+
+message SpatialHit {
+  Node node = 1;
+  double distance_meters = 2;
+}
+
+message DesignateSpatialRequest {
+  string tenant_id = 1;
+  string label = 2;
+  string property_name = 3;
+}
+
+
+// ============================================================================
+// Epistemic traversal
+// ============================================================================
+
+enum EpistemicEdgeType {
+  EPISTEMIC_TYPE_UNSPECIFIED = 0;
+  EPISTEMIC_TYPE_SUPPORTS = 1;
+  EPISTEMIC_TYPE_CONTRADICTS = 2;
+  EPISTEMIC_TYPE_TENSION = 3;
+  EPISTEMIC_TYPE_DERIVES = 4;
+  EPISTEMIC_TYPE_CITES = 5;
+}
+
+message EpistemicNeighborsRequest {
+  string tenant_id = 1;
+  string seed_node_id = 2;
+  repeated EpistemicEdgeType edge_types = 3;
+  uint32 max_hops = 4;
+  double min_confidence = 5;
+}
+
+message EpistemicNeighborsResponse {
+  repeated EpistemicHit hits = 1;
+}
+
+message EpistemicHit {
+  Node node = 1;
+  EpistemicEdgeType edge_type = 2;
+  double confidence = 3;
+  uint32 hop_count = 4;
+}
+
+
+// ============================================================================
+// Graph algorithms
+// ============================================================================
+
+message PPRRequest {
+  string tenant_id = 1;
+  map<string, double> seeds = 2;     // node_id → seed mass
+  double alpha = 3;
+  double epsilon = 4;
+  uint32 max_pushes = 5;
+}
+
+message PPRResponse {
+  map<string, double> scores = 1;
+  uint32 total_pushes = 2;
+}
+
+message PageRankRequest {
+  string tenant_id = 1;
+  double damping = 2;
+  uint32 max_iter = 3;
+  double tolerance = 4;
+}
+
+message PageRankResponse {
+  map<string, double> scores = 1;
+  uint32 iterations_used = 2;
+}
+
+message ComponentsRequest {
+  string tenant_id = 1;
+  bool directed = 2;
+}
+
+message ComponentsResponse {
+  map<string, uint32> node_to_component = 1;
+  uint32 component_count = 2;
+}
+
+message CommunitiesRequest {
+  string tenant_id = 1;
+  uint32 max_iterations = 2;
+}
+
+message CommunitiesResponse {
+  map<string, uint32> node_to_community = 1;
+  uint32 community_count = 2;
+}
+
+
+// ============================================================================
+// Stats + diagnostics
+// ============================================================================
+
+message GraphStatsRequest {
+  string tenant_id = 1;
+}
+
+message GraphStatsResponse {
+  uint64 node_count = 1;
+  uint64 edge_count = 2;
+  uint64 graph_version = 3;
+  map<string, uint64> nodes_by_label = 4;
+  map<string, uint64> edges_by_type = 5;
+}
+
+message GraphVerifyRequest {
+  string tenant_id = 1;
+}
+
+message VerifyReport {
+  bool ok = 1;
+  repeated string issues = 2;
+  uint64 graph_version_at_verify = 3;
+}
+
+message RebuildIndexesRequest {
+  string tenant_id = 1;
+}
+
+message RebuildIndexesResponse {
+  uint32 indexes_rebuilt = 1;
+  uint64 duration_micros = 2;
+}
+
+
+// ============================================================================
+// Cache (graph-version-aware)
+// ============================================================================
+
+message CachePutRequest {
+  string tenant_id = 1;
+  string cache_key = 2;
+  bytes payload = 3;
+  uint64 graph_version = 4;       // version this entry was computed against
+}
+
+message CacheGetRequest {
+  string tenant_id = 1;
+  string cache_key = 2;
+}
+
+message CacheGetResponse {
+  bool found = 1;
+  bytes payload = 2;
+  uint64 stored_at_graph_version = 3;
+  bool stale = 4;
+}
+
+message CacheCheckRequest {
+  string tenant_id = 1;
+  string cache_key = 2;
+}
+
+message CacheCheckResponse {
+  bool present = 1;
+  bool stale = 2;
+  uint64 stored_at_graph_version = 3;
+}
+
+message CacheExplainResponse {
+  bool present = 1;
+  bool stale = 2;
+  uint64 stored_at_graph_version = 3;
+  uint64 current_graph_version = 4;
+  // What invalidated the entry, if stale: "node_count_changed",
+  // "edge_count_changed", "schema_changed", ...
+  repeated string staleness_reasons = 5;
+}
+
+message CacheInvalidateRequest {
+  string tenant_id = 1;
+  string cache_key = 2;
+}
+
+message CacheStatsRequest {
+  string tenant_id = 1;
+}
+
+message CacheStatsResponse {
+  uint64 entries = 1;
+  uint64 hits = 2;
+  uint64 misses = 3;
+  uint64 stale_evictions = 4;
+  uint64 explicit_invalidations = 5;
+}
+
+message CacheAck {
+  bool ok = 1;
+  string reason = 2;
+}

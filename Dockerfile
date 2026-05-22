@@ -3,6 +3,11 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+# vendor/proto/ holds the in-tree snapshot of rustyred.v1 protos that
+# crates/rustyred-server/build.rs compiles via tonic_build. Copying it
+# before crates/ and src/ avoids invalidating the much larger Rust layer
+# cache when only the proto changes. See docs/adr/0001-vendored-proto-for-railway-build.md.
+COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
 
