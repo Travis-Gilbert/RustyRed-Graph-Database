@@ -3,3 +3,8 @@
 *.so
 *.pyd
 __pycache__/
+
+# Local operator config. Never commit; tokens live here.
+.env
+.env.*
+!.env.example
