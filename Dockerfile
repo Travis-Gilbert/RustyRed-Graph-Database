@@ -2,6 +2,10 @@ FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
 # vendor/proto/ holds the in-tree snapshot of rustyred.v1 protos that
 # crates/rustyred-server/build.rs compiles via tonic_build. Copying it
