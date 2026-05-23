@@ -6,17 +6,17 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
 use rustyred_core::store::RedisRustyredStore;
 use rustyred_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphStats, GraphStoreError, GraphStoreResult, GraphTransaction,
-    GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
-    SpatialDesignation, VectorDesignation, VerifyReport,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
+    GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
+    SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
+use serde_json::json;
 
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
@@ -846,6 +846,10 @@ impl RedCoreTenantExecutor {
         self.with_snapshot(|snapshot| snapshot.snapshot().edges)
     }
 
+    pub fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        self.with_snapshot(|snapshot| snapshot.snapshot())
+    }
+
     pub fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -1125,6 +1129,16 @@ impl TenantGraphStore {
         }
     }
 
+    pub fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        match self {
+            Self::RedCore(store) => store.graph_snapshot(),
+            Self::Redis(_) => Err(GraphStoreError::new(
+                "legacy_redis_instant_kg_unsupported",
+                "instant KG requires the native RedCore graph store; RUSTY_RED_MODE=redis is a legacy compatibility path and should be changed to RUSTY_RED_MODE=embedded",
+            )),
+        }
+    }
+
     /// §P6-A pa6.1: `Arc<Vec<EdgeRecord>>` snapshot used by the algorithm
     /// endpoints. The RedCore variant returns a shared, version-cached arc;
     /// callers must not mutate.
@@ -1289,6 +1303,10 @@ impl McpGraphBackend for TenantGraphStore {
         TenantGraphStore::list_edges(self)
     }
 
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        TenantGraphStore::graph_snapshot(self)
+    }
+
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
         TenantGraphStore::upsert_node(self, node).map(|_| ())
     }
@@ -1409,7 +1427,10 @@ impl McpGraphBackend for TenantGraphStore {
 
     fn algo_components(&self, directed: bool) -> GraphStoreResult<Vec<Vec<String>>> {
         let edges = self.list_edges_arc()?;
-        Ok(rustyred_core::connected_components(edges.as_slice(), directed))
+        Ok(rustyred_core::connected_components(
+            edges.as_slice(),
+            directed,
+        ))
     }
 
     fn algo_pagerank(
@@ -1429,7 +1450,9 @@ impl McpGraphBackend for TenantGraphStore {
 
     fn algo_communities(&self) -> GraphStoreResult<(std::collections::HashMap<String, u64>, f64)> {
         let edges = self.list_edges_arc()?;
-        Ok(rustyred_core::label_propagation_communities(edges.as_slice()))
+        Ok(rustyred_core::label_propagation_communities(
+            edges.as_slice(),
+        ))
     }
 }
 
@@ -1479,6 +1502,10 @@ impl McpGraphBackend for ProductMcpBackend {
 
     fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
         self.store.list_edges()
+    }
+
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        self.store.graph_snapshot()
     }
 
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
@@ -1676,14 +1703,14 @@ mod tests {
     use crate::config::{Config, StorageMode};
 
     use super::{AppState, RedCoreTenantExecutor};
-    use serde_json::json;
-    use std::sync::{mpsc, Arc, Barrier};
-    use std::thread;
-    use std::time::Duration;
     use rustyred_core::{
         EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeRecord,
         RedCoreDurability, RedCoreGraphStore,
     };
+    use serde_json::json;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn tenant_state_keys_use_graph_store_tenant_normalization() {
@@ -1724,6 +1751,42 @@ mod tests {
         assert_eq!(
             state.tenant_state_key("Tenant.One!"),
             "rusty-red:TenantOne:state:v1"
+        );
+    }
+
+    #[test]
+    fn instant_kg_snapshot_rejects_legacy_redis_mode() {
+        let mut config = memory_config();
+        config.storage_mode = StorageMode::Redis;
+        config.redis_url = "redis://127.0.0.1:6379".to_string();
+
+        let state = AppState::new(config);
+        let store = state
+            .tenant_graph_store("tenant-kg")
+            .expect("Redis client URL should parse without connecting");
+        let err = store
+            .graph_snapshot()
+            .expect_err("Redis mode must be diagnostic");
+
+        assert_eq!(err.code, "legacy_redis_instant_kg_unsupported");
+        assert!(err.message.contains("RUSTY_RED_MODE=embedded"));
+
+        let mcp = rustyred_mcp::handle_mcp_request(
+            &state,
+            &state.mcp_config(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "instant-kg-status",
+                "method": "tools/call",
+                "params": {
+                    "name": "harness_kg_status",
+                    "arguments": { "tenant": "tenant-kg" }
+                }
+            }),
+        );
+        assert_eq!(
+            mcp["error"]["data"]["code"],
+            "legacy_redis_instant_kg_unsupported"
         );
     }
 

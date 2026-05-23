@@ -47,6 +47,7 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             { "name": "mcp", "description": "Streamable HTTP MCP agent port over Rusty Red graph APIs." },
             { "name": "runs", "description": "Rusty Red compatibility command runtime." },
             { "name": "graph", "description": "First-class graph node, edge, adjacency, index, and verification routes." },
+            { "name": "instant-kg", "description": "Harness Instant KG merged base+session-delta code graph queries." },
             { "name": "transactions", "description": "Open and commit staged transaction workflows for Cypher writes." },
             { "name": "context", "description": "Context pack writes for graph-backed agent workflows." }
         ],
@@ -1264,6 +1265,139 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/tenants/{tenant_id}/instant-kg/status": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Inspect Harness Instant KG merged-view status",
+                    "description": "Uses the tenant's committed graph as the immutable base artifact and overlays an optional session delta without mutating stored graph state.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgViewRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/instant-kg/ppr": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Run PPR over a Harness Instant KG merged view",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgPprRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/instant-kg/impact": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Compute code-object impact over a merged Instant KG view",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgImpactRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/instant-kg/related-objects": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Find related code objects over a merged Instant KG view",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgRelatedRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/instant-kg/search": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Search code objects over a merged Instant KG view",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgSearchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/instant-kg/explain-edge": {
+                "post": {
+                    "tags": ["instant-kg"],
+                    "summary": "Explain edge evidence over a merged Instant KG view",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/InstantKgExplainEdgeRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/InstantKgResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/context/pack": {
                 "post": {
                     "tags": ["context"],
@@ -1405,6 +1539,14 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "content": {
                         "application/json": {
                             "schema": { "$ref": "#/components/schemas/BulkIngestResponseBody" }
+                        }
+                    }
+                },
+                "InstantKgResponse": {
+                    "description": "Harness Instant KG merged-view response.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/InstantKgResponseBody" }
                         }
                     }
                 },
@@ -2292,6 +2434,129 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     },
                     "additionalProperties": false
                 },
+                "InstantKgDelta": {
+                    "type": "object",
+                    "properties": {
+                        "commit_sha": { "type": ["string", "null"] },
+                        "changed_files": { "type": "array", "items": { "type": "string" } },
+                        "objects": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } },
+                        "edges": { "type": "array", "items": { "$ref": "#/components/schemas/EdgeRecord" } },
+                        "tombstoned_object_ids": { "type": "array", "items": { "type": "string" } },
+                        "removed_edge_ids": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "additionalProperties": false
+                },
+                "InstantKgManifest": {
+                    "type": "object",
+                    "properties": {
+                        "repo_id": { "type": "string" },
+                        "repo_hash": { "type": "string" },
+                        "commit_sha": { "type": "string" },
+                        "encoder_version": { "type": "string" },
+                        "ingest_version": { "type": "string" },
+                        "base_graph_hash": { "type": "string" },
+                        "encoded_files": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                        "objects_total": { "type": "integer", "minimum": 0 },
+                        "edges_total": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "InstantKgViewRequest": {
+                    "type": "object",
+                    "properties": {
+                        "manifest": { "$ref": "#/components/schemas/InstantKgManifest" },
+                        "delta": { "$ref": "#/components/schemas/InstantKgDelta" }
+                    },
+                    "additionalProperties": false
+                },
+                "InstantKgPprRequest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InstantKgViewRequest" },
+                        {
+                            "type": "object",
+                            "required": ["seeds"],
+                            "properties": {
+                                "seeds": { "type": "object", "additionalProperties": { "type": "number" } },
+                                "alpha": { "type": "number", "default": 0.15 },
+                                "epsilon": { "type": "number", "default": 0.0001 },
+                                "max_pushes": { "type": "integer", "minimum": 1, "default": 200000 },
+                                "top_k": { "type": "integer", "minimum": 1, "default": 10 }
+                            }
+                        }
+                    ]
+                },
+                "InstantKgImpactRequest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InstantKgViewRequest" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "seed": { "type": "string" },
+                                "symbol_name": { "type": "string" },
+                                "direction": { "type": "string", "enum": ["out", "in"], "default": "out" },
+                                "max_depth": { "type": "integer", "minimum": 1, "default": 2 }
+                            }
+                        }
+                    ]
+                },
+                "InstantKgRelatedRequest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InstantKgViewRequest" },
+                        {
+                            "type": "object",
+                            "required": ["seed"],
+                            "properties": {
+                                "seed": { "type": "string" },
+                                "kinds": { "type": "array", "items": { "type": "string" } },
+                                "top_k": { "type": "integer", "minimum": 1, "default": 10 }
+                            }
+                        }
+                    ]
+                },
+                "InstantKgSearchRequest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InstantKgViewRequest" },
+                        {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": { "type": "string" },
+                                "kinds": { "type": "array", "items": { "type": "string" } },
+                                "top_k": { "type": "integer", "minimum": 1, "default": 10 }
+                            }
+                        }
+                    ]
+                },
+                "InstantKgExplainEdgeRequest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InstantKgViewRequest" },
+                        {
+                            "type": "object",
+                            "required": ["src", "dst"],
+                            "properties": {
+                                "src": { "type": "string" },
+                                "dst": { "type": "string" }
+                            }
+                        }
+                    ]
+                },
+                "InstantKgResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "status"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "status": { "type": "object", "additionalProperties": true },
+                        "stats": { "$ref": "#/components/schemas/GraphStats" },
+                        "seed": { "type": "string" },
+                        "query": { "type": "string" },
+                        "src": { "type": "string" },
+                        "dst": { "type": "string" },
+                        "results": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                        "explanations": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                    },
+                    "additionalProperties": false
+                },
                 "CompatibilityMatrix": {
                     "type": "object",
                     "required": ["version", "supported", "rejected", "pending"],
@@ -2660,6 +2925,12 @@ mod tests {
             ("/v1/tenants/{tenant_id}/graph/fulltext/search", "post"),
             ("/v1/tenants/{tenant_id}/graph/bulk/nodes", "post"),
             ("/v1/tenants/{tenant_id}/graph/bulk/edges", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/status", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/ppr", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/impact", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/related-objects", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/search", "post"),
+            ("/v1/tenants/{tenant_id}/instant-kg/explain-edge", "post"),
         ] {
             let encoded_path = path.replace('/', "~1");
             let pointer = format!("/paths/{encoded_path}/{method}");

@@ -1835,7 +1835,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty_red_native"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "datafrog",
  "egg",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-compat-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rustyred-core",
  "serde_json",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fs2",
  "h3o",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rustyred-core",
  "serde",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-resp-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "redis-protocol",
  "rustyred-core",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "axum",

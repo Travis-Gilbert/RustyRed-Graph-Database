@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use rustyred_core::{
+    CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphSnapshot, GraphStats,
+    GraphStoreError, GraphStoreResult, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta,
+    VectorDesignation, VerifyReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use rustyred_core::{
-    Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError, GraphStoreResult,
-    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    RedCoreGraphStore, VectorDesignation, VerifyReport,
-};
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -26,6 +27,19 @@ pub trait McpGraphBackend {
             "unsupported_operation",
             "list_edges is not supported by this MCP backend",
         ))
+    }
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        let stats = self.stats()?;
+        let nodes = self.query_nodes(NodeQuery {
+            limit: Some(stats.nodes_total.max(1)),
+            ..NodeQuery::default()
+        })?;
+        let edges = self.list_edges()?;
+        Ok(GraphSnapshot {
+            version: stats.version,
+            nodes,
+            edges,
+        })
     }
     fn upsert_node(&mut self, _node: NodeRecord) -> GraphStoreResult<()> {
         Err(GraphStoreError::new(
@@ -196,7 +210,9 @@ pub trait McpGraphBackend {
         tolerance: f64,
     ) -> GraphStoreResult<HashMap<String, f64>> {
         let edges = self.list_edges()?;
-        Ok(rustyred_core::pagerank(&edges, damping, max_iter, tolerance))
+        Ok(rustyred_core::pagerank(
+            &edges, damping, max_iter, tolerance,
+        ))
     }
 
     /// Community detection + modularity via label-propagation. Default impl
@@ -512,6 +528,118 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred.algorithm.communities" | "rustyred.algo.communities" => {
             algorithm_communities_payload(&tenant, &backend)?
         }
+        "rustyred.instant_kg.status" | "harness_kg_status" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            json!({
+                "tenant": tenant,
+                "status": view.status(),
+                "stats": view.stats()
+            })
+        }
+        "rustyred.instant_kg.ppr" | "harness_kg_ppr" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            let seeds: HashMap<String, f64> =
+                serde_json::from_value(arguments.get("seeds").cloned().ok_or_else(|| {
+                    McpError::invalid_params("harness_kg_ppr requires seeds object")
+                })?)
+                .map_err(|error| {
+                    McpError::invalid_params(format!("seeds must be an object: {error}"))
+                })?;
+            let alpha = arguments
+                .get("alpha")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.15);
+            let epsilon = arguments
+                .get("epsilon")
+                .and_then(Value::as_f64)
+                .unwrap_or(1e-4);
+            let max_pushes = arguments
+                .get("max_pushes")
+                .and_then(Value::as_u64)
+                .unwrap_or(200_000) as usize;
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "status": view.status(),
+                "results": view.ppr(&seeds, alpha, epsilon, max_pushes, top_k)
+            })
+        }
+        "rustyred.instant_kg.impact" | "harness_kg_impact" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            let seed_arg = arguments
+                .get("seed")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let symbol_arg = arguments
+                .get("symbol_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let seed = if let Some(seed) = seed_arg {
+                seed.to_string()
+            } else if let Some(symbol_name) = symbol_arg {
+                view.resolve_symbol_name(symbol_name).ok_or_else(|| {
+                    McpError::invalid_params("harness_kg_impact could not resolve symbol_name")
+                })?
+            } else {
+                return Err(McpError::invalid_params(
+                    "harness_kg_impact requires seed or symbol_name",
+                ));
+            };
+            let direction = instant_kg_direction(
+                arguments
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("out"),
+            );
+            let max_depth = arguments
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(2) as usize;
+            json!({
+                "tenant": tenant,
+                "seed": seed,
+                "status": view.status(),
+                "results": view.impact(&seed, direction, max_depth)
+            })
+        }
+        "rustyred.instant_kg.related_objects" | "harness_kg_related_objects" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            let seed = required_str(&arguments, "seed", name)?;
+            let kinds = string_array(&arguments, "kinds");
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "seed": seed,
+                "status": view.status(),
+                "results": view.related_objects(seed, &kinds, top_k)
+            })
+        }
+        "rustyred.instant_kg.search" | "harness_kg_search" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            let query = required_str(&arguments, "query", name)?;
+            let kinds = string_array(&arguments, "kinds");
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "query": query,
+                "status": view.status(),
+                "results": view.search(query, &kinds, top_k)
+            })
+        }
+        "rustyred.instant_kg.explain_edge" | "harness_kg_explain_edge" => {
+            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
+            let src = required_str(&arguments, "src", name)?;
+            let dst = required_str(&arguments, "dst", name)?;
+            json!({
+                "tenant": tenant,
+                "src": src,
+                "dst": dst,
+                "status": view.status(),
+                "explanations": view.explain_edge(src, dst)
+            })
+        }
         "rustyred.fulltext.search" | "rustyred.graph.fulltext.search" => {
             let property = required_str(&arguments, "property", name)?;
             let query = required_str(&arguments, "query", name)?;
@@ -620,7 +748,9 @@ fn call_tool<P: McpGraphProvider>(
                 .get("nodes")
                 .or_else(|| arguments.get("records"))
                 .and_then(Value::as_array)
-                .ok_or_else(|| McpError::invalid_params("rustyred.bulk.nodes requires nodes array"))?;
+                .ok_or_else(|| {
+                    McpError::invalid_params("rustyred.bulk.nodes requires nodes array")
+                })?;
             let mut inserted = 0usize;
             let mut errors = Vec::new();
             for (idx, raw) in records.iter().enumerate() {
@@ -660,7 +790,9 @@ fn call_tool<P: McpGraphProvider>(
                 .get("edges")
                 .or_else(|| arguments.get("records"))
                 .and_then(Value::as_array)
-                .ok_or_else(|| McpError::invalid_params("rustyred.bulk.edges requires edges array"))?;
+                .ok_or_else(|| {
+                    McpError::invalid_params("rustyred.bulk.edges requires edges array")
+                })?;
             let mut inserted = 0usize;
             let mut errors = Vec::new();
             for (idx, raw) in records.iter().enumerate() {
@@ -693,7 +825,9 @@ fn call_tool<P: McpGraphProvider>(
             let property = arguments
                 .get("property")
                 .and_then(Value::as_str)
-                .ok_or_else(|| McpError::invalid_params("rustyred.vector.search requires property"))?;
+                .ok_or_else(|| {
+                    McpError::invalid_params("rustyred.vector.search requires property")
+                })?;
             let query = parse_f32_array(&arguments, "query")?;
             let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
             let label = arguments.get("label").and_then(Value::as_str);
@@ -708,7 +842,9 @@ fn call_tool<P: McpGraphProvider>(
             let property = arguments
                 .get("property")
                 .and_then(Value::as_str)
-                .ok_or_else(|| McpError::invalid_params("rustyred.vector.hybrid requires property"))?;
+                .ok_or_else(|| {
+                    McpError::invalid_params("rustyred.vector.hybrid requires property")
+                })?;
             let query = parse_f32_array(&arguments, "query")?;
             let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
             let label = arguments.get("label").and_then(Value::as_str);
@@ -782,7 +918,9 @@ fn call_tool<P: McpGraphProvider>(
             let label = arguments
                 .get("label")
                 .and_then(Value::as_str)
-                .ok_or_else(|| McpError::invalid_params("rustyred.vector.designate requires label"))?;
+                .ok_or_else(|| {
+                    McpError::invalid_params("rustyred.vector.designate requires label")
+                })?;
             let property = arguments
                 .get("property")
                 .and_then(Value::as_str)
@@ -1068,13 +1206,11 @@ fn algorithm_ppr_payload(
     arguments: &Value,
 ) -> Result<Value, McpError> {
     let edges = backend.list_edges()?;
-    let seeds: HashMap<String, f64> = serde_json::from_value(
-        arguments
-            .get("seeds")
-            .cloned()
-            .ok_or_else(|| McpError::invalid_params("rustyred.algorithm.ppr requires seeds object"))?,
-    )
-    .map_err(|error| McpError::invalid_params(format!("seeds must be an object: {error}")))?;
+    let seeds: HashMap<String, f64> =
+        serde_json::from_value(arguments.get("seeds").cloned().ok_or_else(|| {
+            McpError::invalid_params("rustyred.algorithm.ppr requires seeds object")
+        })?)
+        .map_err(|error| McpError::invalid_params(format!("seeds must be an object: {error}")))?;
     let alpha = arguments
         .get("alpha")
         .and_then(Value::as_f64)
@@ -1162,9 +1298,10 @@ fn algorithm_pagerank_payload(
         .get("top_k")
         .and_then(Value::as_u64)
         .map(|k| k as usize);
-    let mut entries: Vec<(String, f64)> = rustyred_core::pagerank(&edges, damping, max_iter, tolerance)
-        .into_iter()
-        .collect();
+    let mut entries: Vec<(String, f64)> =
+        rustyred_core::pagerank(&edges, damping, max_iter, tolerance)
+            .into_iter()
+            .collect();
     entries.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1210,6 +1347,42 @@ fn algorithm_communities_payload(
         "communities": entries,
         "modularity": modularity,
     }))
+}
+
+fn instant_kg_view_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<HarnessInstantKg, McpError> {
+    let base = backend.graph_snapshot()?;
+    let manifest: Option<CodeKgManifest> = match arguments.get("manifest") {
+        Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+            McpError::invalid_params(format!("manifest must match instant KG schema: {error}"))
+        })?),
+        None => None,
+    };
+    let delta: SessionDelta = match arguments.get("delta") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            McpError::invalid_params(format!("delta must match instant KG schema: {error}"))
+        })?,
+        None => SessionDelta::default(),
+    };
+    let manifest = manifest.or_else(|| {
+        Some(CodeKgManifest::from_base_snapshot(
+            tenant,
+            format!("v{}", base.version),
+            &base,
+        ))
+    });
+    Ok(HarnessInstantKg::new(base, manifest, delta))
+}
+
+fn instant_kg_direction(value: &str) -> Direction {
+    if value.eq_ignore_ascii_case("in") || value.eq_ignore_ascii_case("incoming") {
+        Direction::In
+    } else {
+        Direction::Out
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1317,6 +1490,21 @@ fn required_f64(arguments: &Value, key: &str, tool_name: &str) -> Result<f64, Mc
         .get(key)
         .and_then(Value::as_f64)
         .ok_or_else(|| McpError::invalid_params(format!("{tool_name} requires numeric {key}")))
+}
+
+fn string_array(arguments: &Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
@@ -1626,6 +1814,99 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "properties": { "tenant": { "type": "string" } }
             }),
         ),
+        tool(
+            "harness_kg_status",
+            "Return Harness Instant KG merged-view status for the tenant base graph plus an optional session delta.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" }
+                }
+            }),
+        ),
+        tool(
+            "harness_kg_ppr",
+            "Run Personalized PageRank over the Harness Instant KG merged base+delta view.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" },
+                    "seeds": { "type": "object", "additionalProperties": { "type": "number" } },
+                    "alpha": { "type": "number", "default": 0.15 },
+                    "epsilon": { "type": "number", "default": 0.0001 },
+                    "max_pushes": { "type": "integer", "default": 200000 },
+                    "top_k": { "type": "integer", "default": 10 }
+                },
+                "required": ["seeds"]
+            }),
+        ),
+        tool(
+            "harness_kg_impact",
+            "Compute the blast radius from a code object in the Harness Instant KG merged view.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" },
+                    "seed": { "type": "string" },
+                    "symbol_name": { "type": "string" },
+                    "direction": { "type": "string", "enum": ["out", "in"], "default": "out" },
+                    "max_depth": { "type": "integer", "default": 2 }
+                }
+            }),
+        ),
+        tool(
+            "harness_kg_related_objects",
+            "Find code objects related to a seed in the Harness Instant KG merged view.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" },
+                    "seed": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "top_k": { "type": "integer", "default": 10 }
+                },
+                "required": ["seed"]
+            }),
+        ),
+        tool(
+            "harness_kg_search",
+            "Run lexical code-object search over the Harness Instant KG merged view.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" },
+                    "query": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "top_k": { "type": "integer", "default": 10 }
+                },
+                "required": ["query"]
+            }),
+        ),
+        tool(
+            "harness_kg_explain_edge",
+            "Explain why a merged Instant KG edge exists between two objects.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "delta": { "type": "object" },
+                    "src": { "type": "string" },
+                    "dst": { "type": "string" }
+                },
+                "required": ["src", "dst"]
+            }),
+        ),
     ];
     tools.push(tool(
         "rustyred.fulltext.search",
@@ -1813,7 +2094,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
 
 fn mcp_scope_alias(scope: &str) -> &str {
     match scope {
-        "rustyred:graph:read" | "rustyred:graph:query" | "rustyred:graph:index:read" => "graph:read",
+        "rustyred:graph:read" | "rustyred:graph:query" | "rustyred:graph:index:read" => {
+            "graph:read"
+        }
         "rustyred:graph:write:propose" | "rustyred:graph:write:apply" => "graph:write",
         "rustyred:graph:context" => "context:read",
         "rustyred:graph:admin:verify" => "admin:read",
@@ -1870,7 +2153,9 @@ fn prompt_description(name: &str) -> &'static str {
     match name {
         "rustyred-query" => "Guide an agent through a bounded RustyRed graph query.",
         "rustyred-explain-plan" => "Explain a RustyRed query plan and index usage.",
-        "rustyred-compile-context-pack" => "Compile a small graph-backed context pack from RustyRed reads.",
+        "rustyred-compile-context-pack" => {
+            "Compile a small graph-backed context pack from RustyRed reads."
+        }
         "rustyred-debug-indexes" => "Inspect index health and suggest safe follow-up actions.",
         _ => "RustyRed MCP prompt",
     }
@@ -1895,7 +2180,9 @@ impl ParsedResource {
         let kind = parts
             .next()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| McpError::invalid_params("RustyRed resource URI is missing resource kind"))?;
+            .ok_or_else(|| {
+                McpError::invalid_params("RustyRed resource URI is missing resource kind")
+            })?;
         let rest = parts.next().map(str::to_string);
         Ok(Self {
             tenant: tenant.to_string(),
@@ -1944,6 +2231,10 @@ impl McpGraphBackend for InMemoryGraphStore {
 
     fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
         Ok(self.snapshot().edges)
+    }
+
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(self.snapshot())
     }
 
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
@@ -2079,6 +2370,10 @@ impl McpGraphBackend for RedCoreGraphStore {
         Ok(self.graph_snapshot().edges)
     }
 
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(RedCoreGraphStore::graph_snapshot(self))
+    }
+
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
         RedCoreGraphStore::upsert_node(self, node).map(|_| ())
     }
@@ -2209,6 +2504,13 @@ impl McpGraphBackend for rustyred_core::RedisGraphStore {
         rustyred_core::RedisGraphStore::property_keys(self)
     }
 
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Err(GraphStoreError::new(
+            "legacy_redis_instant_kg_unsupported",
+            "instant KG requires the native RedCore graph store; RUSTY_RED_MODE=redis is a legacy compatibility path and should be changed to RUSTY_RED_MODE=embedded",
+        ))
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Err(GraphStoreError::new(
             "unsupported_operation",
@@ -2273,8 +2575,8 @@ impl McpGraphBackend for rustyred_core::RedisGraphStore {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use rustyred_core::{EdgeRecord, InMemoryGraphStore, NodeRecord};
+    use serde_json::json;
 
     use super::{
         handle_mcp_request, handle_mcp_request_with_context, McpError, McpGraphProvider,
@@ -2376,8 +2678,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.spatial.radius"));
-        assert!(!tools.iter().any(|tool| tool["name"] == "rustyred.admin.verify"));
-        assert!(!tools.iter().any(|tool| tool["name"] == "rustyred.bulk.nodes"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.admin.verify"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.bulk.nodes"));
     }
 
     #[test]
@@ -2503,6 +2809,61 @@ mod tests {
     }
 
     #[test]
+    fn instant_kg_tools_resolve_symbol_names_and_reject_bad_delta() {
+        let (provider, config) = fixture();
+        let impact = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "impact",
+                "method": "tools/call",
+                "params": {
+                    "name": "harness_kg_impact",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "symbol_name": "Ada",
+                        "direction": "out",
+                        "max_depth": 1
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(impact["result"]["structuredContent"]["seed"], "node:a");
+        let impacted_ids: Vec<_> = impact["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["object_id"].as_str())
+            .collect();
+        assert!(impacted_ids.contains(&"node:b"));
+
+        let bad_delta = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "bad-delta",
+                "method": "tools/call",
+                "params": {
+                    "name": "harness_kg_status",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "delta": { "objects": "not-an-array" }
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(bad_delta["error"]["code"], -32602);
+        assert!(bad_delta["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("delta must match instant KG schema"));
+    }
+
+    #[test]
     fn read_write_tools_list_exposes_bulk_and_designation_tools() {
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -2513,7 +2874,9 @@ mod tests {
         );
 
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|tool| tool["name"] == "rustyred.bulk.nodes"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.bulk.nodes"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.fulltext.designate"));

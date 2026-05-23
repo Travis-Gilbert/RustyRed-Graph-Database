@@ -11,6 +11,7 @@ pub mod fulltext;
 pub mod fulltext_tantivy;
 pub mod graph;
 pub mod graph_store;
+pub mod instant_kg;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -41,6 +42,12 @@ pub use graph_store::{
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
+pub use instant_kg::{
+    instant_kg_payload_delta, instant_kg_payload_manifest, instant_kg_status_payload,
+    CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
+    InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
+    INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
+};
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,
     SpatialError, SpatialIndex, RUSTY_RED_SPATIAL_BACKEND_ENV,

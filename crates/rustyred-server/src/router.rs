@@ -9,16 +9,18 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use rustyred_core::commands::{RustyredCommand, RustyredRequest, RustyredResponse};
 use rustyred_core::errors::RustyredError;
-use rustyred_core::executor::{StoreBackedRustyredExecutor, RustyredExecutor};
+use rustyred_core::executor::{RustyredExecutor, StoreBackedRustyredExecutor};
 use rustyred_core::{
-    stable_hash, EdgeRecord, EpistemicType, GraphStats, GraphStoreError, NeighborQuery, NodeQuery,
-    NodeRecord,
+    stable_hash, CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError,
+    HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
 };
-use rustyred_mcp::{agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext};
+use rustyred_mcp::{
+    agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_scope;
@@ -317,6 +319,30 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/bulk/edges",
             post(graph_bulk_edges),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/status",
+            post(instant_kg_status),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/ppr",
+            post(instant_kg_ppr),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/impact",
+            post(instant_kg_impact),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/related-objects",
+            post(instant_kg_related_objects),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/search",
+            post(instant_kg_search),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/explain-edge",
+            post(instant_kg_explain_edge),
         )
         .layer(cors)
         .with_state(state)
@@ -1691,17 +1717,21 @@ fn execute_graph_cache_command(
 ) -> RustyredResponse {
     let upper = command_name.trim().to_ascii_uppercase();
     let result = match upper.as_str() {
-        "RUSTYRED.CACHE.PUT" | "RUSTYRED.CACHE.STORE" => serde_json::from_value::<GraphCachePutBody>(args)
-            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
-            .and_then(|body| cache.put(body, graph_version))
-            .map(|payload| {
-                RustyredResponse::ok(
-                    command_name,
-                    "stored",
-                    json!({ "cache": payload }),
-                    cache_state_hash(cache, graph_version),
-                )
-            }),
+        "RUSTYRED.CACHE.PUT" | "RUSTYRED.CACHE.STORE" => {
+            serde_json::from_value::<GraphCachePutBody>(args)
+                .map_err(|error| {
+                    GraphStoreError::new("invalid_graph_cache_request", error.to_string())
+                })
+                .and_then(|body| cache.put(body, graph_version))
+                .map(|payload| {
+                    RustyredResponse::ok(
+                        command_name,
+                        "stored",
+                        json!({ "cache": payload }),
+                        cache_state_hash(cache, graph_version),
+                    )
+                })
+        }
         "RUSTYRED.CACHE.GET" => serde_json::from_value::<GraphCacheLookupBody>(args)
             .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
             .and_then(|body| cache.get(body, graph_version))
@@ -2069,6 +2099,7 @@ fn graph_error_status(code: &str) -> StatusCode {
         | "tombstoned_graph_endpoint"
         | "invalid_graph_record"
         | "invalid_graph_cache_request"
+        | "invalid_instant_kg_request"
         | "unsupported_graph_cache_kind"
         | "unsupported_graph_cache_command"
         | "dimension_mismatch"
@@ -2108,7 +2139,9 @@ fn required_scope_for_command(command: &str) -> &'static str {
         | "RUSTYRED.CACHE.EXPLAIN"
         | "RUSTYRED.CACHE.STATS" => "graph:read",
         "RUSTYRED.GRAPH.REBUILD_INDEXES" | "RUSTYRED.GRAPH.REBUILD" => "graph:write",
-        "RUSTYRED.CACHE.PUT" | "RUSTYRED.CACHE.STORE" | "RUSTYRED.CACHE.INVALIDATE" => "graph:write",
+        "RUSTYRED.CACHE.PUT" | "RUSTYRED.CACHE.STORE" | "RUSTYRED.CACHE.INVALIDATE" => {
+            "graph:write"
+        }
         _ => "run:write",
     }
 }
@@ -2552,10 +2585,9 @@ fn flush_node_batch(
         Err(_) => {
             for (line, node) in snapshot {
                 let record_id = node.id.clone();
-                let batch =
-                    rustyred_core::GraphMutationBatch::new([rustyred_core::GraphMutation::NodeUpsert(
-                        node.clone(),
-                    )]);
+                let batch = rustyred_core::GraphMutationBatch::new([
+                    rustyred_core::GraphMutation::NodeUpsert(node.clone()),
+                ]);
                 match store.commit_batch(batch) {
                     Ok(_) => {
                         *inserted += 1;
@@ -2754,8 +2786,9 @@ fn flush_edge_batch(
         Err(_) => {
             for (line, edge) in snapshot {
                 let record_id = edge.id.clone();
-                let batch =
-                    rustyred_core::GraphMutationBatch::new([rustyred_core::GraphMutation::EdgeUpsert(edge)]);
+                let batch = rustyred_core::GraphMutationBatch::new([
+                    rustyred_core::GraphMutation::EdgeUpsert(edge),
+                ]);
                 match store.commit_batch(batch) {
                     Ok(_) => {
                         *inserted += 1;
@@ -3100,6 +3133,324 @@ async fn graph_algorithm_communities(
     }
 }
 
+// ===== Harness Instant KG endpoints =====
+
+#[derive(Debug, Deserialize, Default)]
+struct InstantKgViewBody {
+    #[serde(default)]
+    manifest: Option<CodeKgManifest>,
+    #[serde(default)]
+    delta: Option<SessionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgPprBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    seeds: std::collections::HashMap<String, f64>,
+    #[serde(default = "default_ppr_alpha")]
+    alpha: f64,
+    #[serde(default = "default_ppr_epsilon")]
+    epsilon: f64,
+    #[serde(default = "default_ppr_max_pushes")]
+    max_pushes: usize,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgImpactBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    #[serde(default)]
+    seed: Option<String>,
+    #[serde(default)]
+    symbol_name: Option<String>,
+    #[serde(default = "default_impact_direction")]
+    direction: String,
+    #[serde(default = "default_impact_depth")]
+    max_depth: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgRelatedBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    seed: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgSearchBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    query: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgExplainEdgeBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    src: String,
+    dst: String,
+}
+
+fn default_instant_kg_top_k() -> usize {
+    10
+}
+
+fn default_impact_direction() -> String {
+    "out".to_string()
+}
+
+fn default_impact_depth() -> usize {
+    2
+}
+
+fn instant_kg_view(
+    state: &AppState,
+    tenant_id: &str,
+    body: InstantKgViewBody,
+) -> Result<HarnessInstantKg, axum::response::Response> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(store_unavailable_response)?;
+    let base = store.graph_snapshot().map_err(graph_store_error_response)?;
+    Ok(HarnessInstantKg::new(
+        base,
+        body.manifest,
+        body.delta.unwrap_or_default(),
+    ))
+}
+
+fn instant_kg_direction(value: &str) -> Direction {
+    if value.eq_ignore_ascii_case("in") || value.eq_ignore_ascii_case("incoming") {
+        Direction::In
+    } else {
+        Direction::Out
+    }
+}
+
+async fn instant_kg_status(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgViewBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "status": view.status(),
+        "stats": view.stats(),
+    }))
+    .into_response()
+}
+
+async fn instant_kg_ppr(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgPprBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.ppr(
+        &body.seeds,
+        body.alpha,
+        body.epsilon,
+        body.max_pushes,
+        body.top_k,
+    );
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_impact(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgImpactBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let InstantKgImpactBody {
+        view: view_body,
+        seed,
+        symbol_name,
+        direction,
+        max_depth,
+    } = body;
+    let seed = seed
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let symbol_name = symbol_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if seed.is_none() && symbol_name.is_none() {
+        return graph_store_error_response(GraphStoreError::new(
+            "invalid_instant_kg_request",
+            "instant KG impact requires seed or symbol_name",
+        ));
+    }
+    let direction = instant_kg_direction(&direction);
+    let view = match instant_kg_view(&state, &tenant_id, view_body) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let seed = match seed {
+        Some(seed) => seed,
+        None => match symbol_name
+            .as_deref()
+            .and_then(|symbol| view.resolve_symbol_name(symbol))
+        {
+            Some(seed) => seed,
+            None => {
+                return graph_store_error_response(GraphStoreError::new(
+                    "invalid_instant_kg_request",
+                    "instant KG impact could not resolve symbol_name",
+                ))
+            }
+        },
+    };
+    let results = view.impact(&seed, direction, max_depth);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "seed": seed,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_related_objects(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgRelatedBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.related_objects(&body.seed, &body.kinds, body.top_k);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "seed": body.seed,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.search(&body.query, &body.kinds, body.top_k);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "query": body.query,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_explain_edge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgExplainEdgeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let explanations = view.explain_edge(&body.src, &body.dst);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "src": body.src,
+        "dst": body.dst,
+        "status": view.status(),
+        "explanations": explanations,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -3116,11 +3467,13 @@ mod tests {
         execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
         graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
         graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
-        graph_vector_hybrid, graph_vector_search, is_cache_command, is_graph_command,
+        graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge, instant_kg_impact,
+        instant_kg_ppr, instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
         mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
         transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
-        FullTextSearchBody, HybridSearchBody, PageRankBody, PprBody, PublicCypherBody,
-        TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
+        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody,
+        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
@@ -3178,12 +3531,18 @@ mod tests {
     #[test]
     fn maps_core_commands_to_product_scopes() {
         assert_eq!(required_scope_for_command("RUSTYRED.RUN.GET"), "run:read");
-        assert_eq!(required_scope_for_command("RUSTYRED.RUN.BEGIN"), "run:write");
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.RUN.BEGIN"),
+            "run:write"
+        );
         assert_eq!(
             required_scope_for_command("RUSTYRED.CONTEXT.PACK"),
             "context:write"
         );
-        assert_eq!(required_scope_for_command("RUSTYRED.DEBUG.CYPHER"), "graph:read");
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.DEBUG.CYPHER"),
+            "graph:read"
+        );
         assert_eq!(
             required_scope_for_command("RUSTYRED.GRAPH.NODE.UPSERT"),
             "graph:write"
@@ -3196,14 +3555,26 @@ mod tests {
             required_scope_for_command("RUSTYRED.GRAPH.NODES.QUERY"),
             "graph:read"
         );
-        assert_eq!(required_scope_for_command("RUSTYRED.GRAPH.STATS"), "graph:read");
-        assert_eq!(required_scope_for_command("RUSTYRED.GRAPH.VERIFY"), "graph:read");
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.GRAPH.STATS"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.GRAPH.VERIFY"),
+            "graph:read"
+        );
         assert_eq!(
             required_scope_for_command("RUSTYRED.GRAPH.REBUILD_INDEXES"),
             "graph:write"
         );
-        assert_eq!(required_scope_for_command("RUSTYRED.CACHE.CHECK"), "graph:read");
-        assert_eq!(required_scope_for_command("RUSTYRED.CACHE.PUT"), "graph:write");
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.CACHE.CHECK"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED.CACHE.PUT"),
+            "graph:write"
+        );
     }
 
     #[test]
@@ -3254,7 +3625,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
         });
 
-        let response = execute_tenant_command(&state, "tenant-a", "RUSTYRED.GRAPH.STATS", json!({}));
+        let response =
+            execute_tenant_command(&state, "tenant-a", "RUSTYRED.GRAPH.STATS", json!({}));
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -3439,6 +3811,180 @@ mod tests {
         );
         assert_eq!(payload["scoring"]["edge_type_weights"]["CONTRADICTS"], -2.0);
         assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn instant_kg_routes_overlay_session_delta_without_mutating_base() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-kg").unwrap();
+        store
+            .upsert_node(rustyred_core::NodeRecord::new(
+                "file:lib",
+                ["File"],
+                json!({ "path": "src/lib.rs", "content": "encoder pipeline" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(rustyred_core::NodeRecord::new(
+                "sym:old",
+                ["Symbol"],
+                json!({ "name": "old_symbol" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(rustyred_core::EdgeRecord::new(
+                "edge:old",
+                "file:lib",
+                "contains",
+                "sym:old",
+                json!({ "path": "src/lib.rs", "line": 7 }),
+            ))
+            .unwrap();
+        drop(store);
+
+        let delta = rustyred_core::SessionDelta {
+            tombstoned_object_ids: vec!["sym:old".to_string()],
+            objects: vec![rustyred_core::NodeRecord::new(
+                "sym:new",
+                ["Symbol"],
+                json!({ "name": "new_symbol", "content": "instant kg carry" }),
+            )],
+            edges: vec![rustyred_core::EdgeRecord::new(
+                "edge:new",
+                "file:lib",
+                "contains",
+                "sym:new",
+                json!({ "path": "src/lib.rs", "line": 9 }),
+            )],
+            ..rustyred_core::SessionDelta::default()
+        };
+
+        let status_response = instant_kg_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgViewBody {
+                manifest: None,
+                delta: Some(delta.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status = response_payload_json(status_response).await;
+        assert_eq!(status["status"]["total_objects"], 2);
+        assert_eq!(status["status"]["tombstoned_objects"], 1);
+
+        let ppr_response = instant_kg_ppr(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgPprBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                seeds: std::collections::HashMap::from([("file:lib".to_string(), 1.0)]),
+                alpha: default_ppr_alpha(),
+                epsilon: default_ppr_epsilon(),
+                max_pushes: default_ppr_max_pushes(),
+                top_k: 5,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ppr_response.status(), StatusCode::OK);
+        let ppr = response_payload_json(ppr_response).await;
+        let result_ids: Vec<_> = ppr["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["object_id"].as_str())
+            .collect();
+        assert!(result_ids.contains(&"sym:new"));
+        assert!(!result_ids.contains(&"sym:old"));
+
+        let search_response = instant_kg_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgSearchBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                query: "instant".to_string(),
+                kinds: vec!["Symbol".to_string()],
+                top_k: 5,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(search_response.status(), StatusCode::OK);
+        let search = response_payload_json(search_response).await;
+        assert_eq!(search["results"][0]["object_id"], "sym:new");
+
+        let impact_response = instant_kg_impact(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgImpactBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                seed: Some("file:lib".to_string()),
+                symbol_name: None,
+                direction: "out".to_string(),
+                max_depth: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(impact_response.status(), StatusCode::OK);
+        let impact = response_payload_json(impact_response).await;
+        assert_eq!(impact["results"][0]["object_id"], "sym:new");
+
+        let symbol_impact_response = instant_kg_impact(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgImpactBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                seed: None,
+                symbol_name: Some("new_symbol".to_string()),
+                direction: "in".to_string(),
+                max_depth: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(symbol_impact_response.status(), StatusCode::OK);
+        let symbol_impact = response_payload_json(symbol_impact_response).await;
+        assert_eq!(symbol_impact["seed"], "sym:new");
+        assert_eq!(symbol_impact["results"][0]["object_id"], "file:lib");
+
+        let explain_response = instant_kg_explain_edge(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgExplainEdgeBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta),
+                },
+                src: "file:lib".to_string(),
+                dst: "sym:new".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(explain_response.status(), StatusCode::OK);
+        let explain = response_payload_json(explain_response).await;
+        assert_eq!(explain["explanations"][0]["layer"], "delta");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 *.so
 *.pyd
 __pycache__/
+.theorem/
 
 # Local operator config. Never commit; tokens live here.
 .env

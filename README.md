@@ -21,6 +21,7 @@ Clicking the button deploys a single Railway service with a persistent volume, s
 - **H3 spatial index** on node lat/lon properties with radius and bounding-box queries
 - **Epistemic edge types** (Supports, Contradicts, Tension, Derives, Cites) with confidence-weighted traversal across configurable hop depth
 - **Graph algorithms over HTTP/MCP**: PPR, connected components, PageRank, and label-propagation community detection
+- **Harness Instant KG merged views**: session-fresh code deltas overlay durable tenant graph artifacts for code PPR, impact analysis, related-object lookup, search, and edge explanations
 - **MCP agent port** with scoped auth tokens, read-only and read-write modes, tool annotations, and structured tool/resource/prompt surfaces
 - **Graph-version-aware cache** (10 kinds) that detects stale entries when the underlying graph mutates
 - **Bounded Cypher surface**: single-hop and outgoing multi-hop MATCH, bounded variable-length expand, path aliases, property projections, `COUNT(*) / COUNT(binding)`, and transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE`
@@ -272,6 +273,12 @@ POST /v1/tenants/{tenant_id}/graph/fulltext/designate
 POST /v1/tenants/{tenant_id}/graph/fulltext/search
 POST /v1/tenants/{tenant_id}/graph/bulk/nodes
 POST /v1/tenants/{tenant_id}/graph/bulk/edges
+POST /v1/tenants/{tenant_id}/instant-kg/status
+POST /v1/tenants/{tenant_id}/instant-kg/ppr
+POST /v1/tenants/{tenant_id}/instant-kg/impact
+POST /v1/tenants/{tenant_id}/instant-kg/related-objects
+POST /v1/tenants/{tenant_id}/instant-kg/search
+POST /v1/tenants/{tenant_id}/instant-kg/explain-edge
 GET  /v1/diagnostics/slow_queries
 GET  /v1/diagnostics/config
 POST /v1/tenants/{tenant_id}/context/pack
@@ -294,6 +301,7 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 | `rustyred.graph.query` / `rustyred.graph.explain` / `rustyred.graph.neighbors` | Bounded native graph reads and plan inspection |
 | `rustyred.graph.schema` / `rustyred.graph.index_status` | Graph schema and index-health reads |
 | `rustyred.algorithm.ppr` (alias: `rustyred.algo.ppr`) / `rustyred.algorithm.components` (`rustyred.algo.components`) / `rustyred.algorithm.pagerank` (`rustyred.algo.pagerank`) / `rustyred.algorithm.communities` (`rustyred.algo.communities`) | Graph algorithms: PPR, connected components, PageRank, label-propagation communities |
+| `harness_kg_status` / `harness_kg_ppr` / `harness_kg_impact` / `harness_kg_related_objects` / `harness_kg_search` / `harness_kg_explain_edge` | Harness Instant KG tools over a RedCore tenant base graph plus an optional session delta. Legacy `RUSTY_RED_MODE=redis` returns a diagnostic because Instant KG is a native RustyRed capability. |
 | `rustyred.fulltext.search` (alias: `rustyred.graph.fulltext.search`) / `rustyred.spatial.radius` (`rustyred.graph.spatial.radius`) / `rustyred.spatial.bbox` (`rustyred.graph.spatial.bbox`) | Full-text and spatial read surfaces |
 | `rustyred.vector.search` | HNSW nearest-neighbor search on vector properties |
 | `rustyred.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
