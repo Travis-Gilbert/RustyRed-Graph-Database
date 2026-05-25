@@ -8,7 +8,7 @@ Featuring GraphCache graph state-aware cache, a first-class MCP agent port, buil
 multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and document storage.
 Written in Rust, the best way to write a database. In my humble opinion.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/rustyred-graphdb?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
 
 Clicking the button deploys a single Railway service with a persistent volume, security-by-default, and a freshly generated API token. You get the same in-memory RAM-first graph database documented below — no Redis sidecar, no second service, no extra moving parts.
 
@@ -205,6 +205,24 @@ Run the product server locally:
 
 ```bash
 RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
+```
+
+For low-memory local builds, cap Cargo's parallel compiler jobs:
+
+```bash
+CARGO_BUILD_JOBS=2 RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
+```
+
+For a low-memory local Docker build and run:
+
+```bash
+docker build --build-arg CARGO_BUILD_JOBS=2 -t rustyred-local .
+docker run --rm \
+  -p 8380:8380 \
+  -v "$PWD/data/rusty-red:/app/data/rusty-red" \
+  -e RUSTY_RED_VOLUME_MOUNTED=true \
+  -e RUSTY_RED_REQUIRE_AUTH=false \
+  rustyred-local
 ```
 
 Strict local durability mode is explicit:

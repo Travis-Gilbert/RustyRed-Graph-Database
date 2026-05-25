@@ -652,13 +652,10 @@ fn call_tool<P: McpGraphProvider>(
                 "stats": { "returned": results.len(), "k": k }
             })
         }
-        "rustyred.fulltext.designate" | "rustyred.graph.fulltext.designate" if config.read_only => {
-            return Ok(tool_result_error(json!({
-                "error": "mcp_read_only",
-                "message": "Write tools are unavailable while read-only mode is active."
-            })))
-        }
         "rustyred.fulltext.designate" | "rustyred.graph.fulltext.designate" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
             let label = required_str(&arguments, "label", name)?;
             let property = required_str(&arguments, "property", name)?;
             backend.designate_fulltext_property(label, property)?;
@@ -711,13 +708,10 @@ fn call_tool<P: McpGraphProvider>(
                 "stats": { "returned": node_ids.len() }
             })
         }
-        "rustyred.spatial.designate" | "rustyred.graph.spatial.designate" if config.read_only => {
-            return Ok(tool_result_error(json!({
-                "error": "mcp_read_only",
-                "message": "Write tools are unavailable while read-only mode is active."
-            })))
-        }
         "rustyred.spatial.designate" | "rustyred.graph.spatial.designate" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
             let label = required_str(&arguments, "label", name)?;
             let lat_property = required_str(&arguments, "lat_property", name)?;
             let lon_property = required_str(&arguments, "lon_property", name)?;
@@ -737,13 +731,10 @@ fn call_tool<P: McpGraphProvider>(
                 }
             })
         }
-        "rustyred.bulk.nodes" | "rustyred.graph.bulk.nodes" if config.read_only => {
-            return Ok(tool_result_error(json!({
-                "error": "mcp_read_only",
-                "message": "Write tools are unavailable while read-only mode is active."
-            })))
-        }
         "rustyred.bulk.nodes" | "rustyred.graph.bulk.nodes" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
             let records = arguments
                 .get("nodes")
                 .or_else(|| arguments.get("records"))
@@ -779,13 +770,10 @@ fn call_tool<P: McpGraphProvider>(
                 "errors": errors,
             })
         }
-        "rustyred.bulk.edges" | "rustyred.graph.bulk.edges" if config.read_only => {
-            return Ok(tool_result_error(json!({
-                "error": "mcp_read_only",
-                "message": "Write tools are unavailable while read-only mode is active."
-            })))
-        }
         "rustyred.bulk.edges" | "rustyred.graph.bulk.edges" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
             let records = arguments
                 .get("edges")
                 .or_else(|| arguments.get("records"))
@@ -908,13 +896,10 @@ fn call_tool<P: McpGraphProvider>(
                 }
             })
         }
-        "rustyred.vector.designate" if config.read_only => {
-            return Ok(tool_result_error(json!({
-                "error": "mcp_read_only",
-                "message": "Write tools are unavailable while read-only mode is active."
-            })))
-        }
         "rustyred.vector.designate" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
             let label = arguments
                 .get("label")
                 .and_then(Value::as_str)
@@ -1613,6 +1598,26 @@ fn tool_result_error(payload: Value) -> Value {
         map.insert("isError".to_string(), Value::Bool(true));
     }
     result
+}
+
+fn require_write_tool(
+    config: &McpServerConfig,
+    context: &McpRequestContext,
+    tool_name: &str,
+) -> Option<Value> {
+    if config.read_only {
+        return Some(tool_result_error(json!({
+            "error": "mcp_read_only",
+            "message": "Write tools are unavailable while read-only mode is active."
+        })));
+    }
+    if !context.allows("graph:write") {
+        return Some(tool_result_error(json!({
+            "error": "graph_write_scope_required",
+            "message": format!("{tool_name} requires graph:write or rustyred:graph:write:propose/apply scope.")
+        })));
+    }
+    None
 }
 
 fn jsonrpc_error(id: Option<Value>, error: McpError) -> Value {
@@ -2883,6 +2888,90 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.spatial.designate"));
+    }
+
+    #[test]
+    fn write_tools_require_graph_write_scope_even_when_exposed() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        for tool_name in [
+            "rustyred.fulltext.designate",
+            "rustyred.spatial.designate",
+            "rustyred.bulk.nodes",
+            "rustyred.bulk.edges",
+            "rustyred.vector.designate",
+        ] {
+            let response = handle_mcp_request_with_context(
+                &provider,
+                &config,
+                &McpRequestContext::with_scopes(["graph:read"]),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": tool_name,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": { "tenant": "smoke" }
+                    }
+                }),
+            );
+
+            assert_eq!(
+                response["result"]["structuredContent"]["error"],
+                "graph_write_scope_required"
+            );
+        }
+
+        let allowed = handle_mcp_request_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["rustyred:graph:write:apply"]),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "bulk-nodes",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred.bulk.nodes",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "nodes": [{ "id": "node:write", "labels": ["Person"] }]
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(allowed["result"]["structuredContent"]["ok"], true);
+        assert_eq!(allowed["result"]["structuredContent"]["inserted"], 1);
+    }
+
+    #[test]
+    fn read_only_mode_blocks_write_tools_before_scope_check() {
+        let (provider, mut config) = fixture();
+        config.read_only = true;
+
+        let blocked = handle_mcp_request_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["graph:write"]),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "bulk-nodes",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred.bulk.nodes",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "nodes": [{ "id": "node:write", "labels": ["Person"] }]
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            blocked["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
     }
 
     #[test]

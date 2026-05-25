@@ -1,6 +1,7 @@
 FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
+ARG CARGO_BUILD_JOBS=2
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -15,7 +16,7 @@ COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
 
-RUN cargo build -p rustyred-server --release
+RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo build -p rustyred-server --release
 
 FROM debian:bookworm-slim
 
