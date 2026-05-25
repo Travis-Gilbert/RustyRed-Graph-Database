@@ -1,32 +1,30 @@
 // GraphDatabaseService — tonic-side implementation of rustyred.v1.GraphDatabase.
 //
-// This file mirrors the HTTP routes defined in router.rs but exposes them
-// over gRPC. The MAJORITY of methods in this first commit are stubbed with
-// `Status::unimplemented` and a comment naming the HTTP route they should
-// mirror; filling them in is mechanical (parse gRPC request → call the
-// existing handler logic → map the response into a gRPC response message).
-//
-// The methods implemented first are the "vital signs" plus the read-only
-// graph primitives that make gRPC useful for symmetric agent/tool exposure:
-//
-//   - Health        — does the server respond at all?
-//   - Ready         — does the server pass its readiness check?
-//   - GraphStats    — can we read the graph state through gRPC?
-//   - GetNode/GetEdge/QueryNodes/Neighbors — can clients inspect graph state?
-//
-// Subsequent commits fill in the remaining write/search/cache methods. Each
-// todo points at the existing axum route handler so the mapping work is bounded.
+// This file mirrors the HTTP routes defined in router.rs but exposes them over
+// gRPC. The implementation intentionally calls the same state, graph store,
+// auth, query, and cache primitives as the HTTP surface so clients get symmetric
+// behavior regardless of transport.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
+use http::{HeaderMap, HeaderValue, StatusCode};
 use rustyred_core::{
-    Direction, EdgeRecord, GraphStoreError, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    connected_components, label_propagation_communities, pagerank, personalized_pagerank,
+    Direction, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch, GraphStoreError,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
 };
-use serde_json::{Number, Value};
+use serde_json::{json, Number, Value};
 use tonic::{Request, Response, Status};
 
 use super::proto;
 use super::proto::graph_database_server::GraphDatabase;
+use crate::auth::require_scope;
+use crate::graph_cache::{GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody};
+use crate::query_surface::{
+    execute_cypher_query, explain_cypher_query, parse_tx_cypher_mutations, PublicCypherBody,
+    QuerySurfaceError,
+};
 use crate::state::{AppState, TenantGraphStore};
 
 #[derive(Clone)]
@@ -47,20 +45,124 @@ impl GraphDatabaseService {
             ))
         })
     }
-}
 
-// One-stop helper so each unimplemented stub stays a single line below.
-// Returns a tonic Status saying "this method is pending; see the HTTP
-// route for the equivalent surface."
-fn pending(method: &str, http_route: &str) -> Status {
-    Status::unimplemented(format!(
-        "rustyred.v1.GraphDatabase/{} — see HTTP route {} for the equivalent surface; gRPC mapping pending.",
-        method, http_route
-    ))
+    fn require_request_scope<T>(
+        &self,
+        request: &Request<T>,
+        required_scope: &str,
+    ) -> Result<(), Status> {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = request.metadata().get("authorization") {
+            let value = value.to_str().map_err(|_| {
+                Status::unauthenticated("authorization metadata must be valid ASCII")
+            })?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| Status::unauthenticated("authorization metadata is invalid"))?;
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
+        require_scope(
+            &headers,
+            &self.state.config.api_tokens,
+            required_scope,
+            self.state.config.require_auth,
+        )
+        .map(|_| ())
+        .map_err(auth_status_to_grpc)
+    }
 }
 
 fn graph_store_status(operation: &str, error: GraphStoreError) -> Status {
     Status::internal(format!("{operation}: {}: {}", error.code, error.message))
+}
+
+fn auth_status_to_grpc(status: StatusCode) -> Status {
+    match status {
+        StatusCode::UNAUTHORIZED => Status::unauthenticated("missing or invalid bearer token"),
+        StatusCode::FORBIDDEN => Status::permission_denied("token lacks the required scope"),
+        other => Status::internal(format!("unexpected auth status: {other}")),
+    }
+}
+
+fn state_status(operation: &str, error: crate::state::StoreAccessError) -> Status {
+    Status::failed_precondition(format!("{operation}: {}: {}", error.code, error.message))
+}
+
+fn query_surface_status(operation: &str, error: QuerySurfaceError) -> Status {
+    let payload = error.payload();
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("query surface error");
+    match error.status() {
+        StatusCode::BAD_REQUEST => Status::invalid_argument(format!("{operation}: {message}")),
+        StatusCode::UNAUTHORIZED => Status::unauthenticated(format!("{operation}: {message}")),
+        StatusCode::FORBIDDEN => Status::permission_denied(format!("{operation}: {message}")),
+        StatusCode::NOT_FOUND => Status::not_found(format!("{operation}: {message}")),
+        StatusCode::SERVICE_UNAVAILABLE => Status::unavailable(format!("{operation}: {message}")),
+        _ => Status::internal(format!("{operation}: {message}")),
+    }
+}
+
+fn json_result_count(value: &Value) -> u32 {
+    value
+        .get("row_count")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("stats")
+                .and_then(|stats| stats.get("returned"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            value
+                .get("rows")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len() as u64)
+        })
+        .or_else(|| {
+            value
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map(|nodes| nodes.len() as u64)
+        })
+        .unwrap_or_default() as u32
+}
+
+fn grpc_cache_lookup(cache_key: String) -> GraphCacheLookupBody {
+    GraphCacheLookupBody {
+        tenant_id: None,
+        kind: "query_result".to_string(),
+        key: Value::String(cache_key),
+        index_manifest_hash: None,
+        auth_scope_hash: None,
+        retrieval_policy_hash: None,
+        model_version: Some("grpc.v1".to_string()),
+        source_hashes: Vec::new(),
+    }
+}
+
+fn bytes_to_json(bytes: Vec<u8>) -> Value {
+    Value::Array(
+        bytes
+            .into_iter()
+            .map(|byte| Value::Number(u64::from(byte).into()))
+            .collect(),
+    )
+}
+
+fn json_to_bytes(value: Option<Value>) -> Result<Vec<u8>, Status> {
+    let Some(Value::Array(bytes)) = value else {
+        return Ok(Vec::new());
+    };
+    bytes
+        .into_iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|byte| u8::try_from(byte).ok())
+                .ok_or_else(|| Status::internal("cached gRPC payload is not a byte array"))
+        })
+        .collect()
 }
 
 fn node_to_proto(node: NodeRecord) -> proto::Node {
@@ -93,6 +195,41 @@ fn properties_to_proto(value: &Value) -> proto::PropertyMap {
     proto::PropertyMap { properties }
 }
 
+fn node_from_proto(node: Option<proto::Node>) -> Result<NodeRecord, Status> {
+    let node = node.ok_or_else(|| Status::invalid_argument("node is required"))?;
+    if node.id.trim().is_empty() {
+        return Err(Status::invalid_argument("node.id is required"));
+    }
+    Ok(NodeRecord::new(
+        node.id,
+        node.labels,
+        properties_value_from_proto(node.properties),
+    ))
+}
+
+fn edge_from_proto(edge: Option<proto::Edge>) -> Result<EdgeRecord, Status> {
+    let edge = edge.ok_or_else(|| Status::invalid_argument("edge is required"))?;
+    if edge.id.trim().is_empty() {
+        return Err(Status::invalid_argument("edge.id is required"));
+    }
+    if edge.source_id.trim().is_empty() {
+        return Err(Status::invalid_argument("edge.source_id is required"));
+    }
+    if edge.target_id.trim().is_empty() {
+        return Err(Status::invalid_argument("edge.target_id is required"));
+    }
+    if edge.r#type.trim().is_empty() {
+        return Err(Status::invalid_argument("edge.type is required"));
+    }
+    Ok(EdgeRecord::new(
+        edge.id,
+        edge.source_id,
+        edge.r#type,
+        edge.target_id,
+        properties_value_from_proto(edge.properties),
+    ))
+}
+
 fn property_to_proto(value: &Value) -> proto::Property {
     use proto::property::Value as ProtoValue;
 
@@ -111,6 +248,20 @@ fn property_to_proto(value: &Value) -> proto::Property {
         Value::Array(_) | Value::Object(_) | Value::Null => ProtoValue::JsonVal(value.to_string()),
     };
     proto::Property { value: Some(value) }
+}
+
+fn properties_value_from_proto(properties: Option<proto::PropertyMap>) -> Value {
+    Value::Object(
+        properties
+            .map(|properties| {
+                properties
+                    .properties
+                    .into_iter()
+                    .map(|(key, value)| (key, value_from_proto_property(value)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn query_properties_from_proto(properties: Option<proto::PropertyMap>) -> BTreeMap<String, Value> {
@@ -145,6 +296,56 @@ fn value_from_proto_property(property: proto::Property) -> Value {
             serde_json::from_str(&value).unwrap_or(Value::String(value))
         }
         None => Value::Null,
+    }
+}
+
+fn vector_query_from_proto(values: Vec<f64>) -> Vec<f32> {
+    values.into_iter().map(|value| value as f32).collect()
+}
+
+fn spatial_property_pair(property_name: &str) -> Result<(String, String), Status> {
+    let separators = [',', ':', '/'];
+    for separator in separators {
+        if let Some((lat, lon)) = property_name.split_once(separator) {
+            let lat = lat.trim();
+            let lon = lon.trim();
+            if !lat.is_empty() && !lon.is_empty() {
+                return Ok((lat.to_string(), lon.to_string()));
+            }
+        }
+    }
+    Err(Status::invalid_argument(
+        "spatial property_name must encode the latitude and longitude properties as \"lat,lon\"",
+    ))
+}
+
+fn epistemic_types_from_proto(values: Vec<i32>) -> Result<Option<Vec<EpistemicType>>, Status> {
+    let mut types = Vec::new();
+    for value in values {
+        let value = proto::EpistemicEdgeType::try_from(value)
+            .map_err(|_| Status::invalid_argument("invalid epistemic edge type"))?;
+        match value {
+            proto::EpistemicEdgeType::EpistemicTypeUnspecified => {}
+            proto::EpistemicEdgeType::EpistemicTypeSupports => types.push(EpistemicType::Supports),
+            proto::EpistemicEdgeType::EpistemicTypeContradicts => {
+                types.push(EpistemicType::Contradicts)
+            }
+            proto::EpistemicEdgeType::EpistemicTypeTension => types.push(EpistemicType::Tension),
+            proto::EpistemicEdgeType::EpistemicTypeDerives => types.push(EpistemicType::Derives),
+            proto::EpistemicEdgeType::EpistemicTypeCites => types.push(EpistemicType::Cites),
+        }
+    }
+    Ok((!types.is_empty()).then_some(types))
+}
+
+fn epistemic_type_to_proto(value: Option<EpistemicType>) -> proto::EpistemicEdgeType {
+    match value {
+        Some(EpistemicType::Supports) => proto::EpistemicEdgeType::EpistemicTypeSupports,
+        Some(EpistemicType::Contradicts) => proto::EpistemicEdgeType::EpistemicTypeContradicts,
+        Some(EpistemicType::Tension) => proto::EpistemicEdgeType::EpistemicTypeTension,
+        Some(EpistemicType::Derives) => proto::EpistemicEdgeType::EpistemicTypeDerives,
+        Some(EpistemicType::Cites) => proto::EpistemicEdgeType::EpistemicTypeCites,
+        None => proto::EpistemicEdgeType::EpistemicTypeUnspecified,
     }
 }
 
@@ -230,78 +431,300 @@ impl GraphDatabase for GraphDatabaseService {
     }
 
     // ====================================================================
-    // Native query surface — PENDING
+    // Native query surface
     // ====================================================================
 
     async fn query(
         &self,
-        _r: Request<proto::QueryRequest>,
+        request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::QueryResponse>, Status> {
-        Err(pending("query", "POST /v1/query"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let graph_version = store
+            .stats()
+            .map_err(|err| graph_store_status("query.stats", err))?
+            .version;
+        let body: Value = serde_json::from_str(&request.body_json)
+            .map_err(|err| Status::invalid_argument(format!("body_json must be JSON: {err}")))?;
+        let payload = match proto::QueryKind::try_from(request.kind)
+            .unwrap_or(proto::QueryKind::Unspecified)
+        {
+            proto::QueryKind::NodeMatch => {
+                let query: NodeQuery = serde_json::from_value(body).map_err(|err| {
+                    Status::invalid_argument(format!("node query body_json is invalid: {err}"))
+                })?;
+                let nodes = store
+                    .query_nodes(query)
+                    .map_err(|err| graph_store_status("query.node_match", err))?;
+                serde_json::to_string(&nodes)
+                    .map_err(|err| Status::internal(format!("serialize query nodes: {err}")))?
+            }
+            proto::QueryKind::Neighbors => {
+                let query: NeighborQuery = serde_json::from_value(body).map_err(|err| {
+                    Status::invalid_argument(format!("neighbor query body_json is invalid: {err}"))
+                })?;
+                let neighbors = store
+                    .neighbors(query)
+                    .map_err(|err| graph_store_status("query.neighbors", err))?;
+                serde_json::to_string(&neighbors)
+                    .map_err(|err| Status::internal(format!("serialize neighbors: {err}")))?
+            }
+            proto::QueryKind::Unspecified => {
+                return Err(Status::invalid_argument("query kind is required"));
+            }
+        };
+        let result_count = serde_json::from_str::<Value>(&payload)
+            .ok()
+            .and_then(|value| value.as_array().map(|array| array.len() as u32))
+            .unwrap_or_default();
+        Ok(Response::new(proto::QueryResponse {
+            result_json: payload,
+            result_count,
+            graph_version,
+        }))
     }
     async fn cypher(
         &self,
-        _r: Request<proto::CypherRequest>,
+        request: Request<proto::CypherRequest>,
     ) -> Result<Response<proto::CypherResponse>, Status> {
-        Err(pending("cypher", "POST /v1/cypher"))
+        let needs_write_scope = !request.get_ref().transaction_id.trim().is_empty();
+        self.require_request_scope(
+            &request,
+            if needs_write_scope {
+                "graph:write"
+            } else {
+                "graph:read"
+            },
+        )?;
+        let request = request.into_inner();
+        let tenant_id = if request.tenant_id.trim().is_empty() {
+            self.state.config.mcp_default_tenant.clone()
+        } else {
+            request.tenant_id
+        };
+        let params = if request.parameters_json.trim().is_empty() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_str::<BTreeMap<String, Value>>(&request.parameters_json).map_err(
+                |err| Status::invalid_argument(format!("parameters_json must be an object: {err}")),
+            )?
+        };
+        let body = PublicCypherBody {
+            tenant_id: Some(tenant_id.clone()),
+            query: request.cypher,
+            params,
+            tx_id: (!request.transaction_id.trim().is_empty())
+                .then_some(request.transaction_id.clone()),
+        };
+        let store = self.tenant_store(&tenant_id)?;
+        let graph_version = store
+            .stats()
+            .map_err(|err| graph_store_status("cypher.stats", err))?
+            .version;
+
+        let payload = if let Some(tx_id) = body.tx_id.as_deref() {
+            let mutations = parse_tx_cypher_mutations(&body.query, &body.params)
+                .map_err(|err| query_surface_status("cypher.parse_tx", err))?;
+            let staged_mutations = self
+                .state
+                .append_graph_transaction_mutations(&tenant_id, tx_id, mutations)
+                .map_err(|err| state_status("cypher.stage_tx", err))?;
+            json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "query": body.query,
+                "tx_id": tx_id,
+                "subset": "opencypher_v0_1_write_tx",
+                "staged_mutations": staged_mutations,
+            })
+        } else {
+            let mut store = store;
+            self.state.observability.record_cypher();
+            let start = Instant::now();
+            let payload = execute_cypher_query(&mut store, &tenant_id, &body)
+                .map_err(|err| query_surface_status("cypher", err))?;
+            let nanos = start.elapsed().as_nanos() as u64;
+            let detail = body.query.chars().take(120).collect::<String>();
+            self.state
+                .observability
+                .record_query_timing("cypher", &detail, nanos, 0, 0);
+            payload
+        };
+
+        let result_count = json_result_count(&payload);
+        let result_json = serde_json::to_string(&payload)
+            .map_err(|err| Status::internal(format!("serialize cypher result: {err}")))?;
+        Ok(Response::new(proto::CypherResponse {
+            result_json,
+            result_count,
+            graph_version,
+        }))
     }
     async fn cypher_explain(
         &self,
-        _r: Request<proto::CypherRequest>,
+        request: Request<proto::CypherRequest>,
     ) -> Result<Response<proto::CypherExplainResponse>, Status> {
-        Err(pending("cypher_explain", "POST /v1/cypher/explain"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let tenant_id = if request.tenant_id.trim().is_empty() {
+            self.state.config.mcp_default_tenant.clone()
+        } else {
+            request.tenant_id
+        };
+        let params = if request.parameters_json.trim().is_empty() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_str::<BTreeMap<String, Value>>(&request.parameters_json).map_err(
+                |err| Status::invalid_argument(format!("parameters_json must be an object: {err}")),
+            )?
+        };
+        let body = PublicCypherBody {
+            tenant_id: Some(tenant_id.clone()),
+            query: request.cypher,
+            params,
+            tx_id: None,
+        };
+        let plan = explain_cypher_query(&tenant_id, &body)
+            .map_err(|err| query_surface_status("cypher_explain", err))?;
+        let plan_json = serde_json::to_string(&plan)
+            .map_err(|err| Status::internal(format!("serialize cypher plan: {err}")))?;
+        Ok(Response::new(proto::CypherExplainResponse {
+            plan_json,
+            narrative: "OpenCypher compatibility plan generated by RustyRed.".to_string(),
+        }))
     }
 
     // ====================================================================
-    // Transactions — PENDING
+    // Transactions
     // ====================================================================
 
     async fn begin_transaction(
         &self,
-        _r: Request<proto::BeginTxnRequest>,
+        request: Request<proto::BeginTxnRequest>,
     ) -> Result<Response<proto::BeginTxnResponse>, Status> {
-        Err(pending("begin_transaction", "POST /v1/transactions/begin"))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let transaction_id = self
+            .state
+            .begin_graph_transaction(&request.tenant_id)
+            .map_err(|err| state_status("begin_transaction", err))?;
+        let snapshot_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("begin_transaction.stats", err))?
+            .version;
+        self.state.observability.record_transaction_begin();
+        Ok(Response::new(proto::BeginTxnResponse {
+            transaction_id,
+            snapshot_graph_version,
+        }))
     }
     async fn commit_transaction(
         &self,
-        _r: Request<proto::CommitTxnRequest>,
+        request: Request<proto::CommitTxnRequest>,
     ) -> Result<Response<proto::CommitTxnResponse>, Status> {
-        Err(pending(
-            "commit_transaction",
-            "POST /v1/transactions/commit",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let transaction = self
+            .state
+            .commit_graph_transaction(&request.tenant_id, &request.transaction_id)
+            .map_err(|err| state_status("commit_transaction", err))?;
+        let store = self.tenant_store(&request.tenant_id)?;
+        let mut nodes_written = 0u32;
+        let mut edges_written = 0u32;
+        for write in &transaction.writes {
+            if store
+                .get_node(&write.id)
+                .map_err(|err| graph_store_status("commit_transaction.get_node", err))?
+                .is_some()
+            {
+                nodes_written += 1;
+            } else if store
+                .get_edge(&write.id)
+                .map_err(|err| graph_store_status("commit_transaction.get_edge", err))?
+                .is_some()
+            {
+                edges_written += 1;
+            }
+        }
+        self.state.observability.record_transaction_commit();
+        Ok(Response::new(proto::CommitTxnResponse {
+            new_graph_version: transaction.graph_version,
+            nodes_written,
+            edges_written,
+        }))
     }
     async fn rollback_transaction(
         &self,
-        _r: Request<proto::RollbackTxnRequest>,
+        request: Request<proto::RollbackTxnRequest>,
     ) -> Result<Response<proto::RollbackTxnResponse>, Status> {
-        Err(pending(
-            "rollback_transaction",
-            "POST /v1/transactions/rollback",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        self.state
+            .rollback_graph_transaction(&request.tenant_id, &request.transaction_id)
+            .map_err(|err| state_status("rollback_transaction", err))?;
+        self.state.observability.record_transaction_rollback();
+        Ok(Response::new(proto::RollbackTxnResponse {
+            rolled_back: true,
+        }))
     }
 
     // ====================================================================
-    // Node + edge primitives — PENDING
+    // Node + edge primitives
     // ====================================================================
 
     async fn upsert_node(
         &self,
-        _r: Request<proto::UpsertNodeRequest>,
+        request: Request<proto::UpsertNodeRequest>,
     ) -> Result<Response<proto::Node>, Status> {
-        Err(pending(
-            "upsert_node",
-            "POST /v1/tenants/{tenant_id}/graph/nodes",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let node = node_from_proto(request.node)?;
+        if request.transaction_id.trim().is_empty() {
+            let mut store = self.tenant_store(&request.tenant_id)?;
+            store
+                .upsert_node(node.clone())
+                .map_err(|err| graph_store_status("upsert_node", err))?;
+            self.state.observability.record_mutation();
+            self.state
+                .maybe_index_node_fulltext(&request.tenant_id, &node);
+            self.state
+                .maybe_index_node_spatially(&request.tenant_id, &node);
+        } else {
+            self.state
+                .append_graph_transaction_mutations(
+                    &request.tenant_id,
+                    &request.transaction_id,
+                    GraphMutationBatch::new([GraphMutation::NodeUpsert(node.clone())]),
+                )
+                .map_err(|err| state_status("upsert_node.stage", err))?;
+        }
+        Ok(Response::new(node_to_proto(node)))
     }
     async fn upsert_edge(
         &self,
-        _r: Request<proto::UpsertEdgeRequest>,
+        request: Request<proto::UpsertEdgeRequest>,
     ) -> Result<Response<proto::Edge>, Status> {
-        Err(pending(
-            "upsert_edge",
-            "POST /v1/tenants/{tenant_id}/graph/edges",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let edge = edge_from_proto(request.edge)?;
+        if request.transaction_id.trim().is_empty() {
+            let mut store = self.tenant_store(&request.tenant_id)?;
+            store
+                .upsert_edge(edge.clone())
+                .map_err(|err| graph_store_status("upsert_edge", err))?;
+            self.state.observability.record_mutation();
+        } else {
+            self.state
+                .append_graph_transaction_mutations(
+                    &request.tenant_id,
+                    &request.transaction_id,
+                    GraphMutationBatch::new([GraphMutation::EdgeUpsert(edge.clone())]),
+                )
+                .map_err(|err| state_status("upsert_edge.stage", err))?;
+        }
+        Ok(Response::new(edge_to_proto(edge)))
     }
     async fn get_node(
         &self,
@@ -433,232 +856,772 @@ impl GraphDatabase for GraphDatabaseService {
     }
 
     // ====================================================================
-    // Bulk ingest — PENDING
+    // Bulk ingest
     // ====================================================================
 
     async fn bulk_insert_nodes(
         &self,
-        _r: Request<proto::BulkNodesRequest>,
+        request: Request<proto::BulkNodesRequest>,
     ) -> Result<Response<proto::BulkInsertResponse>, Status> {
-        Err(pending(
-            "bulk_insert_nodes",
-            "POST /v1/tenants/{tenant_id}/graph/bulk/nodes",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let nodes = request
+            .nodes
+            .into_iter()
+            .map(|node| node_from_proto(Some(node)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted_count = nodes.len() as u32;
+        let graph_version = if request.transaction_id.trim().is_empty() {
+            if nodes.is_empty() {
+                self.tenant_store(&request.tenant_id)?
+                    .stats()
+                    .map_err(|err| graph_store_status("bulk_insert_nodes.stats", err))?
+                    .version
+            } else {
+                let mut store = self.tenant_store(&request.tenant_id)?;
+                let transaction = store
+                    .commit_batch(GraphMutationBatch::new(
+                        nodes.iter().cloned().map(GraphMutation::NodeUpsert),
+                    ))
+                    .map_err(|err| graph_store_status("bulk_insert_nodes", err))?;
+                for node in &nodes {
+                    self.state.observability.record_mutation();
+                    self.state
+                        .maybe_index_node_fulltext(&request.tenant_id, node);
+                    self.state
+                        .maybe_index_node_spatially(&request.tenant_id, node);
+                }
+                transaction.graph_version
+            }
+        } else if nodes.is_empty() {
+            self.tenant_store(&request.tenant_id)?
+                .stats()
+                .map_err(|err| graph_store_status("bulk_insert_nodes.stats", err))?
+                .version
+        } else {
+            self.state
+                .append_graph_transaction_mutations(
+                    &request.tenant_id,
+                    &request.transaction_id,
+                    GraphMutationBatch::new(nodes.into_iter().map(GraphMutation::NodeUpsert)),
+                )
+                .map_err(|err| state_status("bulk_insert_nodes.stage", err))?;
+            self.tenant_store(&request.tenant_id)?
+                .stats()
+                .map_err(|err| graph_store_status("bulk_insert_nodes.stats", err))?
+                .version
+        };
+        Ok(Response::new(proto::BulkInsertResponse {
+            inserted_count,
+            skipped_count: 0,
+            skipped_ids: Vec::new(),
+            new_graph_version: graph_version,
+        }))
     }
     async fn bulk_insert_edges(
         &self,
-        _r: Request<proto::BulkEdgesRequest>,
+        request: Request<proto::BulkEdgesRequest>,
     ) -> Result<Response<proto::BulkInsertResponse>, Status> {
-        Err(pending(
-            "bulk_insert_edges",
-            "POST /v1/tenants/{tenant_id}/graph/bulk/edges",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let edges = request
+            .edges
+            .into_iter()
+            .map(|edge| edge_from_proto(Some(edge)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted_count = edges.len() as u32;
+        let graph_version = if request.transaction_id.trim().is_empty() {
+            if edges.is_empty() {
+                self.tenant_store(&request.tenant_id)?
+                    .stats()
+                    .map_err(|err| graph_store_status("bulk_insert_edges.stats", err))?
+                    .version
+            } else {
+                let mut store = self.tenant_store(&request.tenant_id)?;
+                let transaction = store
+                    .commit_batch(GraphMutationBatch::new(
+                        edges.iter().cloned().map(GraphMutation::EdgeUpsert),
+                    ))
+                    .map_err(|err| graph_store_status("bulk_insert_edges", err))?;
+                for _ in &edges {
+                    self.state.observability.record_mutation();
+                }
+                transaction.graph_version
+            }
+        } else if edges.is_empty() {
+            self.tenant_store(&request.tenant_id)?
+                .stats()
+                .map_err(|err| graph_store_status("bulk_insert_edges.stats", err))?
+                .version
+        } else {
+            self.state
+                .append_graph_transaction_mutations(
+                    &request.tenant_id,
+                    &request.transaction_id,
+                    GraphMutationBatch::new(edges.into_iter().map(GraphMutation::EdgeUpsert)),
+                )
+                .map_err(|err| state_status("bulk_insert_edges.stage", err))?;
+            self.tenant_store(&request.tenant_id)?
+                .stats()
+                .map_err(|err| graph_store_status("bulk_insert_edges.stats", err))?
+                .version
+        };
+        Ok(Response::new(proto::BulkInsertResponse {
+            inserted_count,
+            skipped_count: 0,
+            skipped_ids: Vec::new(),
+            new_graph_version: graph_version,
+        }))
     }
 
     // ====================================================================
-    // Vector search — PENDING
+    // Vector search
     // ====================================================================
 
     async fn vector_search(
         &self,
-        _r: Request<proto::VectorSearchRequest>,
+        request: Request<proto::VectorSearchRequest>,
     ) -> Result<Response<proto::VectorSearchResponse>, Status> {
-        Err(pending(
-            "vector_search",
-            "POST /v1/tenants/{tenant_id}/graph/vector/search",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let query = vector_query_from_proto(request.query_vector);
+        let k = if request.k == 0 {
+            10
+        } else {
+            request.k as usize
+        };
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = store
+            .vector_search(Some(&request.label), &request.property_name, &query, k)
+            .map_err(|err| graph_store_status("vector_search", err))?;
+        let hits = hits
+            .into_iter()
+            .filter_map(|(node_id, distance)| {
+                store
+                    .get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| proto::VectorHit {
+                        node: Some(node_to_proto(node)),
+                        distance: distance as f64,
+                        score: f64::from(1.0 - distance),
+                    })
+            })
+            .collect();
+        Ok(Response::new(proto::VectorSearchResponse { hits }))
     }
     async fn vector_hybrid_search(
         &self,
-        _r: Request<proto::VectorHybridRequest>,
+        request: Request<proto::VectorHybridRequest>,
     ) -> Result<Response<proto::VectorSearchResponse>, Status> {
-        Err(pending(
-            "vector_hybrid_search",
-            "POST /v1/tenants/{tenant_id}/graph/vector/hybrid",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let query = vector_query_from_proto(request.query_vector);
+        let k = if request.k == 0 {
+            10
+        } else {
+            request.k as usize
+        };
+        let graph_seeds = if request.seed_node_id.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![request.seed_node_id.clone()]
+        };
+        let alpha = request.graph_proximity_weight.clamp(0.0, 1.0) as f32;
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = store
+            .hybrid_search(
+                Some(&request.label),
+                &request.property_name,
+                &query,
+                k,
+                &graph_seeds,
+                3,
+                alpha,
+            )
+            .map_err(|err| graph_store_status("vector_hybrid_search", err))?;
+        let hits = hits
+            .into_iter()
+            .filter_map(|(node_id, score)| {
+                store
+                    .get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| proto::VectorHit {
+                        node: Some(node_to_proto(node)),
+                        distance: f64::from(1.0 - score),
+                        score: score as f64,
+                    })
+            })
+            .collect();
+        Ok(Response::new(proto::VectorSearchResponse { hits }))
     }
     async fn designate_vector_property(
         &self,
-        _r: Request<proto::DesignateVectorRequest>,
+        request: Request<proto::DesignateVectorRequest>,
     ) -> Result<Response<proto::DesignateAck>, Status> {
-        Err(pending(
-            "designate_vector_property",
-            "POST /v1/tenants/{tenant_id}/graph/vector/designate",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        store
+            .designate_vector_property(
+                &request.label,
+                &request.property_name,
+                request.dimension as usize,
+            )
+            .map_err(|err| graph_store_status("designate_vector_property", err))?;
+        Ok(Response::new(proto::DesignateAck {
+            designated: true,
+            reason: String::new(),
+        }))
     }
 
     // ====================================================================
-    // Full-text search — PENDING
+    // Full-text search
     // ====================================================================
 
     async fn fulltext_search(
         &self,
-        _r: Request<proto::FulltextSearchRequest>,
+        request: Request<proto::FulltextSearchRequest>,
     ) -> Result<Response<proto::FulltextSearchResponse>, Status> {
-        Err(pending(
-            "fulltext_search",
-            "POST /v1/tenants/{tenant_id}/graph/fulltext/search",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let limit = if request.limit == 0 {
+            10
+        } else {
+            request.limit as usize
+        };
+        let label = (!request.label.trim().is_empty()).then_some(request.label.as_str());
+        let results = self
+            .state
+            .fulltext_search(
+                &request.tenant_id,
+                label,
+                &request.property_name,
+                &request.query,
+                limit,
+            )
+            .map_err(|err| state_status("fulltext_search", err))?;
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = results
+            .into_iter()
+            .filter_map(|(node_id, score)| {
+                store
+                    .get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| proto::FulltextHit {
+                        node: Some(node_to_proto(node)),
+                        bm25_score: score as f64,
+                        highlights: Vec::new(),
+                    })
+            })
+            .collect();
+        Ok(Response::new(proto::FulltextSearchResponse { hits }))
     }
     async fn designate_fulltext_property(
         &self,
-        _r: Request<proto::DesignateFulltextRequest>,
+        request: Request<proto::DesignateFulltextRequest>,
     ) -> Result<Response<proto::DesignateAck>, Status> {
-        Err(pending(
-            "designate_fulltext_property",
-            "POST /v1/tenants/{tenant_id}/graph/fulltext/designate",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        self.state
+            .designate_fulltext_property(&request.tenant_id, &request.label, &request.property_name)
+            .map_err(|err| state_status("designate_fulltext_property", err))?;
+        Ok(Response::new(proto::DesignateAck {
+            designated: true,
+            reason: String::new(),
+        }))
     }
 
     // ====================================================================
-    // Spatial — PENDING
+    // Spatial
     // ====================================================================
 
     async fn spatial_radius(
         &self,
-        _r: Request<proto::SpatialRadiusRequest>,
+        request: Request<proto::SpatialRadiusRequest>,
     ) -> Result<Response<proto::SpatialResponse>, Status> {
-        Err(pending(
-            "spatial_radius",
-            "POST /v1/tenants/{tenant_id}/graph/spatial/radius",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let (lat_property, lon_property) = spatial_property_pair(&request.property_name)?;
+        let limit = if request.limit == 0 {
+            usize::MAX
+        } else {
+            request.limit as usize
+        };
+        let node_ids = self
+            .state
+            .spatial_radius_search(
+                &request.tenant_id,
+                &request.label,
+                &lat_property,
+                &lon_property,
+                request.center_lat,
+                request.center_lon,
+                request.radius_meters / 1000.0,
+            )
+            .map_err(|err| state_status("spatial_radius", err))?;
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = node_ids
+            .into_iter()
+            .take(limit)
+            .filter_map(|node_id| {
+                store
+                    .get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| proto::SpatialHit {
+                        node: Some(node_to_proto(node)),
+                        distance_meters: 0.0,
+                    })
+            })
+            .collect();
+        Ok(Response::new(proto::SpatialResponse { hits }))
     }
     async fn spatial_bounding_box(
         &self,
-        _r: Request<proto::SpatialBboxRequest>,
+        request: Request<proto::SpatialBboxRequest>,
     ) -> Result<Response<proto::SpatialResponse>, Status> {
-        Err(pending(
-            "spatial_bounding_box",
-            "POST /v1/tenants/{tenant_id}/graph/spatial/bbox",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let (lat_property, lon_property) = spatial_property_pair(&request.property_name)?;
+        let limit = if request.limit == 0 {
+            usize::MAX
+        } else {
+            request.limit as usize
+        };
+        let node_ids = self
+            .state
+            .spatial_bbox_search(
+                &request.tenant_id,
+                &request.label,
+                &lat_property,
+                &lon_property,
+                request.min_lat,
+                request.min_lon,
+                request.max_lat,
+                request.max_lon,
+            )
+            .map_err(|err| state_status("spatial_bounding_box", err))?;
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = node_ids
+            .into_iter()
+            .take(limit)
+            .filter_map(|node_id| {
+                store
+                    .get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| proto::SpatialHit {
+                        node: Some(node_to_proto(node)),
+                        distance_meters: 0.0,
+                    })
+            })
+            .collect();
+        Ok(Response::new(proto::SpatialResponse { hits }))
     }
     async fn designate_spatial_property(
         &self,
-        _r: Request<proto::DesignateSpatialRequest>,
+        request: Request<proto::DesignateSpatialRequest>,
     ) -> Result<Response<proto::DesignateAck>, Status> {
-        Err(pending(
-            "designate_spatial_property",
-            "POST /v1/tenants/{tenant_id}/graph/spatial/designate",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let (lat_property, lon_property) = spatial_property_pair(&request.property_name)?;
+        self.state
+            .designate_spatial_property(
+                &request.tenant_id,
+                &request.label,
+                &lat_property,
+                &lon_property,
+                9,
+            )
+            .map_err(|err| state_status("designate_spatial_property", err))?;
+        Ok(Response::new(proto::DesignateAck {
+            designated: true,
+            reason: String::new(),
+        }))
     }
 
     // ====================================================================
-    // Epistemic traversal — PENDING
+    // Epistemic traversal
     // ====================================================================
 
     async fn epistemic_neighbors(
         &self,
-        _r: Request<proto::EpistemicNeighborsRequest>,
+        request: Request<proto::EpistemicNeighborsRequest>,
     ) -> Result<Response<proto::EpistemicNeighborsResponse>, Status> {
-        Err(pending(
-            "epistemic_neighbors",
-            "POST /v1/tenants/{tenant_id}/graph/epistemic-neighbors",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let edge_types = epistemic_types_from_proto(request.edge_types)?;
+        let max_depth = (request.max_hops > 0).then_some(request.max_hops as usize);
+        let min_confidence = (request.min_confidence > 0.0).then_some(request.min_confidence);
+        let store = self.tenant_store(&request.tenant_id)?;
+        let hits = store
+            .epistemic_neighbors(
+                &request.seed_node_id,
+                edge_types.as_deref(),
+                min_confidence,
+                max_depth,
+            )
+            .map_err(|err| graph_store_status("epistemic_neighbors", err))?
+            .into_iter()
+            .map(|(edge, node)| proto::EpistemicHit {
+                node: Some(node_to_proto(node)),
+                edge_type: epistemic_type_to_proto(edge.epistemic_type.clone()).into(),
+                confidence: edge.effective_confidence(),
+                hop_count: 1,
+            })
+            .collect();
+        Ok(Response::new(proto::EpistemicNeighborsResponse { hits }))
     }
 
     // ====================================================================
-    // Graph algorithms — PENDING
+    // Graph algorithms
     // ====================================================================
 
     async fn personalized_page_rank(
         &self,
-        _r: Request<proto::PprRequest>,
+        request: Request<proto::PprRequest>,
     ) -> Result<Response<proto::PprResponse>, Status> {
-        Err(pending(
-            "personalized_page_rank",
-            "POST /v1/tenants/{tenant_id}/graph/algorithms/ppr",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let edges = store
+            .list_edges()
+            .map_err(|err| graph_store_status("personalized_page_rank.list_edges", err))?;
+        let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for edge in edges.iter().filter(|edge| !edge.tombstone) {
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push((edge.to_id.clone(), edge.effective_confidence()));
+        }
+        let max_pushes = if request.max_pushes == 0 {
+            10_000
+        } else {
+            request.max_pushes as usize
+        };
+        let scores = personalized_pagerank(
+            &adjacency,
+            &request.seeds,
+            request.alpha,
+            request.epsilon,
+            max_pushes,
+        );
+        Ok(Response::new(proto::PprResponse {
+            scores,
+            total_pushes: 0,
+        }))
     }
     async fn page_rank(
         &self,
-        _r: Request<proto::PageRankRequest>,
+        request: Request<proto::PageRankRequest>,
     ) -> Result<Response<proto::PageRankResponse>, Status> {
-        Err(pending(
-            "page_rank",
-            "POST /v1/tenants/{tenant_id}/graph/algorithms/pagerank",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let edges = store
+            .list_edges()
+            .map_err(|err| graph_store_status("page_rank.list_edges", err))?;
+        let damping = if request.damping == 0.0 {
+            0.85
+        } else {
+            request.damping
+        };
+        let max_iter = if request.max_iter == 0 {
+            50
+        } else {
+            request.max_iter as usize
+        };
+        let tolerance = if request.tolerance == 0.0 {
+            1e-6
+        } else {
+            request.tolerance
+        };
+        let scores = pagerank(&edges, damping, max_iter, tolerance);
+        Ok(Response::new(proto::PageRankResponse {
+            scores,
+            iterations_used: max_iter as u32,
+        }))
     }
     async fn connected_components(
         &self,
-        _r: Request<proto::ComponentsRequest>,
+        request: Request<proto::ComponentsRequest>,
     ) -> Result<Response<proto::ComponentsResponse>, Status> {
-        Err(pending(
-            "connected_components",
-            "POST /v1/tenants/{tenant_id}/graph/algorithms/components",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let edges = store
+            .list_edges()
+            .map_err(|err| graph_store_status("connected_components.list_edges", err))?;
+        let components = connected_components(&edges, request.directed);
+        let mut node_to_component = HashMap::new();
+        for (idx, component) in components.iter().enumerate() {
+            for node_id in component {
+                node_to_component.insert(node_id.clone(), idx as u32);
+            }
+        }
+        Ok(Response::new(proto::ComponentsResponse {
+            node_to_component,
+            component_count: components.len() as u32,
+        }))
     }
     async fn communities(
         &self,
-        _r: Request<proto::CommunitiesRequest>,
+        request: Request<proto::CommunitiesRequest>,
     ) -> Result<Response<proto::CommunitiesResponse>, Status> {
-        Err(pending(
-            "communities",
-            "POST /v1/tenants/{tenant_id}/graph/algorithms/communities",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let edges = store
+            .list_edges()
+            .map_err(|err| graph_store_status("communities.list_edges", err))?;
+        let (communities, _modularity) = label_propagation_communities(&edges);
+        let community_count = communities.values().copied().collect::<HashSet<_>>().len() as u32;
+        Ok(Response::new(proto::CommunitiesResponse {
+            node_to_community: communities
+                .into_iter()
+                .map(|(node_id, community)| (node_id, community as u32))
+                .collect(),
+            community_count,
+        }))
     }
 
     // ====================================================================
-    // Stats + diagnostics — graph_verify + rebuild_indexes PENDING
+    // Stats + diagnostics
     // ====================================================================
 
     async fn graph_verify(
         &self,
-        _r: Request<proto::GraphVerifyRequest>,
+        request: Request<proto::GraphVerifyRequest>,
     ) -> Result<Response<proto::VerifyReport>, Status> {
-        Err(pending(
-            "graph_verify",
-            "GET /v1/tenants/{tenant_id}/graph/verify",
-        ))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let store = self.tenant_store(&request.tenant_id)?;
+        let report = store
+            .verify()
+            .map_err(|err| graph_store_status("graph_verify", err))?;
+        let issues = report
+            .problems
+            .into_iter()
+            .map(|problem| format!("{}:{}: {}", problem.kind, problem.id, problem.detail))
+            .collect();
+        Ok(Response::new(proto::VerifyReport {
+            ok: report.ok,
+            issues,
+            graph_version_at_verify: report.stats.version,
+        }))
     }
     async fn rebuild_indexes(
         &self,
-        _r: Request<proto::RebuildIndexesRequest>,
+        request: Request<proto::RebuildIndexesRequest>,
     ) -> Result<Response<proto::RebuildIndexesResponse>, Status> {
-        Err(pending(
-            "rebuild_indexes",
-            "POST /v1/tenants/{tenant_id}/graph/rebuild-indexes",
-        ))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let mut store = self.tenant_store(&request.tenant_id)?;
+        let start = Instant::now();
+        let report = store
+            .rebuild_indexes()
+            .map_err(|err| graph_store_status("rebuild_indexes", err))?;
+        Ok(Response::new(proto::RebuildIndexesResponse {
+            indexes_rebuilt: u32::from(report.repaired),
+            duration_micros: start.elapsed().as_micros() as u64,
+        }))
     }
 
     // ====================================================================
-    // Cache — PENDING
+    // Cache
     // ====================================================================
 
     async fn cache_put(
         &self,
-        _r: Request<proto::CachePutRequest>,
+        request: Request<proto::CachePutRequest>,
     ) -> Result<Response<proto::CacheAck>, Status> {
-        Err(pending("cache_put", "POST /v1/cache/put"))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_put.stats", err))?
+            .version;
+        if request.graph_version != 0 && request.graph_version != current_graph_version {
+            return Err(Status::failed_precondition(format!(
+                "cache_put graph_version {} does not match current graph version {}",
+                request.graph_version, current_graph_version
+            )));
+        }
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_put.cache", err))?;
+        cache
+            .put(
+                GraphCachePutBody {
+                    tenant_id: None,
+                    kind: "query_result".to_string(),
+                    key: Value::String(request.cache_key.clone()),
+                    value: bytes_to_json(request.payload),
+                    metadata: json!({
+                        "grpc_cache_key": request.cache_key,
+                        "requested_graph_version": request.graph_version,
+                    }),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: Some("grpc.v1".to_string()),
+                    source_hashes: Vec::new(),
+                },
+                current_graph_version,
+            )
+            .map_err(|err| graph_store_status("cache_put", err))?;
+        Ok(Response::new(proto::CacheAck {
+            ok: true,
+            reason: "stored".to_string(),
+        }))
     }
     async fn cache_get(
         &self,
-        _r: Request<proto::CacheGetRequest>,
+        request: Request<proto::CacheGetRequest>,
     ) -> Result<Response<proto::CacheGetResponse>, Status> {
-        Err(pending("cache_get", "POST /v1/cache/get"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_get.stats", err))?
+            .version;
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_get.cache", err))?;
+        let result = cache
+            .get(grpc_cache_lookup(request.cache_key), current_graph_version)
+            .map_err(|err| graph_store_status("cache_get", err))?;
+        Ok(Response::new(proto::CacheGetResponse {
+            found: result.hit,
+            payload: json_to_bytes(result.value)?,
+            stored_at_graph_version: result.entry_graph_version.unwrap_or_default(),
+            stale: result.stale,
+        }))
     }
     async fn cache_check(
         &self,
-        _r: Request<proto::CacheCheckRequest>,
+        request: Request<proto::CacheCheckRequest>,
     ) -> Result<Response<proto::CacheCheckResponse>, Status> {
-        Err(pending("cache_check", "POST /v1/cache/check"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_check.stats", err))?
+            .version;
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_check.cache", err))?;
+        let result = cache
+            .check(grpc_cache_lookup(request.cache_key), current_graph_version)
+            .map_err(|err| graph_store_status("cache_check", err))?;
+        Ok(Response::new(proto::CacheCheckResponse {
+            present: result.hit,
+            stale: result.stale,
+            stored_at_graph_version: result.entry_graph_version.unwrap_or_default(),
+        }))
     }
     async fn cache_explain(
         &self,
-        _r: Request<proto::CacheCheckRequest>,
+        request: Request<proto::CacheCheckRequest>,
     ) -> Result<Response<proto::CacheExplainResponse>, Status> {
-        Err(pending("cache_explain", "POST /v1/cache/explain"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_explain.stats", err))?
+            .version;
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_explain.cache", err))?;
+        let result = cache
+            .explain(grpc_cache_lookup(request.cache_key), current_graph_version)
+            .map_err(|err| graph_store_status("cache_explain", err))?;
+        let staleness_reasons = if result.stale {
+            vec![result.reason]
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(proto::CacheExplainResponse {
+            present: result.hit,
+            stale: result.stale,
+            stored_at_graph_version: result.entry_graph_version.unwrap_or_default(),
+            current_graph_version,
+            staleness_reasons,
+        }))
     }
     async fn cache_invalidate(
         &self,
-        _r: Request<proto::CacheInvalidateRequest>,
+        request: Request<proto::CacheInvalidateRequest>,
     ) -> Result<Response<proto::CacheAck>, Status> {
-        Err(pending("cache_invalidate", "POST /v1/cache/invalidate"))
+        self.require_request_scope(&request, "graph:write")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_invalidate.stats", err))?
+            .version;
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_invalidate.cache", err))?;
+        let result = cache
+            .invalidate(
+                GraphCacheInvalidateBody {
+                    tenant_id: None,
+                    all: false,
+                    stale_only: false,
+                    kind: Some("query_result".to_string()),
+                    key: Some(Value::String(request.cache_key)),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: Some("grpc.v1".to_string()),
+                    source_hashes: Vec::new(),
+                },
+                current_graph_version,
+            )
+            .map_err(|err| graph_store_status("cache_invalidate", err))?;
+        Ok(Response::new(proto::CacheAck {
+            ok: result.removed > 0,
+            reason: format!("removed {}", result.removed),
+        }))
     }
     async fn cache_stats(
         &self,
-        _r: Request<proto::CacheStatsRequest>,
+        request: Request<proto::CacheStatsRequest>,
     ) -> Result<Response<proto::CacheStatsResponse>, Status> {
-        Err(pending("cache_stats", "POST /v1/cache/stats"))
+        self.require_request_scope(&request, "graph:read")?;
+        let request = request.into_inner();
+        let current_graph_version = self
+            .tenant_store(&request.tenant_id)?
+            .stats()
+            .map_err(|err| graph_store_status("cache_stats.stats", err))?
+            .version;
+        let cache = self
+            .state
+            .tenant_graph_cache(&request.tenant_id)
+            .map_err(|err| state_status("cache_stats.cache", err))?;
+        let stats = cache
+            .stats(current_graph_version)
+            .map_err(|err| graph_store_status("cache_stats", err))?;
+        Ok(Response::new(proto::CacheStatsResponse {
+            entries: stats.entries_total as u64,
+            hits: stats.hits,
+            misses: stats.misses,
+            stale_evictions: stats.stale_hits,
+            explicit_invalidations: stats.invalidations,
+        }))
     }
 }
 
@@ -799,6 +1762,84 @@ mod tests {
         assert_eq!(neighbors.neighbors[0].node.as_ref().unwrap().id, "node:b");
         assert_eq!(neighbors.neighbors[0].edge.as_ref().unwrap().id, "edge:ab");
         assert_eq!(neighbors.neighbors[0].score, 0.82);
+    }
+
+    #[tokio::test]
+    async fn grpc_write_query_diagnostics_and_cache_surfaces_work() {
+        let service = service_with_graph();
+
+        let count = service
+            .cypher(Request::new(proto::CypherRequest {
+                tenant_id: "smoke".to_string(),
+                cypher: "MATCH (n:Person) RETURN COUNT(*)".to_string(),
+                parameters_json: String::new(),
+                transaction_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(count.result_count, 1);
+        let count_payload: Value = serde_json::from_str(&count.result_json).unwrap();
+        assert_eq!(count_payload["row_count"], 1);
+
+        let created = service
+            .upsert_node(Request::new(proto::UpsertNodeRequest {
+                tenant_id: "smoke".to_string(),
+                node: Some(proto::Node {
+                    id: "node:c".to_string(),
+                    labels: vec!["Person".to_string()],
+                    properties: Some(properties_to_proto(&json!({"name": "Katherine"}))),
+                }),
+                transaction_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(created.id, "node:c");
+
+        let verify = service
+            .graph_verify(Request::new(proto::GraphVerifyRequest {
+                tenant_id: "smoke".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(verify.ok);
+        assert!(verify.issues.is_empty());
+
+        let payload = b"cached bytes".to_vec();
+        let ack = service
+            .cache_put(Request::new(proto::CachePutRequest {
+                tenant_id: "smoke".to_string(),
+                cache_key: "cypher:person-count".to_string(),
+                payload: payload.clone(),
+                graph_version: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok);
+
+        let cached = service
+            .cache_get(Request::new(proto::CacheGetRequest {
+                tenant_id: "smoke".to_string(),
+                cache_key: "cypher:person-count".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cached.found);
+        assert_eq!(cached.payload, payload);
+
+        let stats = service
+            .cache_stats(Request::new(proto::CacheStatsRequest {
+                tenant_id: "smoke".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[tokio::test]
