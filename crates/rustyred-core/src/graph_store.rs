@@ -1907,7 +1907,7 @@ impl RedCoreGraphStore {
     fn apply_recovered_mutation(&mut self, mutation: RedCoreMutation) -> GraphStoreResult<()> {
         match mutation {
             RedCoreMutation::NodeUpsert(node) => self.store.apply_recovered_node(node),
-            RedCoreMutation::EdgeUpsert(edge) => self.store.apply_recovered_edge(edge),
+            RedCoreMutation::EdgeUpsert(edge) => self.apply_recovered_edge_lossy(edge),
             RedCoreMutation::Batch(mutations) => {
                 for mutation in mutations {
                     self.apply_recovered_mutation(mutation)?;
@@ -1918,6 +1918,14 @@ impl RedCoreGraphStore {
                 self.store
                     .designate_vector_property(&d.label, &d.property, d.dimension)
             }
+        }
+    }
+
+    fn apply_recovered_edge_lossy(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        match self.store.apply_recovered_edge(edge) {
+            Ok(()) => Ok(()),
+            Err(error) if is_recoverable_orphan_edge(&error) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -2191,6 +2199,13 @@ fn decode_aof_frame(raw: &str) -> GraphStoreResult<RedCoreAofFrame> {
         ));
     }
     Ok(frame)
+}
+
+fn is_recoverable_orphan_edge(error: &GraphStoreError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "missing_graph_endpoint" | "tombstoned_graph_endpoint"
+    )
 }
 
 fn truncate_aof_tail(file: &File, data_dir: &Path, offset: u64) -> GraphStoreResult<()> {
@@ -3635,8 +3650,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, InMemoryGraphStore,
-        NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+        stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore,
+        InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord, RedCoreAofFrame,
+        RedCoreDurability, RedCoreGraphStore, RedCoreMutation, RedCoreOptions, REDCORE_AOF_FILE,
+        REDCORE_AOF_MAGIC, REDCORE_MANIFEST_VERSION,
     };
 
     #[test]
@@ -4161,6 +4178,60 @@ mod tests {
             store.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
             "node:b"
         );
+        assert_eq!(store.verify().unwrap().ok, true);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_recovery_skips_orphan_edges_instead_of_poisoning_store() {
+        let data_dir = unique_test_dir("redcore-orphan-edge-recovery");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "actor:sandbox",
+                    ["Actor"],
+                    json!({ "actor_id": "sandbox" }),
+                ))
+                .unwrap();
+        }
+
+        let mutation = RedCoreMutation::EdgeUpsert(EdgeRecord::new(
+            "edge:orphan-created-by",
+            "mem:missing-memory-atom",
+            "CREATED_BY",
+            "actor:sandbox",
+            json!({ "actor_kind": "sandbox" }),
+        ));
+        let frame = RedCoreAofFrame {
+            magic: REDCORE_AOF_MAGIC.to_string(),
+            version: REDCORE_MANIFEST_VERSION,
+            txn_id: 2,
+            graph_version: 2,
+            timestamp_unix_ms: 0,
+            payload_checksum: stable_hash(&mutation),
+            mutation,
+        };
+        let raw = serde_json::to_string(&frame).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(data_dir.join(REDCORE_AOF_FILE))
+            .unwrap()
+            .write_all(format!("{raw}\n").as_bytes())
+            .unwrap();
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+
+        assert!(store.get_node("actor:sandbox").unwrap().is_some());
+        assert!(store.get_edge("edge:orphan-created-by").unwrap().is_none());
+        assert_eq!(store.status().recovered_frames, 2);
+        assert_eq!(store.status().last_txn_id, 2);
         assert_eq!(store.verify().unwrap().ok, true);
 
         std::fs::remove_dir_all(data_dir).ok();
