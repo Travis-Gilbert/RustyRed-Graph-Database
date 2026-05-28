@@ -598,7 +598,11 @@ impl InMemoryGraphStore {
             store.apply_recovered_node(node)?;
         }
         for edge in snapshot.edges {
-            store.apply_recovered_edge(edge)?;
+            match store.apply_recovered_edge(edge) {
+                Ok(()) => {}
+                Err(error) if is_recoverable_orphan_edge(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         store.version = store.version.max(snapshot.version);
         Ok(store)
@@ -3650,8 +3654,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore,
-        InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord, RedCoreAofFrame,
+        stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot,
+        GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord, RedCoreAofFrame,
         RedCoreDurability, RedCoreGraphStore, RedCoreMutation, RedCoreOptions, REDCORE_AOF_FILE,
         REDCORE_AOF_MAGIC, REDCORE_MANIFEST_VERSION,
     };
@@ -4235,6 +4239,31 @@ mod tests {
         assert_eq!(store.verify().unwrap().ok, true);
 
         std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn graph_snapshot_recovery_skips_orphan_edges_instead_of_poisoning_store() {
+        let snapshot = GraphSnapshot {
+            version: 2,
+            nodes: vec![NodeRecord::new(
+                "actor:sandbox",
+                ["Actor"],
+                json!({ "actor_id": "sandbox" }),
+            )],
+            edges: vec![EdgeRecord::new(
+                "edge:orphan-created-by",
+                "mem:missing-memory-atom",
+                "CREATED_BY",
+                "actor:sandbox",
+                json!({ "actor_kind": "sandbox" }),
+            )],
+        };
+
+        let store = InMemoryGraphStore::from_snapshot(snapshot).unwrap();
+
+        assert!(store.get_node("actor:sandbox").is_some());
+        assert!(store.get_edge("edge:orphan-created-by").is_none());
+        assert_eq!(store.verify().ok, true);
     }
 
     #[test]
