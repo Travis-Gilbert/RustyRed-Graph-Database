@@ -4,6 +4,8 @@ RustyRed is a remarkably fast Graph + Vector database.
 It runs entirely in RAM.
 Designed to help humans and their agents work well together.
 
+Current public release: `0.6.0`.
+
 Featuring GraphCache graph state-aware cache, a first-class MCP agent port, built-in-RAG both graph and vector
 multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and document storage.
 Written in Rust, the best way to write a database. In my humble opinion.
@@ -29,7 +31,7 @@ Clicking the button deploys a single Railway service with a persistent volume, s
 - **JSONL bulk loader** for nodes and edges
 - **Observability**: Prometheus `/metrics` (17 counters), slow-query ring buffer at `/v1/diagnostics/slow_queries`
 - **HTTP transaction API**: `/v1/transactions/begin|commit|rollback` with snapshot isolation
-- **Native algorithm helpers** exposed through the root PyO3 compatibility crate, including ACL local-push Personalized PageRank
+- **Pure Rust algorithm helpers** exposed through the root helper crate, including ACL local-push Personalized PageRank with no Python runtime or native extension dependency
 
 ---
 
@@ -170,17 +172,16 @@ These are on the roadmap, in roughly this priority order:
 | `rustyred-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
 | `rustyred-compat-server` | Standalone compatibility command server |
 | `rustyred-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
-| root crate | PyO3 compatibility bindings for native graph/search helpers |
+| root crate | Pure Rust helper facade over `rustyred-core`, including integer-ID PPR and release version metadata |
 
 ### Build (local development)
 
-Requires Rust 1.85+ and `maturin >= 1.7`. The repo vendors the `rustyred.v1` proto at `vendor/proto/` so a fresh clone builds without any submodule init step:
+Requires Rust 1.85+. The repo vendors the `rustyred.v1` proto at `vendor/proto/` so a fresh clone builds without any submodule init step:
 
 ```bash
 git clone https://github.com/Travis-Gilbert/RustyRed-Graph-Database.git
 cd RustyRed-Graph-Database
 cargo check --workspace
-maturin develop --release
 ```
 
 The `theorem-protos` submodule at `proto/` is optional for development; pull it only if you intend to edit the upstream proto contract:
@@ -193,8 +194,7 @@ scripts/sync-vendored-proto.sh   # mirrors your edits into vendor/proto/
 
 CI checks that `vendor/proto/` matches the submodule on every PR via `.github/workflows/vendored-proto-up-to-date.yml`. See [docs/adr/0001-vendored-proto-for-railway-build.md](docs/adr/0001-vendored-proto-for-railway-build.md) for the rationale.
 
-`cargo check --workspace` validates the Rust workspace (including the tonic gRPC server scaffolded against `vendor/proto/rustyred/v1/`).
-`maturin develop --release` builds the root `abi3-py312` compatibility wheel into the active Python environment.
+`cargo check --workspace` validates the Rust workspace, including the tonic gRPC server scaffolded against `vendor/proto/rustyred/v1/`. The public standalone release has no Python packaging or native extension build step.
 
 ### Product server
 
@@ -357,19 +357,22 @@ POST /v1/command
 POST /v1/batch
 ```
 
-### Python compatibility bindings
+### Rust-native PPR helper
 
-The root crate exposes native helper functions through PyO3 for Python 3.12+. These bindings are not required for the Railway template. The most important algorithm helper is:
+The root crate exposes a pure Rust convenience wrapper for integer-ID local-push PPR. It delegates to `rustyred-core`, which is also what the HTTP, MCP, and Instant KG routes use.
 
-```python
-def push_ppr(
-    adjacency: dict[int, list[tuple[int, float]]],
-    seeds: dict[int, float],
-    *,
-    alpha: float = 0.15,
-    epsilon: float = 1e-4,
-    max_pushes: int = 200_000,
-) -> dict[int, float]: ...
+```rust
+use std::collections::HashMap;
+
+let adjacency = HashMap::from([
+    (0, vec![(1, 1.0)]),
+    (1, vec![(2, 1.0)]),
+    (2, vec![(0, 1.0)]),
+]);
+let seeds = HashMap::from([(0, 1.0)]);
+
+let scores = rusty_red_native::push_ppr(&adjacency, &seeds, 0.15, 1e-4, 200_000);
+assert_eq!(rusty_red_native::VERSION, "0.6.0");
 ```
 
 ### Downstream integrations
@@ -377,21 +380,6 @@ def push_ppr(
 This repository is the upstream source for versioned Rusty Red releases. Product integrations can consume it as a downstream `git subtree` and keep their own deployment adapters or private overlays downstream. The included `.github/workflows/sync-downstream.yml` can open downstream sync PRs after pushes to `main` when `DOWNSTREAM_SYNC_REPOSITORY` and `DOWNSTREAM_SYNC_TOKEN` are configured in repository settings.
 
 See [`docs/downstream-sync.md`](docs/downstream-sync.md) for the setup contract and the local subtree sync command.
-
-### Benchmarks
-
-Single-threaded, single-seed PPR queries on random sparse graphs (average degree 4, alpha 0.15, epsilon 1e-4), captured on an M1 Max via `tests/test_benchmarks.py`:
-
-| Nodes | Native | Python | Speedup |
-|-------|--------|--------|---------|
-| 50K   | 0.0024s | 0.0318s | 13.2x |
-| 200K  | 0.0034s | 0.1753s | 51.3x |
-| 1M    | 0.0023s | 0.9573s | 413.9x (acceptance gate: must be >= 20x) |
-
-
-The fixture is generated with seed 42 for reproducibility. Numbers vary across hardware; the 20x floor is enforced on whatever runner executes the test.
-
-The native impl uses lazy on-demand neighbor extraction: ACL Push typically touches ~1/(epsilon*alpha) ~ 67k nodes for production params, so converting only those (not the full adjacency dict) eliminates the dominant FFI cost.
 
 ### Algorithm reference
 

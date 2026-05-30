@@ -1,7 +1,7 @@
 //! Rusty Red core command runtime.
 //!
-//! This crate has no Python or network-server dependencies. Both PyO3
-//! in-process bindings and the standalone HTTP server call this same executor.
+//! This crate has no Python or network-server dependencies. The standalone
+//! helper crate, MCP adapter, and HTTP server call this same executor.
 
 pub mod commands;
 pub mod errors;

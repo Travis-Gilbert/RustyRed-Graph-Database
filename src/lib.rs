@@ -1,62 +1,97 @@
-//! rusty_red_native: PyO3 entry point.
+//! Rusty Red standalone Rust helper facade.
 //!
-//! Exports a native `push_ppr` implementation with this Python signature:
-//!
-//!     push_ppr(
-//!         adjacency: dict[int, list[tuple[int, float]]],
-//!         seeds: dict[int, float],
-//!         *,
-//!         alpha: float = 0.15,
-//!         epsilon: float = 1e-4,
-//!         max_pushes: int = 200_000,
-//!     ) -> dict[int, float]
-//!
-//! `alpha`, `epsilon`, `max_pushes` are keyword-only (PyO3 `*` separator).
-//! `adjacency` keys and node IDs are Python `int` (not contiguous indices)
-//! because application node IDs are arbitrary integers.
+//! The public release does not require Python or native extension bindings.
+//! Product HTTP, MCP, and direct Rust callers all use the same `rustyred-core`
+//! graph algorithms.
 
-mod bgi;
-mod cmh;
-mod graph_export;
-mod push_ppr;
-mod search_kernel;
-mod rustyred;
+use std::collections::HashMap;
 
-use pyo3::prelude::*;
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[pymodule]
-fn rusty_red_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(push_ppr::push_ppr, m)?)?;
-    m.add_function(wrap_pyfunction!(cmh::cmh_body_hash, m)?)?;
-    m.add_function(wrap_pyfunction!(cmh::cmh_atom_id_v1, m)?)?;
-    m.add_function(wrap_pyfunction!(cmh::cmh_handoff_state_hash_v1, m)?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_stable_hash_json, m)?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_fact_pack_hash_rows_json, m)?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_egraph_receipt_summary_json, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        bgi::bgi_egraph_extract_context_pack_json,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_datalog_receipt_summary_json, m)?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_datalog_derive_core_json, m)?)?;
-    m.add_function(wrap_pyfunction!(bgi::bgi_compact_receipts_json, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        search_kernel::search_normalize_urls_batch,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        search_kernel::search_score_frontier_batch,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        search_kernel::search_fuse_scores_batch,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(search_kernel::search_cosine_topk, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_export::graph_remap_ids_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_export::graph_pack_edges_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(rustyred::rustyred_expand_bounded, m)?)?;
-    m.add_function(wrap_pyfunction!(rustyred::rustyred_paths_shortest, m)?)?;
-    m.add_class::<rustyred::RustyredCoreExecutor>()?;
-    Ok(())
+pub type NodeId = i64;
+pub type WeightedAdjacency = HashMap<NodeId, Vec<(NodeId, f64)>>;
+pub type SeedMap = HashMap<NodeId, f64>;
+pub type ScoreMap = HashMap<NodeId, f64>;
+
+pub use rustyred_core::{
+    connected_components, label_propagation_communities, pagerank, personalized_pagerank,
+};
+
+/// Run ACL local-push Personalized PageRank with integer node identifiers.
+///
+/// This is a pure Rust convenience wrapper over `rustyred-core` for callers
+/// that do not need to construct full graph-store records.
+pub fn push_ppr(
+    adjacency: &WeightedAdjacency,
+    seeds: &SeedMap,
+    alpha: f64,
+    epsilon: f64,
+    max_pushes: usize,
+) -> ScoreMap {
+    let string_adjacency: HashMap<String, Vec<(String, f64)>> = adjacency
+        .iter()
+        .map(|(source, neighbors)| {
+            (
+                source.to_string(),
+                neighbors
+                    .iter()
+                    .map(|(target, weight)| (target.to_string(), *weight))
+                    .collect(),
+            )
+        })
+        .collect();
+    let string_seeds: HashMap<String, f64> = seeds
+        .iter()
+        .map(|(node, mass)| (node.to_string(), *mass))
+        .collect();
+
+    rustyred_core::personalized_pagerank(
+        &string_adjacency,
+        &string_seeds,
+        alpha,
+        epsilon,
+        max_pushes,
+    )
+    .into_iter()
+    .filter_map(|(node, score)| node.parse::<NodeId>().ok().map(|id| (id, score)))
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_matches_package_version() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn push_ppr_matches_core_for_integer_ids() {
+        let adjacency = HashMap::from([
+            (0, vec![(1, 1.0)]),
+            (1, vec![(2, 1.0)]),
+            (2, vec![(0, 1.0)]),
+        ]);
+        let seeds = HashMap::from([(0, 1.0)]);
+
+        let int_scores = push_ppr(&adjacency, &seeds, 0.15, 1e-4, 20_000);
+
+        let core_adjacency = HashMap::from([
+            ("0".to_string(), vec![("1".to_string(), 1.0)]),
+            ("1".to_string(), vec![("2".to_string(), 1.0)]),
+            ("2".to_string(), vec![("0".to_string(), 1.0)]),
+        ]);
+        let core_seeds = HashMap::from([("0".to_string(), 1.0)]);
+        let core_scores =
+            rustyred_core::personalized_pagerank(&core_adjacency, &core_seeds, 0.15, 1e-4, 20_000);
+
+        assert_eq!(int_scores.len(), core_scores.len());
+        for (node, score) in int_scores {
+            let core_score = core_scores
+                .get(&node.to_string())
+                .expect("core score for integer node");
+            assert!((score - core_score).abs() < 1e-12);
+        }
+    }
 }

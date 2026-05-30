@@ -1,6 +1,6 @@
 [package]
 name = "rustyred-core"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Rusty Red core command executor and graph state machine."
 license = "MIT"

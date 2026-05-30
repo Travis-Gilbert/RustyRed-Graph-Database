@@ -31,7 +31,7 @@ Origin: `/orchestrate mode=plan` 2026-05-22
 - **Data/model changes:** None. No schema changes, no AOF/snapshot format changes.
 - **Operational impact:** New operator-facing artifacts (`.env.example`, `docs/railway-template.md`, ADR). README restructured. Build context now includes `vendor/proto/`. CI gains a vendored-proto-up-to-date check.
 - **What must not regress:**
-  - Local dev workflow (`maturin develop --release`, `cargo check --workspace`, `cargo run -p rustyred-server`) still works for a developer who has run `git submodule update --init`.
+  - Local dev workflow (`cargo check --workspace`, `cargo run -p rustyred-server`) still works for a developer who has run `git submodule update --init`.
   - The downstream sync workflow continues to pick up the upstream tree correctly.
   - SECURITY.md remains authoritative for the auth model; README's auth summary links to it, doesn't reimplement it.
   - The voice in `README.md:1-9`, the "What you can't do yet" section, the benchmark numbers, and the algorithm citation survive verbatim.
@@ -106,7 +106,7 @@ New section order: (1) Hero + voice, (2) Deploy & operate, (3) Develop & extend,
 | RT-205 | New section: **Persistence and the volume**. One paragraph: AOF + snapshot, the volume requirement, why `REQUIRE_VOLUME=true` fails the start when missing, what happens on Railway redeploy (volume persists), how to back up (snapshot file copy). | `crates/rustyred-server/src/config.rs:108-130,265-275`, `Dockerfile:24-36` | Claude | ≤12 lines. Calls out the loud-fail behavior as a feature, not a bug. | Diff review. | low | planned |
 | RT-206 | New section: **Observability**. One paragraph each on `/metrics` (17 Prometheus counters), the slow-query ring buffer, the diagnostics endpoints. State what an operator should alarm on (auth-rejection spikes, unexpected write-rate growth). | `README.md:28`, `SECURITY.md:168-170` | Claude | ≤20 lines. Specific. No "consider observability" filler. | Diff review. | low | planned |
 | RT-207 | New section: **Upgrade and version pinning**. One paragraph: track tagged releases, the `rustyred-upgrade-format` migration path (existing on-disk-format-stable claim from current README line 18), don't pin to `main` in production. | `README.md:18`, `SECURITY.md:152-167` | Claude | ≤10 lines. Echoes SECURITY.md operator responsibility #5 without duplicating it. | Diff review. | low | planned |
-| RT-208 | Restructure existing technical content (Build, Product server, Routes, MCP tools, Compatibility command server, Python bindings, Benchmarks, Algorithm reference, License) into a **Develop & extend** section that comes *after* the operator content. Preserve voice. Keep "What you can't do yet" early in this section as a roadmap signal. | `README.md:15-306` | Claude | All current technical content present, no duplication, ordering flows: roadmap → architecture → build → product server → routes → MCP → compat-server → Python → benchmarks → algorithm → license. | Diff review: byte-count of preserved sections matches; benchmark table unchanged. | medium — large reflow, easy to drop a sentence | planned |
+| RT-208 | Restructure existing technical content (Build, Product server, Routes, MCP tools, Compatibility command server, Rust-native helper crate, Algorithm reference, License) into a **Develop & extend** section that comes *after* the operator content. Preserve voice. Keep "What you can't do yet" early in this section as a roadmap signal. | `README.md:15-306` | Claude | All current technical content present, no duplication, ordering flows: roadmap → architecture → build → product server → routes → MCP → compat-server → Rust helper crate → algorithm → license. | Diff review: byte-count of preserved sections matches. | medium — large reflow, easy to drop a sentence | planned |
 | RT-209 | Remove the placeholder note at `README.md:13`. | `README.md:13` | Claude | String "Note put template ID here before making public" no longer exists in README. | `grep -n "put template ID here" README.md` returns empty. | low | planned |
 
 ### W3 — Operator surface (`.env.example` + `docs/railway-template.md`)
@@ -170,12 +170,12 @@ The `${{secret(64, "abcdef0123456789")}}` function yields a 64-character hex str
 ## Test Strategy
 
 - **Preflight checks:** `cargo check --workspace`, `cargo build -p rustyred-server`, `cargo test -p rustyred-server` — all must pass after RT-102.
-- **Focused tests:** Run any existing tests in `tests/` that exercise the server. No new tests required by this plan; the build itself is the test for hermeticity.
+- **Focused tests:** Run any existing Rust tests that exercise the server. No new tests required by this plan; the build itself is the test for hermeticity.
 - **Integration tests:** Local Docker build twice — once with submodule populated, once with `proto/` deleted. Both must succeed. (RT-106 acceptance.)
 - **Regression tests:** Local dev workflow probe — `git submodule update --init && cargo run -p rustyred-server` must still boot.
 - **Type/lint/static checks:** `cargo clippy --workspace -- -D warnings` if currently green; do not introduce new warnings.
 - **Manual smoke checks:** RT-506 — five-point check on the smoke deploy.
-- **Performance/security checks:** None new; existing benchmarks in `tests/test_benchmarks.py` are unaffected.
+- **Performance/security checks:** None new; use Rust benchmark or smoke harnesses when this plan is refreshed.
 
 ## Production Gates
 
