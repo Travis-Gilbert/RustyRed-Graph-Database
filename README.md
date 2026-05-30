@@ -279,6 +279,10 @@ GET  /v1/tenants/{tenant_id}/graph/verify
 POST /v1/tenants/{tenant_id}/graph/rebuild-indexes
 POST /v1/tenants/{tenant_id}/graph/version/compile
 POST /v1/tenants/{tenant_id}/graph/version/diff
+POST /v1/tenants/{tenant_id}/graph/version/ref
+POST /v1/tenants/{tenant_id}/graph/version/log
+POST /v1/tenants/{tenant_id}/graph/version/checkout
+POST /v1/tenants/{tenant_id}/graph/version/merge
 POST /v1/tenants/{tenant_id}/graph/vector/search
 POST /v1/tenants/{tenant_id}/graph/vector/hybrid
 POST /v1/tenants/{tenant_id}/graph/vector/designate
@@ -313,7 +317,7 @@ The public query surface splits cleanly:
 - `/v1/cypher` and `/v1/cypher/explain` are the bounded OpenCypher-compatible surface for read queries plus transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE` writes.
 - `/v1/tenants/{tenant_id}/graph/query` remains the older debug bridge and should not be treated as the product route.
 
-The version routes are the public Git/provenance substrate. `/graph/version/compile` reads the current tenant graph and returns a `rustyred-versioned-graph-v1` pack: content hashes, a Prolly-style tree root, Git-like commit metadata, and declarative compiler capabilities such as a tree-root validator. `/graph/version/diff` compares a supplied base snapshot against the current graph, or against an explicit target snapshot. Full corpus-to-skill encoding, domain pack lowering, LoRA adapters, and Skill Encoder promotion policies belong downstream in Theseus/Theorem, not in this open release.
+The version routes are the public Git/provenance substrate. `/graph/version/compile` reads the current tenant graph and returns a `rustyred-versioned-graph-v1` pack: content hashes, a Prolly-style tree root, Git-like commit metadata, and declarative compiler capabilities such as a tree-root validator. `/graph/version/diff` compares a supplied base snapshot against the current graph, or against an explicit target snapshot. `/graph/version/ref`, `/log`, and `/checkout` operate on caller-supplied graph repositories so downstream products can choose their own persistence layer; checkout returns a snapshot and does not mutate the tenant graph. `/graph/version/merge` performs a read-only three-way merge with content-hash conflict detection and confidence-weighted edge conflict resolution. Full corpus-to-skill encoding, domain pack lowering, LoRA adapters, and Skill Encoder promotion policies belong downstream in Theseus/Theorem, not in this open release.
 
 ### MCP tools
 
@@ -323,7 +327,7 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 |------|-------------|
 | `rustyred.graph.query` / `rustyred.graph.explain` / `rustyred.graph.neighbors` | Bounded native graph reads and plan inspection |
 | `rustyred.graph.schema` / `rustyred.graph.index_status` | Graph schema and index-health reads |
-| `rustyred.graph.version.compile` (`rustyred.git.compile`) / `rustyred.graph.version.diff` (`rustyred.git.diff`) | Public content-addressed graph pack compiler and snapshot diff tools |
+| `rustyred.graph.version.compile` (`rustyred.git.compile`) / `rustyred.graph.version.diff` (`rustyred.git.diff`) / `rustyred.graph.version.ref` (`rustyred.git.ref`) / `rustyred.graph.version.log` (`rustyred.git.log`) / `rustyred.graph.version.checkout` (`rustyred.git.checkout`) / `rustyred.graph.version.merge` (`rustyred.git.merge`) | Public content-addressed graph pack, refs/log/checkout, and three-way merge tools |
 | `rustyred.algorithm.ppr` (alias: `rustyred.algo.ppr`) / `rustyred.algorithm.components` (`rustyred.algo.components`) / `rustyred.algorithm.pagerank` (`rustyred.algo.pagerank`) / `rustyred.algorithm.communities` (`rustyred.algo.communities`) | Graph algorithms: PPR, connected components, PageRank, label-propagation communities |
 | `harness_kg_status` / `harness_kg_ppr` / `harness_kg_impact` / `harness_kg_related_objects` / `harness_kg_search` / `harness_kg_explain_edge` | Harness Instant KG tools over a RedCore tenant base graph plus an optional session delta. Legacy `RUSTY_RED_MODE=redis` returns a diagnostic because Instant KG is a native RustyRed capability. |
 | `rustyred.fulltext.search` (alias: `rustyred.graph.fulltext.search`) / `rustyred.spatial.radius` (`rustyred.graph.spatial.radius`) / `rustyred.spatial.bbox` (`rustyred.graph.spatial.bbox`) | Full-text and spatial read surfaces |

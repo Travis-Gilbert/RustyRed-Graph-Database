@@ -977,6 +977,121 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/tenants/{tenant_id}/graph/version/ref": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Update a graph version branch ref",
+                    "description": "Compiles the current tenant graph and updates a branch ref in a caller-supplied graph version repository value. The repository is returned for caller-side persistence.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionRefRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Updated graph version repository and ref.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionRefResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/version/log": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Read graph version commit log",
+                    "description": "Walks commit history from a branch name or commit hash in a caller-supplied graph version repository value.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionLogRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph version log.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionLogResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/version/checkout": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Checkout a graph version snapshot",
+                    "description": "Reconstructs a graph snapshot from a branch name or commit hash in a caller-supplied graph version repository value. This route is read-only and does not mutate the tenant graph.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionCheckoutRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Checked-out graph snapshot.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionCheckoutResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/version/merge": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Three-way merge graph snapshots",
+                    "description": "Merges base/ours/theirs graph snapshots by content hash. Non-overlapping changes resolve automatically; edge conflicts can resolve by confidence; unresolved conflicts are returned explicitly without mutating the tenant graph.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionMergeRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph version merge result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionMergeResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/graph/vector/designate": {
                 "post": {
                     "tags": ["graph"],
@@ -2143,6 +2258,129 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     },
                     "additionalProperties": false
                 },
+                "GraphVersionRepository": {
+                    "type": "object",
+                    "properties": {
+                        "protocol_version": { "type": "string" },
+                        "refs": { "type": "array", "items": { "type": "object" } },
+                        "packs": { "type": "array", "items": { "type": "object" } }
+                    },
+                    "additionalProperties": true
+                },
+                "GraphVersionRefRequest": {
+                    "type": "object",
+                    "properties": {
+                        "repository": { "$ref": "#/components/schemas/GraphVersionRepository" },
+                        "name": { "type": "string" },
+                        "branch": { "type": "string", "default": "main" },
+                        "parent_commits": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "author": { "type": "string" },
+                        "message": { "type": "string" },
+                        "timestamp_unix_ms": { "type": "integer" },
+                        "updated_at_unix_ms": { "type": "integer" },
+                        "include_payloads": { "type": "boolean", "default": true }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionRefResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "ref_update"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "ref_update": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionLogRequest": {
+                    "type": "object",
+                    "required": ["repository"],
+                    "properties": {
+                        "repository": { "$ref": "#/components/schemas/GraphVersionRepository" },
+                        "target": { "type": "string", "default": "main" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionLogResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "log"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "log": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionCheckoutRequest": {
+                    "type": "object",
+                    "required": ["repository", "target"],
+                    "properties": {
+                        "repository": { "$ref": "#/components/schemas/GraphVersionRepository" },
+                        "target": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionCheckoutResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "checkout"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "checkout": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionMergeRequest": {
+                    "type": "object",
+                    "required": ["base", "theirs"],
+                    "properties": {
+                        "base": { "$ref": "#/components/schemas/GraphSnapshot" },
+                        "ours": { "$ref": "#/components/schemas/GraphSnapshot" },
+                        "theirs": { "$ref": "#/components/schemas/GraphSnapshot" },
+                        "name": { "type": "string" },
+                        "branch": { "type": "string", "default": "main" },
+                        "parent_commits": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "author": { "type": "string" },
+                        "message": { "type": "string" },
+                        "timestamp_unix_ms": { "type": "integer" },
+                        "include_payloads": { "type": "boolean", "default": true },
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["auto_confidence", "prefer_ours", "prefer_theirs", "manual"],
+                            "default": "auto_confidence"
+                        },
+                        "min_confidence_delta": { "type": "number", "default": 0.0 }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionMergeResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "merge"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "merge": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
                 "GraphWriteResult": {
                     "type": "object",
                     "required": ["id", "version", "checksum"],
@@ -3047,6 +3285,10 @@ mod tests {
             ("/v1/tenants/{tenant_id}/graph/rebuild-indexes", "post"),
             ("/v1/tenants/{tenant_id}/graph/version/compile", "post"),
             ("/v1/tenants/{tenant_id}/graph/version/diff", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/ref", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/log", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/checkout", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/merge", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/designate", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/search", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/hybrid", "post"),

@@ -13,9 +13,11 @@ use rustyred_core::commands::{RustyredCommand, RustyredRequest, RustyredResponse
 use rustyred_core::errors::RustyredError;
 use rustyred_core::executor::{RustyredExecutor, StoreBackedRustyredExecutor};
 use rustyred_core::{
-    compile_graph_pack, diff_graph_snapshots, stable_hash, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
-    HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
+    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
+    merge_graph_snapshots, stable_hash, update_graph_ref, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats,
+    GraphStoreError, GraphVersionRepository, HarnessInstantKg, NeighborQuery, NodeQuery,
+    NodeRecord, SessionDelta,
 };
 use rustyred_mcp::{
     agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
@@ -193,6 +195,39 @@ pub struct GraphVersionDiffBody {
     pub target: Option<GraphSnapshot>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionRefBody {
+    #[serde(default)]
+    pub repository: Option<GraphVersionRepository>,
+    #[serde(default)]
+    pub updated_at_unix_ms: Option<u128>,
+    #[serde(flatten)]
+    pub options: GraphCompileOptions,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionLogBody {
+    pub repository: GraphVersionRepository,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionCheckoutBody {
+    pub repository: GraphVersionRepository,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionMergeBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub ours: Option<GraphSnapshot>,
+    pub theirs: GraphSnapshot,
+    #[serde(flatten)]
+    pub options: GraphMergeOptions,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -274,6 +309,22 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/version/diff",
             post(graph_version_diff),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/ref",
+            post(graph_version_ref),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/log",
+            post(graph_version_log_route),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/checkout",
+            post(graph_version_checkout),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/merge",
+            post(graph_version_merge),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .route(
@@ -1494,6 +1545,137 @@ async fn graph_version_diff(
         "ok": true,
         "tenant": tenant_id,
         "diff": diff
+    }))
+    .into_response()
+}
+
+async fn graph_version_ref(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionRefBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let branch = body.options.branch.clone();
+            let pack = compile_graph_pack(&snapshot, body.options);
+            let ref_update = update_graph_ref(
+                body.repository.unwrap_or_default(),
+                pack,
+                branch,
+                body.updated_at_unix_ms,
+            );
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "ref_update": ref_update
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_log_route(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionLogBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "log": graph_version_log(&body.repository, body.target.as_deref())
+    }))
+    .into_response()
+}
+
+async fn graph_version_checkout(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    match checkout_graph_version(&body.repository, &body.target) {
+        Some(checkout) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "checkout": checkout
+        }))
+        .into_response(),
+        None => graph_store_error_response(GraphStoreError::new(
+            "version_target_not_found",
+            format!(
+                "version target not found or has no payloads: {}",
+                body.target
+            ),
+        )),
+    }
+}
+
+async fn graph_version_merge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionMergeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let ours = match body.ours {
+        Some(ours) => ours,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "merge": merge_graph_snapshots(&body.base, &ours, &body.theirs, body.options)
     }))
     .into_response()
 }
@@ -3553,11 +3735,13 @@ mod tests {
         execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
         graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
         graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
-        graph_vector_hybrid, graph_vector_search, graph_version_compile, graph_version_diff,
+        graph_vector_hybrid, graph_vector_search, graph_version_checkout, graph_version_compile,
+        graph_version_diff, graph_version_log_route, graph_version_merge, graph_version_ref,
         instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
         instant_kg_status, is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
         required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
-        BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody, GraphVersionDiffBody,
+        BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody, GraphVersionCheckoutBody,
+        GraphVersionDiffBody, GraphVersionLogBody, GraphVersionMergeBody, GraphVersionRefBody,
         HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
         InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody, PublicCypherBody,
         TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
@@ -3966,7 +4150,10 @@ mod tests {
             axum::extract::State(state.clone()),
             axum::extract::Path("tenant-version".to_string()),
             HeaderMap::new(),
-            Json(GraphVersionDiffBody { base, target: None }),
+            Json(GraphVersionDiffBody {
+                base: base.clone(),
+                target: None,
+            }),
         )
         .await
         .into_response();
@@ -3977,6 +4164,90 @@ mod tests {
             1
         );
         assert_eq!(diff_payload["diff"]["unchanged"], 2);
+
+        let ref_response = graph_version_ref(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(GraphVersionRefBody {
+                repository: None,
+                updated_at_unix_ms: Some(2),
+                options: rustyred_core::GraphCompileOptions {
+                    branch: Some("main".to_string()),
+                    timestamp_unix_ms: Some(1),
+                    ..rustyred_core::GraphCompileOptions::default()
+                },
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ref_response.status(), StatusCode::OK);
+        let ref_payload = response_payload_json(ref_response).await;
+        assert_eq!(ref_payload["ref_update"]["reference"]["name"], "main");
+        let repository: rustyred_core::GraphVersionRepository =
+            serde_json::from_value(ref_payload["ref_update"]["repository"].clone()).unwrap();
+
+        let log_response = graph_version_log_route(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(GraphVersionLogBody {
+                repository: repository.clone(),
+                target: Some("main".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(log_response.status(), StatusCode::OK);
+        let log_payload = response_payload_json(log_response).await;
+        assert_eq!(log_payload["log"]["commits"].as_array().unwrap().len(), 1);
+
+        let checkout_response = graph_version_checkout(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(GraphVersionCheckoutBody {
+                repository,
+                target: "main".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(checkout_response.status(), StatusCode::OK);
+        let checkout_payload = response_payload_json(checkout_response).await;
+        assert_eq!(
+            checkout_payload["checkout"]["snapshot"]["nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut theirs = base.clone();
+        theirs.nodes.push(rustyred_core::NodeRecord::new(
+            "node:theirs",
+            ["Person"],
+            json!({ "name": "Theirs" }),
+        ));
+        let merge_response = graph_version_merge(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(GraphVersionMergeBody {
+                base,
+                ours: None,
+                theirs,
+                options: rustyred_core::GraphMergeOptions {
+                    timestamp_unix_ms: Some(3),
+                    ..rustyred_core::GraphMergeOptions::default()
+                },
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(merge_response.status(), StatusCode::OK);
+        let merge_payload = response_payload_json(merge_response).await;
+        assert_eq!(merge_payload["merge"]["status"], "clean");
     }
 
     #[tokio::test]
