@@ -919,6 +919,64 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/tenants/{tenant_id}/graph/version/compile": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Compile a versioned graph pack",
+                    "description": "Builds a public RustyRed content-addressed graph pack from the current tenant graph. The pack contains Git-like commit metadata, a Prolly-style tree, declarative compiler capabilities, and optionally the graph record payloads.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionCompileRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Compiled graph pack.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionCompileResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/version/diff": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Diff graph snapshots by content hash",
+                    "description": "Compares a base graph snapshot with the current tenant graph, or with an explicit target snapshot, using RustyRed content hashes and Prolly tree roots.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/GraphVersionDiffRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Graph version diff.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/GraphVersionDiffResponse" }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/graph/vector/designate": {
                 "post": {
                     "tags": ["graph"],
@@ -1973,7 +2031,12 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                             "additionalProperties": true
                         },
                         "version": { "type": "integer", "minimum": 0 },
-                        "tombstone": { "type": "boolean" }
+                        "tombstone": { "type": "boolean" },
+                        "content_hash": { "type": "string" },
+                        "parent_hashes": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
                     },
                     "additionalProperties": false
                 },
@@ -1998,7 +2061,85 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                             "additionalProperties": true
                         },
                         "version": { "type": "integer", "minimum": 0 },
-                        "tombstone": { "type": "boolean" }
+                        "tombstone": { "type": "boolean" },
+                        "confidence": { "type": "number" },
+                        "epistemic_type": { "type": "string" },
+                        "provenance": {
+                            "type": "object",
+                            "additionalProperties": true
+                        },
+                        "content_hash": { "type": "string" },
+                        "parent_hashes": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphSnapshot": {
+                    "type": "object",
+                    "required": ["version", "nodes", "edges"],
+                    "properties": {
+                        "version": { "type": "integer", "minimum": 0 },
+                        "nodes": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/NodeRecord" }
+                        },
+                        "edges": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/EdgeRecord" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionCompileRequest": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "branch": { "type": "string", "default": "main" },
+                        "parent_commits": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "author": { "type": "string" },
+                        "message": { "type": "string" },
+                        "timestamp_unix_ms": { "type": "integer" },
+                        "include_payloads": { "type": "boolean", "default": true }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionCompileResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "pack"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "pack": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionDiffRequest": {
+                    "type": "object",
+                    "required": ["base"],
+                    "properties": {
+                        "base": { "$ref": "#/components/schemas/GraphSnapshot" },
+                        "target": { "$ref": "#/components/schemas/GraphSnapshot" }
+                    },
+                    "additionalProperties": false
+                },
+                "GraphVersionDiffResponse": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "diff"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "diff": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
                     },
                     "additionalProperties": false
                 },
@@ -2904,6 +3045,8 @@ mod tests {
             ("/v1/cache/check", "post"),
             ("/v1/cache/put", "post"),
             ("/v1/tenants/{tenant_id}/graph/rebuild-indexes", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/compile", "post"),
+            ("/v1/tenants/{tenant_id}/graph/version/diff", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/designate", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/search", "post"),
             ("/v1/tenants/{tenant_id}/graph/vector/hybrid", "post"),
@@ -2973,6 +3116,12 @@ mod tests {
             document.pointer("/components/schemas/GraphCacheLookupResponse/properties/cache/$ref"),
             Some(&serde_json::Value::String(
                 "#/components/schemas/GraphCacheLookupResult".to_string()
+            ))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/GraphVersionDiffRequest/properties/base/$ref"),
+            Some(&serde_json::Value::String(
+                "#/components/schemas/GraphSnapshot".to_string()
             ))
         );
 

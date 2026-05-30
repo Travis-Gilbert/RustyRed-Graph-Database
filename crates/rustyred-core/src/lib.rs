@@ -17,6 +17,7 @@ pub mod spatial;
 pub mod spatial_s2;
 pub mod state;
 pub mod store;
+pub mod versioned_graph;
 
 pub use commands::{RustyredCommand, RustyredRequest, RustyredResponse};
 pub use errors::{RustyredError, RustyredResult};
@@ -53,3 +54,10 @@ pub use spatial::{
     SpatialError, SpatialIndex, RUSTY_RED_SPATIAL_BACKEND_ENV,
 };
 pub use state::{stable_hash, RustyredEdge, RustyredNode, RustyredState};
+pub use versioned_graph::{
+    build_prolly_tree, compile_graph_pack, diff_graph_snapshots, snapshot_content_objects,
+    CompiledGraphPack, GraphCommit, GraphCompileOptions, GraphCompilerCapability,
+    GraphContentObject, GraphDiffEntry, GraphObjectKind, GraphPackManifest, GraphProllyTree,
+    GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, DEFAULT_GRAPH_BRANCH,
+    GRAPH_PACK_COMPILER_VERSION, VERSIONED_GRAPH_PROTOCOL_VERSION,
+};

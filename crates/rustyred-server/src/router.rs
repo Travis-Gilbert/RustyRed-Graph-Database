@@ -13,7 +13,8 @@ use rustyred_core::commands::{RustyredCommand, RustyredRequest, RustyredResponse
 use rustyred_core::errors::RustyredError;
 use rustyred_core::executor::{RustyredExecutor, StoreBackedRustyredExecutor};
 use rustyred_core::{
-    stable_hash, CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError,
+    compile_graph_pack, diff_graph_snapshots, stable_hash, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
     HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
 };
 use rustyred_mcp::{
@@ -185,6 +186,13 @@ pub struct TransactionMutationBody {
     pub tenant_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionDiffBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub target: Option<GraphSnapshot>,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -258,6 +266,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/rebuild-indexes",
             post(graph_rebuild_indexes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/compile",
+            post(graph_version_compile),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/diff",
+            post(graph_version_diff),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .route(
@@ -1410,6 +1426,76 @@ async fn graph_rebuild_indexes(
         .into_response(),
         Err(error) => graph_store_error_response(error),
     }
+}
+
+async fn graph_version_compile(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(options): Json<GraphCompileOptions>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let pack = compile_graph_pack(&snapshot, options);
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "pack": pack
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_diff(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionDiffBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let target = match body.target {
+        Some(target) => target,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    let diff = diff_graph_snapshots(&body.base, &target);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "diff": diff
+    }))
+    .into_response()
 }
 
 fn execute_tenant_command(
@@ -3467,13 +3553,14 @@ mod tests {
         execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
         graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
         graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
-        graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge, instant_kg_impact,
-        instant_kg_ppr, instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
-        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
-        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
-        FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
-        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        graph_vector_hybrid, graph_vector_search, graph_version_compile, graph_version_diff,
+        instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
+        instant_kg_status, is_cache_command, is_graph_command, mcp_origin_allowed, public_cypher,
+        required_scope_for_command, transaction_begin, transaction_commit, transaction_rollback,
+        BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody, GraphVersionDiffBody,
+        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
+        InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody, PublicCypherBody,
+        TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
@@ -3811,6 +3898,85 @@ mod tests {
         );
         assert_eq!(payload["scoring"]["edge_type_weights"]["CONTRADICTS"], -2.0);
         assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn graph_version_compile_and_diff_routes_return_public_pack() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-version").unwrap();
+        store
+            .upsert_node(rustyred_core::NodeRecord::new(
+                "node:ada",
+                ["Person"],
+                json!({ "name": "Ada" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(rustyred_core::NodeRecord::new(
+                "node:bob",
+                ["Person"],
+                json!({ "name": "Bob" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(rustyred_core::EdgeRecord::new(
+                "edge:knows",
+                "node:ada",
+                "KNOWS",
+                "node:bob",
+                json!({}),
+            ))
+            .unwrap();
+        let base = store.graph_snapshot().unwrap();
+        store
+            .upsert_node(rustyred_core::NodeRecord::new(
+                "node:ada",
+                ["Person"],
+                json!({ "name": "Ada Lovelace" }),
+            ))
+            .unwrap();
+        drop(store);
+
+        let compile_response = graph_version_compile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(rustyred_core::GraphCompileOptions {
+                name: Some("public-redcore".to_string()),
+                timestamp_unix_ms: Some(1),
+                ..rustyred_core::GraphCompileOptions::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(compile_response.status(), StatusCode::OK);
+        let compile_payload = response_payload_json(compile_response).await;
+        assert_eq!(compile_payload["ok"], true);
+        assert_eq!(
+            compile_payload["pack"]["protocol_version"],
+            rustyred_core::VERSIONED_GRAPH_PROTOCOL_VERSION
+        );
+        assert_eq!(compile_payload["pack"]["manifest"]["objects_total"], 3);
+        assert_eq!(
+            compile_payload["pack"]["capabilities"][0]["kind"],
+            "graph_manifest"
+        );
+
+        let diff_response = graph_version_diff(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-version".to_string()),
+            HeaderMap::new(),
+            Json(GraphVersionDiffBody { base, target: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(diff_response.status(), StatusCode::OK);
+        let diff_payload = response_payload_json(diff_response).await;
+        assert_eq!(
+            diff_payload["diff"]["modified"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(diff_payload["diff"]["unchanged"], 2);
     }
 
     #[tokio::test]

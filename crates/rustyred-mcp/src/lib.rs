@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use rustyred_core::{
-    CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphSnapshot, GraphStats,
-    GraphStoreError, GraphStoreResult, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta,
-    VectorDesignation, VerifyReport,
+    compile_graph_pack, diff_graph_snapshots, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
+    GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
+    HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -514,6 +514,35 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred.graph.index_status" => index_status_payload(&tenant, &backend)?,
         "rustyred.graph.explain" => explain_payload(&tenant, &arguments),
         "rustyred.graph.query" => query_payload(&tenant, &backend, &arguments)?,
+        "rustyred.graph.version.compile" | "rustyred.git.compile" => {
+            let snapshot = backend.graph_snapshot()?;
+            let options = serde_json::from_value::<GraphCompileOptions>(arguments.clone())
+                .map_err(|error| {
+                    McpError::invalid_params(format!("invalid graph compile options: {error}"))
+                })?;
+            json!({
+                "tenant": tenant,
+                "pack": compile_graph_pack(&snapshot, options)
+            })
+        }
+        "rustyred.graph.version.diff" | "rustyred.git.diff" => {
+            let base = arguments.get("base").cloned().ok_or_else(|| {
+                McpError::invalid_params("rustyred.graph.version.diff requires base snapshot")
+            })?;
+            let base = serde_json::from_value::<GraphSnapshot>(base).map_err(|error| {
+                McpError::invalid_params(format!("base must be a graph snapshot: {error}"))
+            })?;
+            let target = match arguments.get("target").cloned() {
+                Some(value) => serde_json::from_value::<GraphSnapshot>(value).map_err(|error| {
+                    McpError::invalid_params(format!("target must be a graph snapshot: {error}"))
+                })?,
+                None => backend.graph_snapshot()?,
+            };
+            json!({
+                "tenant": tenant,
+                "diff": diff_graph_snapshots(&base, &target)
+            })
+        }
         // §P6-B pb6.1: SPEC names `rustyred.algo.*` are aliases for the existing
         // `rustyred.algorithm.*` arms below. Either name reaches the same payload.
         "rustyred.algorithm.ppr" | "rustyred.algo.ppr" => {
@@ -1771,6 +1800,36 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "rustyred.graph.version.compile",
+            "Compile the tenant graph into a public content-addressed Prolly-tree pack with a Git-like commit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "name": { "type": "string" },
+                    "branch": { "type": "string", "default": "main" },
+                    "parent_commits": { "type": "array", "items": { "type": "string" } },
+                    "author": { "type": "string" },
+                    "message": { "type": "string" },
+                    "timestamp_unix_ms": { "type": "integer" },
+                    "include_payloads": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        tool(
+            "rustyred.graph.version.diff",
+            "Diff a base graph snapshot against the current tenant graph or a provided target snapshot using content hashes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "base": { "type": "object" },
+                    "target": { "type": "object" }
+                },
+                "required": ["base"]
+            }),
+        ),
+        tool(
             "rustyred.algorithm.ppr",
             "Run Personalized PageRank over the tenant graph.",
             json!({
@@ -2683,6 +2742,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.spatial.radius"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.graph.version.compile"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.graph.version.diff"));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.admin.verify"));
@@ -2784,6 +2849,68 @@ mod tests {
         assert_eq!(
             response["result"]["structuredContent"]["explain"]["plan"][1]["op"],
             "node_index_seek"
+        );
+    }
+
+    #[test]
+    fn version_tools_compile_and_diff_graph_snapshots() {
+        let (provider, config) = fixture();
+        let base = provider.0.snapshot();
+        let compile = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "compile",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred.graph.version.compile",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "name": "public-redcore",
+                        "timestamp_unix_ms": 1
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            compile["result"]["structuredContent"]["pack"]["protocol_version"],
+            rustyred_core::VERSIONED_GRAPH_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            compile["result"]["structuredContent"]["pack"]["manifest"]["objects_total"],
+            5
+        );
+
+        let mut changed = base.clone();
+        changed.nodes.push(NodeRecord::new(
+            "node:new",
+            ["Person"],
+            json!({"name": "Dorothy"}),
+        ));
+        let diff = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "diff",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred.graph.version.diff",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "base": base,
+                        "target": changed
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            diff["result"]["structuredContent"]["diff"]["added"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
