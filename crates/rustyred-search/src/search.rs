@@ -31,7 +31,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rustyred_core::graph_store::{GraphStore, NeighborQuery, NodeQuery, NodeRecord};
 use rustyred_core::personalized_pagerank;
 use serde::{Deserialize, Serialize};
-use turbovec::IdMapIndex;
 use url::Url;
 
 use crate::{EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, LABEL_PAGE};
@@ -48,14 +47,12 @@ const DEFAULT_PPR_ALPHA: f64 = 0.15;
 const DEFAULT_PPR_EPSILON: f64 = 1e-5;
 /// Hard cap for local-push work. Browser substrates should stay well below this.
 const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
-/// Dense candidates to retrieve from the local TurboVec index before graph fusion.
+/// Dense candidates to retrieve from the local hash-vector scorer before graph fusion.
 const DEFAULT_DENSE_LIMIT: usize = 64;
 /// Reciprocal rank fusion constant; 60 is the common IR default.
 const DEFAULT_RRF_K: usize = 60;
 /// Hash embedding dimensionality for the standalone dense layer.
 const DENSE_DIM: usize = 128;
-/// TurboVec quantization bit width for ephemeral local search indexes.
-const DENSE_BIT_WIDTH: usize = 4;
 /// Avoid arbitrary dense-only matches when the hash vector has no meaningful overlap.
 const MIN_DENSE_SCORE: f32 = 0.08;
 
@@ -307,18 +304,6 @@ fn compare_ranked_hits(a: &(String, usize, f64), b: &(String, usize, f64)) -> Or
         .then_with(|| a.0.cmp(&b.0))
 }
 
-fn stable_dense_id(page_id: &str, used: &mut BTreeSet<u64>) -> u64 {
-    let digest = blake3::hash(page_id.as_bytes());
-    let bytes = digest.as_bytes();
-    let mut id = u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]);
-    while !used.insert(id) {
-        id = id.wrapping_add(1);
-    }
-    id
-}
-
 fn normalized_features(text: &str) -> Vec<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -357,6 +342,10 @@ fn hash_embed_text(text: &str) -> Vec<f32> {
     vector
 }
 
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
+}
+
 fn dense_candidate_scores(
     pages: &[NodeRecord],
     meta: &BTreeMap<String, (String, String, String)>,
@@ -371,10 +360,7 @@ fn dense_candidate_scores(
         return BTreeMap::new();
     }
 
-    let mut vectors = Vec::with_capacity(pages.len() * DENSE_DIM);
-    let mut ids = Vec::with_capacity(pages.len());
-    let mut id_to_page: HashMap<u64, String> = HashMap::with_capacity(pages.len());
-    let mut used_ids = BTreeSet::new();
+    let mut ranked: Vec<(String, f32)> = Vec::with_capacity(pages.len());
     for page in pages {
         let Some((url, title, text)) = meta.get(&page.id) else {
             continue;
@@ -384,34 +370,25 @@ fn dense_candidate_scores(
         if vector.iter().all(|value| value.abs() < 1e-6) {
             continue;
         }
-        let dense_id = stable_dense_id(&page.id, &mut used_ids);
-        id_to_page.insert(dense_id, page.id.clone());
-        ids.push(dense_id);
-        vectors.extend(vector);
+        let score = dot_product(&query_vector, &vector);
+        if score >= MIN_DENSE_SCORE {
+            ranked.push((page.id.clone(), score));
+        }
     }
-    if ids.is_empty() {
+
+    if ranked.is_empty() {
         return BTreeMap::new();
     }
 
-    let mut index = match IdMapIndex::new(DENSE_DIM, DENSE_BIT_WIDTH) {
-        Ok(index) => index,
-        Err(_) => return BTreeMap::new(),
-    };
-    if index.add_with_ids(&vectors, &ids).is_err() {
-        return BTreeMap::new();
-    }
-    let (scores, result_ids) = index.search(&query_vector, k.min(ids.len()));
-    scores
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(k.min(ranked.len()));
+    ranked
         .into_iter()
-        .zip(result_ids)
-        .filter_map(|(score, dense_id)| {
-            if score < MIN_DENSE_SCORE {
-                return None;
-            }
-            id_to_page
-                .get(&dense_id)
-                .map(|page_id| (page_id.clone(), score as f64))
-        })
+        .map(|(page_id, score)| (page_id, score as f64))
         .collect()
 }
 
