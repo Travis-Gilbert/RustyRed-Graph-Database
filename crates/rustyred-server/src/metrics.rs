@@ -135,6 +135,15 @@ pub async fn diagnostics_config(
         "slow_query_threshold_nanos": state.config.slow_query_threshold_nanos,
         "slow_query_capacity": state.config.slow_query_capacity,
         "slow_query_log_enabled": state.config.slow_query_log.is_some(),
+        "federation": {
+            "enabled": state.config.federate,
+            "hub_configured": state.config.federate_hub_url.is_some(),
+            "token_configured": state.config.federate_token.is_some(),
+            "peer_id_configured": state.config.federate_peer_id.is_some(),
+            "private_key_configured": state.config.federate_private_key.is_some(),
+            "provenance_enabled": state.config.federate_provenance,
+            "snapshot_text_bytes": state.config.federate_snapshot_text_bytes,
+        },
         "hybrid_scoring": {
             "alpha": state.config.hybrid_scoring.alpha,
             "confidence_weighted_graph_distance": state.config.hybrid_scoring.confidence_weighted_graph_distance,

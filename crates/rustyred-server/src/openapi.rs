@@ -47,12 +47,142 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             { "name": "mcp", "description": "Streamable HTTP MCP agent port over Rusty Red graph APIs." },
             { "name": "runs", "description": "Rusty Red compatibility command runtime." },
             { "name": "graph", "description": "First-class graph node, edge, adjacency, index, and verification routes." },
+            { "name": "search", "description": "Standalone RustyWeb crawl and graph-native search routes." },
+            { "name": "federation", "description": "Signed RustyWeb Web Commons fragment verification, trust gating, and merge receipts." },
             { "name": "instant-kg", "description": "Harness Instant KG merged base+session-delta code graph queries." },
             { "name": "transactions", "description": "Open and commit staged transaction workflows for Cypher writes." },
             { "name": "context", "description": "Context pack writes for graph-backed agent workflows." }
         ],
         "security": [{ "bearerAuth": [] }],
         "paths": {
+            "/": {
+                "get": {
+                    "tags": ["search"],
+                    "summary": "Render the graph-native search home page",
+                    "responses": {
+                        "200": {
+                            "description": "Self-contained RustyWeb SERP HTML for the default tenant.",
+                            "content": { "text/html": { "schema": { "type": "string" } } }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/search": {
+                "get": {
+                    "tags": ["search"],
+                    "summary": "Render graph-native search results",
+                    "parameters": [
+                        { "name": "q", "in": "query", "schema": { "type": "string" } },
+                        { "name": "tenant", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Self-contained RustyWeb SERP HTML.",
+                            "content": { "text/html": { "schema": { "type": "string" } } }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/search.json": {
+                "get": {
+                    "tags": ["search"],
+                    "summary": "Return graph-native search results as JSON",
+                    "parameters": [
+                        { "name": "q", "in": "query", "schema": { "type": "string" } },
+                        { "name": "tenant", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Substrate search payload with hits and LINKS_TO edges.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ok": { "type": "boolean" },
+                                            "tenant": { "type": "string" },
+                                            "search": { "type": "object", "additionalProperties": true }
+                                        },
+                                        "required": ["ok", "tenant", "search"]
+                                    }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/crawl": {
+                "post": {
+                    "tags": ["search"],
+                    "summary": "Run a bounded RustyWeb frontier crawl into the tenant graph",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tenant": { "type": "string" },
+                                        "run_id": { "type": "string" },
+                                        "seeds": { "type": "array", "items": { "type": "string", "format": "uri" } },
+                                        "budget": { "type": "object", "additionalProperties": true },
+                                        "scope": { "type": "object", "additionalProperties": true }
+                                    },
+                                    "required": ["seeds"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Crawl receipt and graph transaction.",
+                            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+                        },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
+            "/federate/submit": {
+                "post": {
+                    "tags": ["federation"],
+                    "summary": "Submit a signed RustyWeb Web Commons fragment",
+                    "description": "Verifies Ed25519 signatures, applies Web Commons trust gates, merges accepted pages and links into the tenant graph, and returns a per-page receipt. Receipt/hash-only payloads are compatibility no-ops.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tenant": { "type": "string" },
+                                        "federable": { "type": "boolean" },
+                                        "graph_delta_hash": { "type": "string" },
+                                        "receipt": { "type": "object", "additionalProperties": true },
+                                        "fragment": { "type": "object", "additionalProperties": true }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Federation fragment verified and merged, or compatibility receipt validated as a no-op.",
+                            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+                        },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
             "/health": {
                 "get": {
                     "tags": ["operations"],
@@ -1729,6 +1859,14 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                 "Forbidden": {
                     "description": "Bearer token lacks the required scope or the request origin is not allowed."
                 },
+                "BadRequest": {
+                    "description": "The request is malformed or rejected by route-specific validation.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                        }
+                    }
+                },
                 "StoreUnavailable": {
                     "description": "Configured graph store is unavailable or not writable.",
                     "content": {
@@ -3255,6 +3393,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -3272,6 +3417,11 @@ mod tests {
 
         for (path, method) in [
             ("/metrics", "get"),
+            ("/", "get"),
+            ("/search", "get"),
+            ("/search.json", "get"),
+            ("/crawl", "post"),
+            ("/federate/submit", "post"),
             ("/v1/diagnostics/slow_queries", "get"),
             ("/v1/diagnostics/config", "get"),
             ("/v1/query", "post"),

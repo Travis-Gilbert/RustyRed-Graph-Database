@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, env, fs};
 
 use crate::auth::ApiToken;
-use serde::{Deserialize, Serialize};
 use rustyred_core::{default_hybrid_edge_type_weights, HybridScoringConfig, RedCoreDurability};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageMode {
@@ -58,6 +58,13 @@ pub struct Config {
     pub service_name: String,
     pub api_title: String,
     pub public_url: Option<String>,
+    pub federate: bool,
+    pub federate_hub_url: Option<String>,
+    pub federate_token: Option<String>,
+    pub federate_peer_id: Option<String>,
+    pub federate_private_key: Option<String>,
+    pub federate_provenance: bool,
+    pub federate_snapshot_text_bytes: usize,
     pub mcp_enabled: bool,
     pub mcp_read_only: bool,
     pub mcp_allow_admin: bool,
@@ -122,12 +129,18 @@ impl Config {
                 }
             });
         let require_volume = env_bool(
-            &["RUSTY_RED_REQUIRE_VOLUME", "RUSTYRED_PRODUCT_REQUIRE_VOLUME"],
+            &[
+                "RUSTY_RED_REQUIRE_VOLUME",
+                "RUSTYRED_PRODUCT_REQUIRE_VOLUME",
+            ],
             railway_port.is_some(),
         );
         let volume_available = railway_volume_mount_path.is_some()
             || env_bool(
-                &["RUSTY_RED_VOLUME_MOUNTED", "RUSTYRED_PRODUCT_VOLUME_MOUNTED"],
+                &[
+                    "RUSTY_RED_VOLUME_MOUNTED",
+                    "RUSTYRED_PRODUCT_VOLUME_MOUNTED",
+                ],
                 false,
             );
         let durability = env_first(&["RUSTY_RED_DURABILITY", "RUSTYRED_PRODUCT_DURABILITY"])
@@ -140,17 +153,21 @@ impl Config {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1_000);
-        let strict_acid = env_bool(&["RUSTY_RED_STRICT_ACID", "RUSTYRED_PRODUCT_STRICT_ACID"], false);
+        let strict_acid = env_bool(
+            &["RUSTY_RED_STRICT_ACID", "RUSTYRED_PRODUCT_STRICT_ACID"],
+            false,
+        );
         let concurrency = env_first(&["RUSTY_RED_CONCURRENCY", "RUSTYRED_PRODUCT_CONCURRENCY"])
             .unwrap_or_else(|_| "single_writer".to_string());
-        let txn_isolation = env_first(&["RUSTY_RED_TXN_ISOLATION", "RUSTYRED_PRODUCT_TXN_ISOLATION"])
-            .unwrap_or_else(|_| {
-                if strict_acid {
-                    "serializable".to_string()
-                } else {
-                    "snapshot".to_string()
-                }
-            });
+        let txn_isolation =
+            env_first(&["RUSTY_RED_TXN_ISOLATION", "RUSTYRED_PRODUCT_TXN_ISOLATION"])
+                .unwrap_or_else(|_| {
+                    if strict_acid {
+                        "serializable".to_string()
+                    } else {
+                        "snapshot".to_string()
+                    }
+                });
         let (tenant_memory_quota_bytes, tenant_memory_quota_config_error) = env_usize(
             &[
                 "RUSTY_RED_TENANT_MEMORY_QUOTA_BYTES",
@@ -159,7 +176,10 @@ impl Config {
             0,
         );
         let (slow_query_threshold_nanos, slow_query_threshold_error) = env_u64(
-            &["RUSTY_RED_SLOW_QUERY_NANOS", "RUSTYRED_PRODUCT_SLOW_QUERY_NANOS"],
+            &[
+                "RUSTY_RED_SLOW_QUERY_NANOS",
+                "RUSTYRED_PRODUCT_SLOW_QUERY_NANOS",
+            ],
             100_000_000,
         );
         let (slow_query_capacity, slow_query_capacity_error) = env_usize(
@@ -169,10 +189,13 @@ impl Config {
             ],
             128,
         );
-        let slow_query_log = env_first(&["RUSTY_RED_SLOW_QUERY_LOG", "RUSTYRED_PRODUCT_SLOW_QUERY_LOG"])
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let slow_query_log = env_first(&[
+            "RUSTY_RED_SLOW_QUERY_LOG",
+            "RUSTYRED_PRODUCT_SLOW_QUERY_LOG",
+        ])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
         let mut tenant_config_error = slow_query_threshold_error.or(slow_query_capacity_error);
         let (tenant_config_overrides, parsed_tenant_config_error) = tenant_config_from_env();
         if tenant_config_error.is_none() {
@@ -204,13 +227,46 @@ impl Config {
         let api_title = env_first(&["RUSTY_RED_API_TITLE", "RUSTYRED_API_TITLE"])
             .unwrap_or_else(|_| "Rusty Red Graph Database API".to_string());
         let public_url = env_first(&["RUSTY_RED_PUBLIC_URL", "RUSTYRED_PUBLIC_URL"]).ok();
+        let federate = env_bool(&["RUSTY_RED_FEDERATE", "RUSTYRED_FEDERATE"], true);
+        let federate_hub_url =
+            env_first(&["RUSTY_RED_FEDERATE_HUB_URL", "RUSTYRED_FEDERATE_HUB_URL"]).ok();
+        let federate_token =
+            env_first(&["RUSTY_RED_FEDERATE_TOKEN", "RUSTYRED_FEDERATE_TOKEN"]).ok();
+        let federate_peer_id =
+            env_first(&["RUSTY_RED_FEDERATE_PEER_ID", "RUSTYRED_FEDERATE_PEER_ID"]).ok();
+        let federate_private_key = env_first(&[
+            "RUSTY_RED_FEDERATE_PRIVATE_KEY",
+            "RUSTYRED_FEDERATE_PRIVATE_KEY",
+        ])
+        .ok();
+        let federate_provenance = env_bool(
+            &[
+                "RUSTY_RED_FEDERATE_PROVENANCE",
+                "RUSTYRED_FEDERATE_PROVENANCE",
+            ],
+            false,
+        );
+        let (federate_snapshot_text_bytes, federate_snapshot_text_error) = env_usize(
+            &[
+                "RUSTY_RED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+                "RUSTYRED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+            ],
+            rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
+        );
+        if tenant_config_error.is_none() {
+            tenant_config_error = federate_snapshot_text_error;
+        }
         let mcp_enabled = env_bool(&["RUSTY_RED_MCP_ENABLED", "RUSTYRED_MCP_ENABLED"], true);
         let mcp_read_only = env_bool(&["RUSTY_RED_MCP_READ_ONLY", "RUSTYRED_MCP_READ_ONLY"], true);
-        let mcp_allow_admin =
-            env_bool(&["RUSTY_RED_MCP_ALLOW_ADMIN", "RUSTYRED_MCP_ALLOW_ADMIN"], false);
-        let mcp_default_tenant =
-            env_first(&["RUSTY_RED_MCP_DEFAULT_TENANT", "RUSTYRED_MCP_DEFAULT_TENANT"])
-                .unwrap_or_else(|_| "default".to_string());
+        let mcp_allow_admin = env_bool(
+            &["RUSTY_RED_MCP_ALLOW_ADMIN", "RUSTYRED_MCP_ALLOW_ADMIN"],
+            false,
+        );
+        let mcp_default_tenant = env_first(&[
+            "RUSTY_RED_MCP_DEFAULT_TENANT",
+            "RUSTYRED_MCP_DEFAULT_TENANT",
+        ])
+        .unwrap_or_else(|_| "default".to_string());
 
         Self {
             host,
@@ -240,6 +296,13 @@ impl Config {
             service_name,
             api_title,
             public_url,
+            federate,
+            federate_hub_url,
+            federate_token,
+            federate_peer_id,
+            federate_private_key,
+            federate_provenance,
+            federate_snapshot_text_bytes,
             mcp_enabled,
             mcp_read_only,
             mcp_allow_admin,
@@ -469,6 +532,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,

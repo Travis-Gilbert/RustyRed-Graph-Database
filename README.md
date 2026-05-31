@@ -60,7 +60,7 @@ If you want to manage the deploy yourself instead of using the template:
 3. Railway will detect `railway.toml` and use the bundled `Dockerfile`. Healthcheck path is `/ready`.
 4. Attach a volume mounted at `/app/data/rusty-red`.
 5. Set the required environment variables (see [Environment variable reference](#environment-variable-reference)). At minimum:
-   - `RUSTY_RED_API_TOKENS=<your-token>=graph:read|graph:write|context:read|admin:read`
+   - `RUSTY_RED_API_TOKENS=<your-token>=graph:read|graph:write|context:read|admin:read|federation:write`
    - Generate the token with `openssl rand -hex 32`.
 
 ### Persistence and the volume
@@ -74,7 +74,7 @@ RustyRed is RAM-first but durable. State lives in memory while the service runs;
 
 ### Auth model in one screen
 
-The default Dockerfile ships **auth required**. `/v1/*` and `/mcp` reject unauthenticated requests; only `/health`, `/ready`, `/openapi.json`, `/metrics`, and the `.well-known/*` advertisement endpoints stay open.
+The default Dockerfile ships **auth required**. `/`, `/search`, `/search.json`, `/crawl`, `/federate/submit`, `/v1/*`, `/mcp`, and `/metrics` reject unauthenticated requests; only `/health`, `/ready`, `/openapi.json`, and the `.well-known/*` advertisement endpoints stay open.
 
 Authentication is bearer-token. Tokens live in `RUSTY_RED_API_TOKENS` as a comma-separated list, each entry shaped `<secret>=<scope>|<scope>|...`. Scopes:
 
@@ -84,6 +84,7 @@ Authentication is bearer-token. Tokens live in `RUSTY_RED_API_TOKENS` as a comma
 | `graph:write` | All `graph:read` plus mutating routes (Cypher writes, node/edge upserts, bulk ingest) |
 | `context:read` | `/v1/tenants/{id}/context/pack` |
 | `admin:read` | Verify, rebuild-indexes, diagnostics, MCP admin tool surface (only if `RUSTY_RED_MCP_ALLOW_ADMIN=true`) |
+| `federation:write` | Submit signed RustyWeb Web Commons fragments to `/federate/submit` |
 | `*` | All of the above. Operator emergency access; do not use as an application token. |
 
 **Tokens are tenant-blind** — a `graph:write` token can write to any tenant on the instance. Multi-tenant deployments that need per-tenant isolation should either run one RustyRed instance per tenant or front the service with an external auth layer.
@@ -116,6 +117,13 @@ Source of truth is `crates/rustyred-server/src/config.rs`. The Dockerfile defaul
 | `RUSTY_RED_API_TITLE` | `Rusty Red Graph Database API` | — | OpenAPI title. |
 | `RUSTY_RED_PUBLIC_URL` | (unset) | — | Public base URL; used in OpenAPI `servers` block. |
 | `RUSTY_RED_ALLOWED_ORIGINS` | (empty) | — | CORS allowlist; comma-separated origins. |
+| `RUSTY_RED_FEDERATE` | `true` | — | Mark default crawls federable and enable optional Web Commons submission. |
+| `RUSTY_RED_FEDERATE_HUB_URL` | (unset) | federation clients | Hub base URL or `/federate/submit` URL. If unset, crawls stay local and return a federation receipt status. |
+| `RUSTY_RED_FEDERATE_TOKEN` | (unset) | authenticated hubs | Bearer token used when posting to the hub. |
+| `RUSTY_RED_FEDERATE_PRIVATE_KEY` | (unset) | federation clients | 32-byte Ed25519 private key as hex, used to sign Web Commons fragments. |
+| `RUSTY_RED_FEDERATE_PEER_ID` | derived | federation clients | Optional Ed25519 public key hex. Must match the private key if set. |
+| `RUSTY_RED_FEDERATE_PROVENANCE` | `false` | — | Include crawl seeds/actor provenance in submitted fragments. Content and links can federate without provenance. |
+| `RUSTY_RED_FEDERATE_SNAPSHOT_TEXT_BYTES` | `4096` | — | Max text bytes per federated content snapshot. |
 | `RUSTY_RED_MCP_ENABLED` | `true` | — | Master switch for `/mcp`. |
 | `RUSTY_RED_MCP_READ_ONLY` | `true` | — | Keeps write tools unreachable until you opt in. |
 | `RUSTY_RED_MCP_ALLOW_ADMIN` | `false` | — | Exposes the admin tool surface; requires `admin:read` token. |
@@ -243,6 +251,11 @@ Core routes are documented by `GET /openapi.json`. The OpenAPI document is gener
 ### Canonical routes
 
 ```text
+GET  /
+GET  /search?q={query}&tenant={tenant}
+GET  /search.json?q={query}&tenant={tenant}
+POST /crawl
+POST /federate/submit
 GET  /health
 GET  /ready
 GET  /openapi.json

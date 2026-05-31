@@ -18,11 +18,12 @@ RUSTY_RED_REQUIRE_VOLUME=true
 
 In this posture:
 
-- `/v1/*` and `/mcp` reject requests that do not present a valid
-  bearer token from `RUSTY_RED_API_TOKENS`.
+- `/`, `/search`, `/search.json`, `/crawl`, `/federate/submit`,
+  `/v1/*`, `/mcp`, and `/metrics` reject requests that do not present
+  a valid bearer token from `RUSTY_RED_API_TOKENS`.
 - `/health`, `/ready`, `/openapi.json`, `/.well-known/agent.json`,
-  `/.well-known/mcp/rustyred.json`, and `/metrics` remain unauthenticated;
-  they expose no tenant data or mutable surface.
+  and `/.well-known/mcp/rustyred.json` remain unauthenticated; they expose
+  no tenant data or mutable surface.
 - MCP starts in read-only mode. Write tools are unreachable until the
   operator explicitly enables them.
 - The service refuses to start without a persistent volume mounted
@@ -60,6 +61,7 @@ Supported canonical scopes:
 | `graph:write` | All `graph:read` plus mutating routes: `/v1/cypher` with `CREATE`/`MERGE`/`SET`/`DELETE`, `/v1/tenants/{id}/graph/nodes` (POST), `/v1/tenants/{id}/graph/edges` (POST), `/v1/tenants/{id}/graph/bulk/nodes`, `/v1/tenants/{id}/graph/bulk/edges`, `/v1/cache/put`, `/v1/cache/invalidate`. |
 | `context:read` | `/v1/tenants/{id}/context/pack`. |
 | `admin:read` | `/v1/tenants/{id}/graph/verify`, `/v1/tenants/{id}/graph/rebuild-indexes`, `/v1/diagnostics/config`, and the MCP admin tool surface (only when `RUSTY_RED_MCP_ALLOW_ADMIN=true`). |
+| `federation:write` | Submit signed RustyWeb Web Commons fragments to `/federate/submit`. |
 | `run:read` / `run:write` | The legacy compat-server's run-lifecycle routes (`/v1/runs/{id}`, etc.). Only meaningful with the legacy server. |
 
 Scope aliases are also accepted for backward compatibility:
@@ -67,7 +69,8 @@ Scope aliases are also accepted for backward compatibility:
 all map to `graph:read`; `rustyred:graph:write:propose` and
 `rustyred:graph:write:apply` both map to `graph:write`;
 `rustyred:graph:context` maps to `context:read`;
-`rustyred:graph:admin:verify` maps to `admin:read`.
+`rustyred:graph:admin:verify` maps to `admin:read`;
+`rustyred:federation:write` maps to `federation:write`.
 
 A `*` scope in any entry grants all of the above and should be used
 sparingly — operator emergency access, not application tokens.
@@ -103,8 +106,8 @@ boundary, not a trust boundary against an authenticated caller.
 We treat the following as security issues and will respond to
 reports about them:
 
-- Authentication bypass on `/v1/*` or `/mcp` when
-  `RUSTY_RED_REQUIRE_AUTH=true`.
+- Authentication bypass on protected search, crawl, federation, `/v1/*`,
+  `/mcp`, or metrics routes when `RUSTY_RED_REQUIRE_AUTH=true`.
 - Cross-tenant data leakage via `/v1/tenants/{tenant_id}/...`
   routes — a request scoped to one `tenant_id` returning data
   belonging to a different `tenant_id`.
@@ -121,8 +124,7 @@ reports about them:
   cannot reload.
 - Information disclosure via unauthenticated routes that goes
   beyond intentional surface (`/health`, `/ready`, `/openapi.json`,
-  `/metrics`, `/.well-known/*` are intentionally open and not
-  considered leakage).
+  `/.well-known/*` are intentionally open and not considered leakage).
 
 ## What is out of scope (for now)
 

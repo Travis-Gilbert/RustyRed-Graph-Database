@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Substrate search</title>
+<style>
+  :root {
+    --ink: #2A2823;
+    --ink-soft: #6b665c;
+    --paper: #f4f1ea;
+    --paper-soft: #ece8df;
+    --rule: #d9d4c8;
+    --accent: #b45a2d;
+    --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--paper); color: var(--ink); }
+  body { display: flex; flex-direction: column; font-family: var(--mono); }
+  header { border-bottom: 1px solid var(--rule); background: var(--paper-soft); padding: 14px 22px 12px; }
+  .eyebrow { margin: 0 0 8px; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); }
+  form.search { display: flex; gap: 8px; align-items: stretch; }
+  form.search input {
+    flex: 1; min-width: 0; border: 1.5px solid var(--rule); border-radius: 7px;
+    background: var(--paper); color: var(--ink); font-family: var(--mono); font-size: 17px;
+    padding: 9px 12px; outline: none;
+  }
+  form.search input:focus { border-color: var(--accent); }
+  form.search button {
+    border: 1.5px solid var(--accent); background: var(--accent); color: var(--paper);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 0 16px; border-radius: 7px; cursor: pointer;
+  }
+  form.search button:hover { background: #9c4a22; }
+  .status { margin: 9px 0 0; font-size: 11px; color: var(--ink-soft); min-height: 14px; }
+  .legend { display: flex; gap: 14px; margin-top: 8px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--accent); }
+  #stage { position: relative; flex: 1; min-height: 0; }
+  #graph { display: block; width: 100%; height: 100%; cursor: grab; }
+  #empty {
+    position: absolute; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; padding: 32px; color: var(--ink-soft);
+    font-size: 13px; line-height: 1.6; max-width: 460px; margin: 0 auto;
+  }
+  #empty strong { display: block; color: var(--ink); font-size: 18px; margin-bottom: 6px; }
+  #empty .accent { color: var(--accent); }
+  #tip {
+    position: absolute; pointer-events: none; display: none; max-width: 320px; padding: 8px 10px;
+    border: 1px solid var(--rule); border-radius: 6px; background: var(--paper-soft);
+    font-size: 11px; line-height: 1.45; color: var(--ink); box-shadow: 0 4px 14px rgba(42, 40, 35, 0.12);
+  }
+  #tip .u { color: var(--accent); word-break: break-all; margin-top: 2px; }
+  #tip .s { color: var(--ink-soft); margin-top: 3px; }
+  #tip .r { color: var(--ink-soft); }
+</style>
+</head>
+<body>
+  <header>
+    <p class="eyebrow">Substrate search</p>
+    <form class="search" action="/search" method="get" autocomplete="off">
+      <input id="q" name="q" type="search" placeholder="Search your substrate…" aria-label="Search your substrate" />
+      <button type="submit">Search</button>
+    </form>
+    <p class="status" id="status"></p>
+    <div class="legend" id="legend"></div>
+  </header>
+  <div id="stage">
+    <svg id="graph"></svg>
+    <div id="empty"></div>
+    <div id="tip"></div>
+  </div>
+
+<!-- d3 (vendored, inlined by the renderer so the page is self-contained) -->
+<script>/*__D3__*/</script>
+
+<script>
+// The browser's load_web_resource hook replaces the next line with the real
+// SubstrateSearch payload (serde JSON) before serving. Left null -> honest empty
+// state, never fake data. All text rendered via textContent / d3 .text() (never
+// innerHTML): titles/urls/snippets come from crawled pages and are untrusted.
+var SERP_DATA = null; // __SERP_DATA__
+
+(function () {
+  "use strict";
+
+  var INK = "#2A2823", INK_SOFT = "#6b665c", ACCENT = "#b45a2d", PAPER = "#f4f1ea";
+  var MONO = '"JetBrains Mono", ui-monospace, monospace';
+  var RING_NAMES = ["match", "adjacent", "nearby", "distant"];
+  function ringName(r) { return RING_NAMES[r] || "distant"; }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+  function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+  var data = SERP_DATA && Array.isArray(SERP_DATA.hits)
+    ? SERP_DATA
+    : { query: "", hits: [], links: [], matched_count: 0, kept_count: 0 };
+
+  // Search box reflects the current query (set as a property, never HTML).
+  document.getElementById("q").value = data.query || "";
+
+  // Status line.
+  var statusEl = document.getElementById("status");
+  if (data.kept_count === 0) {
+    statusEl.textContent = data.query ? "New territory: nothing in scope matches yet." : "Nothing captured yet — browse a few pages.";
+  } else if (!data.query) {
+    statusEl.textContent = "Browsing " + data.kept_count + " pages.";
+  } else {
+    statusEl.textContent = data.matched_count + " direct match" + (data.matched_count === 1 ? "" : "es")
+      + ", " + data.kept_count + " in the neighbourhood. Drag to rearrange, scroll to zoom.";
+  }
+
+  // Legend.
+  var maxRing = data.hits.reduce(function (m, h) { return Math.max(m, h.ring || 0); }, 0);
+  var legend = document.getElementById("legend");
+  if (data.kept_count > 0) {
+    for (var r = 0; r <= Math.min(3, maxRing); r++) {
+      var span = el("span");
+      var dot = el("span", "dot");
+      dot.style.background = r === 0 ? ACCENT : "transparent";
+      dot.style.opacity = String(1 - r * 0.22);
+      span.appendChild(dot);
+      span.appendChild(document.createTextNode(ringName(r)));
+      legend.appendChild(span);
+    }
+  }
+
+  // Empty state.
+  if (data.kept_count === 0) {
+    var emptyEl = document.getElementById("empty");
+    if (data.query) {
+      emptyEl.appendChild(el("strong", null, "New territory."));
+      emptyEl.appendChild(document.createTextNode("Nothing in your substrate connects to "));
+      emptyEl.appendChild(el("span", "accent", "“" + data.query + "”"));
+      emptyEl.appendChild(document.createTextNode(" yet. That is itself a finding: this is unexplored ground."));
+    } else {
+      emptyEl.appendChild(el("strong", null, "No knowledge captured yet."));
+      emptyEl.appendChild(document.createTextNode("Browse a few pages and their shape will appear here."));
+    }
+    emptyEl.style.display = "flex";
+    return;
+  }
+
+  // ---- d3 force-directed graph ----
+  var stage = document.getElementById("stage");
+  var tip = document.getElementById("tip");
+  var svg = d3.select("#graph");
+  var W = stage.clientWidth || 800, H = stage.clientHeight || 600;
+  svg.attr("viewBox", [0, 0, W, H]);
+  var g = svg.append("g");
+
+  var nodes = data.hits.map(function (h) { return Object.assign({ id: h.node_id }, h); });
+  var links = (data.links || []).map(function (l) { return { source: l.source, target: l.target }; });
+
+  function nodeR(d) {
+    return (d.ring || 0) === 0 ? 7 + Math.min(8, (d.match_score || 1) * 1.5) : Math.max(4, 7 - d.ring);
+  }
+  function nodeOpacity(d) { return Math.max(0.45, 1 - (d.ring || 0) * 0.2); }
+
+  var sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(function (d) { return d.id; }).distance(62).strength(0.45))
+    .force("charge", d3.forceManyBody().strength(-230))
+    .force("center", d3.forceCenter(W / 2, H / 2))
+    .force("collide", d3.forceCollide().radius(function (d) { return nodeR(d) + 7; }))
+    .force("x", d3.forceX(W / 2).strength(0.04))
+    .force("y", d3.forceY(H / 2).strength(0.04));
+
+  var link = g.append("g")
+    .attr("stroke", "rgba(42,40,35,0.18)")
+    .attr("stroke-width", 1)
+    .selectAll("line").data(links).join("line");
+
+  var node = g.append("g")
+    .selectAll("circle").data(nodes).join("circle")
+    .attr("r", nodeR)
+    .attr("fill", function (d) { return (d.ring || 0) === 0 ? ACCENT : PAPER; })
+    .attr("stroke", function (d) { return (d.ring || 0) === 0 ? ACCENT : INK_SOFT; })
+    .attr("stroke-width", function (d) { return (d.ring || 0) === 0 ? 0 : 1.5; })
+    .attr("opacity", nodeOpacity)
+    .style("cursor", "grab")
+    .call(drag(sim))
+    .on("mouseover", showTip)
+    .on("mousemove", moveTip)
+    .on("mouseout", hideTip);
+
+  var label = g.append("g")
+    .attr("font-family", MONO).attr("font-size", 11).attr("fill", INK)
+    .selectAll("text").data(nodes.filter(function (d) { return (d.ring || 0) <= 1; })).join("text")
+    .attr("text-anchor", "middle")
+    .attr("dy", function (d) { return nodeR(d) + 13; })
+    .attr("opacity", function (d) { return (d.ring || 0) === 0 ? 1 : 0.7; })
+    .style("pointer-events", "none")
+    .text(function (d) { return trunc(d.title || d.url || d.id, 22); });
+
+  sim.on("tick", function () {
+    link.attr("x1", function (d) { return d.source.x; }).attr("y1", function (d) { return d.source.y; })
+        .attr("x2", function (d) { return d.target.x; }).attr("y2", function (d) { return d.target.y; });
+    node.attr("cx", function (d) { return d.x; }).attr("cy", function (d) { return d.y; });
+    label.attr("x", function (d) { return d.x; }).attr("y", function (d) { return d.y; });
+  });
+
+  svg.call(d3.zoom().scaleExtent([0.3, 4]).on("zoom", function (e) { g.attr("transform", e.transform); }));
+
+  function drag(simulation) {
+    return d3.drag()
+      .on("start", function (e, d) { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on("drag", function (e, d) { d.fx = e.x; d.fy = e.y; })
+      .on("end", function (e, d) { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; });
+  }
+
+  function showTip(event, d) {
+    while (tip.firstChild) tip.removeChild(tip.firstChild);
+    var head = el("div", null, d.title || "");
+    head.appendChild(el("span", "r", " [" + ringName(d.ring) + "]"));
+    tip.appendChild(head);
+    if (d.url) tip.appendChild(el("div", "u", d.url));
+    if (d.snippet) tip.appendChild(el("div", "s", d.snippet));
+    tip.style.display = "block";
+    moveTip(event);
+  }
+  function moveTip(event) {
+    var rect = stage.getBoundingClientRect();
+    var x = Math.min(event.clientX - rect.left + 14, rect.width - 330);
+    tip.style.left = Math.max(8, x) + "px";
+    tip.style.top = (event.clientY - rect.top + 14) + "px";
+  }
+  function hideTip() { tip.style.display = "none"; }
+
+  window.addEventListener("resize", function () {
+    W = stage.clientWidth || W; H = stage.clientHeight || H;
+    svg.attr("viewBox", [0, 0, W, H]);
+    sim.force("center", d3.forceCenter(W / 2, H / 2));
+    sim.force("x", d3.forceX(W / 2).strength(0.04));
+    sim.force("y", d3.forceY(H / 2).strength(0.04));
+    sim.alpha(0.3).restart();
+  });
+})();
+</script>
+</body>
+</html>

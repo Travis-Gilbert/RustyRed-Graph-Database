@@ -1742,6 +1742,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -1821,6 +1828,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -1879,6 +1893,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -1921,6 +1942,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -2169,10 +2197,12 @@ mod tests {
         let state = AppState::new(memory_config());
         let mut config = state.mcp_config();
         config.read_only = false;
+        let write_context = rustyred_mcp::McpRequestContext::with_scopes(["graph:write"]);
 
-        let bulk = rustyred_mcp::handle_mcp_request(
+        let bulk = rustyred_mcp::handle_mcp_request_with_context(
             &state,
             &config,
+            &write_context,
             json!({
                 "jsonrpc": "2.0",
                 "id": "bulk",
@@ -2198,9 +2228,10 @@ mod tests {
         );
         assert_eq!(bulk["result"]["structuredContent"]["inserted"], 1);
 
-        let fulltext_designate = rustyred_mcp::handle_mcp_request(
+        let fulltext_designate = rustyred_mcp::handle_mcp_request_with_context(
             &state,
             &config,
+            &write_context,
             json!({
                 "jsonrpc": "2.0",
                 "id": "ft-designate",
@@ -2242,9 +2273,10 @@ mod tests {
             "place:a"
         );
 
-        let spatial_designate = rustyred_mcp::handle_mcp_request(
+        let spatial_designate = rustyred_mcp::handle_mcp_request_with_context(
             &state,
             &config,
+            &write_context,
             json!({
                 "jsonrpc": "2.0",
                 "id": "sp-designate",
@@ -2320,6 +2352,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
@@ -2366,6 +2405,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
-use serde::Deserialize;
-use serde_json::{json, Value};
 use rustyred_core::{
     Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError, NeighborQuery,
     NodeQuery, NodeRecord,
 };
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::cypher::ast::{
     AggOp, CypherPattern, EdgePattern, NodePattern, ParsedCypher, PropertyFilter, ReturnItem,
@@ -2210,8 +2210,8 @@ fn take_braced_block(source: &str) -> Result<(&str, &str), QuerySurfaceError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::json;
     use rustyred_core::{EdgeRecord, GraphMutation, NodeRecord, RedCoreDurability};
+    use serde_json::json;
 
     use super::{
         cypher_compatibility_matrix, execute_cypher_query, execute_public_query,
@@ -2252,6 +2252,13 @@ mod tests {
             service_name: "rusty-red".to_string(),
             api_title: "Rusty Red".to_string(),
             public_url: None,
+            federate: true,
+            federate_hub_url: None,
+            federate_token: None,
+            federate_peer_id: None,
+            federate_private_key: None,
+            federate_provenance: false,
+            federate_snapshot_text_bytes: rustyred_search::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
             mcp_enabled: true,
             mcp_read_only: true,
             mcp_allow_admin: false,
