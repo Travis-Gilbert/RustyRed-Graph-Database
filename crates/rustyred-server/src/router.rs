@@ -660,10 +660,12 @@ async fn crawl_submit(
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
     };
-    let transaction = match store.commit_batch(output.graph.batch.clone()) {
-        Ok(transaction) => transaction,
-        Err(error) => return graph_store_error_response(error),
-    };
+    let transaction =
+        match commit_batch_with_indexes(&state, &tenant_id, &mut store, output.graph.batch.clone())
+        {
+            Ok(transaction) => transaction,
+            Err(error) => return graph_store_error_response(error),
+        };
     let federation =
         submit_web_commons_fragment(&state, &tenant_id, &federation_request, &output).await;
     Json(json!({
@@ -804,10 +806,11 @@ fn ingest_web_commons_fragment(
         )
             .into_response();
     }
-    let transaction = match store.commit_batch(plan.batch.clone()) {
-        Ok(transaction) => transaction,
-        Err(error) => return graph_store_error_response(error),
-    };
+    let transaction =
+        match commit_batch_with_indexes(&state, &tenant_id, &mut store, plan.batch.clone()) {
+            Ok(transaction) => transaction,
+            Err(error) => return graph_store_error_response(error),
+        };
 
     Json(json!({
         "ok": true,
@@ -821,6 +824,32 @@ fn ingest_web_commons_fragment(
         "transaction": transaction,
     }))
     .into_response()
+}
+
+fn commit_batch_with_indexes(
+    state: &AppState,
+    tenant_id: &str,
+    store: &mut TenantGraphStore,
+    batch: rustyred_core::GraphMutationBatch,
+) -> Result<rustyred_core::GraphTransaction, GraphStoreError> {
+    let index_batch = batch.clone();
+    let transaction = store.commit_batch(batch)?;
+    index_committed_batch(state, tenant_id, &index_batch);
+    Ok(transaction)
+}
+
+fn index_committed_batch(
+    state: &AppState,
+    tenant_id: &str,
+    batch: &rustyred_core::GraphMutationBatch,
+) {
+    for mutation in &batch.mutations {
+        state.observability.record_mutation();
+        if let rustyred_core::GraphMutation::NodeUpsert(node) = mutation {
+            state.maybe_index_node_spatially(tenant_id, node);
+            state.maybe_index_node_fulltext(tenant_id, node);
+        }
+    }
 }
 
 async fn submit_web_commons_fragment(
@@ -4601,22 +4630,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     use axum::body::{to_bytes, Body};
-    use axum::extract::{Query, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
     use serde_json::{json, Value};
 
     use super::{
-        crawl_submit, default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes,
-        default_pr_damping, default_pr_max_iter, default_pr_tolerance, execute_graph_store_command,
-        execute_tenant_cache_command, execute_tenant_command, federate_submit,
-        graph_algorithm_communities, graph_algorithm_components, graph_algorithm_pagerank,
-        graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
-        graph_fulltext_search, graph_vector_hybrid, graph_vector_search, graph_version_checkout,
-        graph_version_compile, graph_version_diff, graph_version_log_route, graph_version_merge,
-        graph_version_ref, instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr,
-        instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
+        commit_batch_with_indexes, crawl_submit, default_ppr_alpha, default_ppr_epsilon,
+        default_ppr_max_pushes, default_pr_damping, default_pr_max_iter, default_pr_tolerance,
+        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
+        federate_submit, graph_algorithm_communities, graph_algorithm_components,
+        graph_algorithm_pagerank, graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes,
+        graph_error_status, graph_fulltext_search, graph_vector_hybrid, graph_vector_search,
+        graph_version_checkout, graph_version_compile, graph_version_diff, graph_version_log_route,
+        graph_version_merge, graph_version_ref, instant_kg_explain_edge, instant_kg_impact,
+        instant_kg_ppr, instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
         mcp_origin_allowed, public_cypher, public_peer_id_from_private_key,
         required_scope_for_command, search_json, sign_web_commons_fragment,
         submit_web_commons_fragment, transaction_begin, transaction_commit, transaction_rollback,
@@ -4835,6 +4864,52 @@ mod tests {
             payload["search"]["hits"][0]["url"],
             "http://example.com/apple"
         );
+    }
+
+    #[tokio::test]
+    async fn crawled_content_updates_fulltext_designations() {
+        let state = memory_product_state();
+        let tenant_id = "flint";
+        state
+            .designate_fulltext_property(tenant_id, "ContentSnapshot", "text")
+            .unwrap();
+        let output = rustyred_search::build_v2_fixture_crawl(
+            rustyred_search::CrawlRequest::new(
+                "civic-fulltext",
+                vec!["https://example.com/flint-carriage-town".to_string()],
+            ),
+            &[rustyred_search::FetchedPage::html(
+                "https://example.com/flint-carriage-town",
+                "<html><body>Carriage Town porchfest reconstruction route notes</body></html>",
+            )],
+        )
+        .unwrap();
+        let mut store = state.tenant_graph_store(tenant_id).unwrap();
+        commit_batch_with_indexes(&state, tenant_id, &mut store, output.graph.batch).unwrap();
+
+        let response = graph_fulltext_search(
+            State(state),
+            Path(tenant_id.to_string()),
+            HeaderMap::new(),
+            Json(FullTextSearchBody {
+                label: Some("ContentSnapshot".to_string()),
+                property: "text".to_string(),
+                query: "porchfest reconstruction".to_string(),
+                k: 5,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["tenant"], tenant_id);
+        assert_eq!(payload["results"].as_array().unwrap().len(), 1);
+        assert!(payload["results"][0]["node_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("content_snapshot:"));
     }
 
     #[tokio::test]
