@@ -1,11 +1,14 @@
 [package]
 name = "rusty_red_native"
-version = "0.6.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Rusty Red GraphDB engine, product server, MCP adapter, and pure Rust graph algorithm helpers."
-license = "MIT"
-repository = "https://github.com/Travis-Gilbert/RustyRed-Graph-Database"
-rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [workspace]
 members = [
@@ -19,11 +22,20 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.9.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Travis-Gilbert/RustyRed-Graph-Database"
+rust-version = "1.85"
+keywords = ["graph", "database", "vector-search", "mcp", "knowledge-graph"]
+categories = ["database-implementations", "data-structures", "algorithms"]
+
 [lib]
 name = "rusty_red_native"
 
 [dependencies]
-rustyred-core = { path = "crates/rustyred-core" }
+rustyred-core = { path = "crates/rustyred-core", version = "0.9.1" }
 
 [profile.release]
 opt-level = 3
@@ -31,3 +43,22 @@ lto = "fat"
 codegen-units = 1
 debug = false
 strip = "symbols"
+
+# Staged config for cargo-dist / `dist` (https://opensource.axo.dev/cargo-dist/).
+# Inert for normal `cargo build`. Run `dist init` to generate a release
+# workflow that produces a curl|sh installer, a Homebrew formula, and an npm
+# shim from this config. The hand-written .github/workflows/release.yml already
+# ships prebuilt binaries on tag; `dist init` supersedes it when you adopt the
+# installer ecosystem. `dist init` will also pin `dist-version` to your tool.
+[workspace.metadata.dist]
+dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "homebrew", "npm"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+install-path = "CARGO_HOME"

@@ -1,10 +1,11 @@
 [package]
 name = "rustyred-mcp"
-version = "0.6.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Model Context Protocol adapter for Rusty Red Graph Database."
-license = "MIT"
-rust-version = "1.85"
+license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [features]
 default = []

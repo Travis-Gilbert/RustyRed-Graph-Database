@@ -2162,14 +2162,14 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty_red_native"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "rustyred-core",
 ]
 
 [[package]]
 name = "rustyred-compat-server"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "rustyred-core",
  "serde_json",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-core"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "fs2",
  "h3o",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-mcp"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "rustyred-core",
  "serde",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-resp-server"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "redis-protocol",
  "rustyred-core",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-search"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "lol_html",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-server"
-version = "0.6.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2243,6 +2243,7 @@ dependencies = [
  "rustyred-search",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tonic",
  "tonic-build",
