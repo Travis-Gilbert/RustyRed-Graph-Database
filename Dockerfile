@@ -16,7 +16,7 @@ COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
 
-RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo build -p rustyred-server --release
+RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo build --locked -p rustyred-server --release
 
 FROM debian:bookworm-slim
 
