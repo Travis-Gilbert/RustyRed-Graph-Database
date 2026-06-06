@@ -16,6 +16,44 @@ Under the hood: a RAM-first store with append-only-file + snapshot durability, H
 
 Clicking the button deploys a single Railway service with a persistent volume, security-by-default, and a freshly generated API token. You get the same in-memory RAM-first graph database documented below — no Redis sidecar, no second service, no extra moving parts.
 
+## Try it live (read-only)
+
+A public RustyRed instance is already online with a small sample graph and a **read-only** token — nothing to deploy. The token carries only `graph:read`, so you can query, search, and run graph algorithms, but not mutate the data.
+
+- **Base URL:** `https://rustyred-production-fc07.up.railway.app`
+- **MCP endpoint:** `https://rustyred-production-fc07.up.railway.app/mcp`
+- **Read-only token:** `rrdemo_aceb221d263a64a47a1e08b523fba4db617f02465fc8945d`
+
+Point an agent at it (Claude Desktop / Cursor):
+
+```json
+{
+  "mcpServers": {
+    "rustyred-demo": {
+      "url": "https://rustyred-production-fc07.up.railway.app/mcp",
+      "headers": { "Authorization": "Bearer rrdemo_aceb221d263a64a47a1e08b523fba4db617f02465fc8945d" }
+    }
+  }
+}
+```
+
+Or curl it — an HNSW vector search and a PageRank over the sample graph:
+
+```bash
+DEMO=https://rustyred-production-fc07.up.railway.app
+TOKEN=rrdemo_aceb221d263a64a47a1e08b523fba4db617f02465fc8945d
+
+curl -s -X POST "$DEMO/v1/tenants/demo/graph/vector/search" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"label":"Claim","property":"embedding","k":3,"query":[0.88,0.12,0.25,0.02,0.08,0,0,0]}'
+
+curl -s -X POST "$DEMO/v1/tenants/demo/graph/algorithms/pagerank" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"top_k":5}'
+```
+
+The sample is a tiny epistemic knowledge graph about RustyRed itself, loaded by [`scripts/demo/seed.sh`](scripts/demo/seed.sh). Want your own instance with write access? Hit **Deploy on Railway** above.
+
 ## What Rusty Red does
 
 - **Graph storage** with AOF/snapshot persistence, per-tenant isolation, single-writer serializable commits, and committed read snapshots

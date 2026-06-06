@@ -68,14 +68,18 @@ BASE_URL=https://<service>.up.railway.app TOKEN=<token> ./scripts/bench/run.sh
 | Environment | Ingest, nodes/sec | Ingest, edges/sec | PPR p50 | PPR p95 |
 |-------------|-------------------|-------------------|---------|---------|
 | Apple Silicon (Darwin arm64), release build, loopback HTTP | ~8,300 | ~4,800 | 27 ms | 42 ms |
+| Railway (shared instance), client over public internet | ~3,700 | ~3,000 | 248 ms | 319 ms |
 
 Run: `VERSION=0.9.1 NODES=20000 PPR_TRIALS=50 ./scripts/bench/run.sh` (20,000 nodes,
 40,000 edges, 50 PPR trials, one warm-up discarded). Edge ingest is slower than
 node ingest because each edge validates both endpoints and the bulk loader
 commits in batches (default 500), refreshing the committed read view per batch.
 
-A deployed-instance (Railway) row — same harness, with network latency folded
-into the PPR figure — belongs here once the public instance is live.
+Both rows are measured (2026-06-06). The Railway row is the **same harness run
+from a developer laptop against the live demo over the public internet**, so its
+PPR latency is dominated by client↔server round-trip time, not engine compute —
+the loopback row isolates the engine. A client co-located with the instance sees
+latency close to the loopback figure plus one network hop.
 <!-- BENCH_RESULTS_END -->
 
 Numbers are point-in-time and machine-specific. The header of each run records
