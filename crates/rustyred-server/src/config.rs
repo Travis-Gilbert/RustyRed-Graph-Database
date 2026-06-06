@@ -321,6 +321,12 @@ impl Config {
         if let Some(error) = &self.tenant_config_error {
             return Err(error.clone());
         }
+        if self.require_auth && self.api_tokens.is_empty() {
+            return Err(
+                "RUSTY_RED_REQUIRE_AUTH=true but RUSTY_RED_API_TOKENS is empty; no request can authenticate. Set a token or RUSTY_RED_REQUIRE_AUTH=false."
+                    .to_string(),
+            );
+        }
         if self.slow_query_capacity == 0 {
             return Err("RUSTY_RED_SLOW_QUERY_CAPACITY must be greater than 0".to_string());
         }
@@ -500,7 +506,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        parse_tenant_config_json, Config, HybridScoringConfig, RedCoreDurability, StorageMode,
+        parse_tenant_config_json, ApiToken, Config, HybridScoringConfig, RedCoreDurability,
+        StorageMode,
     };
 
     fn base_config() -> Config {
@@ -544,6 +551,30 @@ mod tests {
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
         }
+    }
+
+    #[test]
+    fn require_auth_without_tokens_is_rejected() {
+        let mut config = base_config();
+        config.require_auth = true;
+        config.api_tokens = Vec::new();
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("RUSTY_RED_API_TOKENS is empty"));
+    }
+
+    #[test]
+    fn require_auth_with_a_token_passes() {
+        let mut config = base_config();
+        config.require_auth = true;
+        config.api_tokens = vec![ApiToken {
+            token: "secret".to_string(),
+            scopes: vec!["graph:read".to_string()],
+        }];
+
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]
