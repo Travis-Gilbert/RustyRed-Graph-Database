@@ -383,10 +383,7 @@ impl AppState {
                 "graph transaction tenant mismatch",
             ));
         }
-        context
-            .mutations
-            .mutations
-            .extend(batch.mutations.into_iter());
+        context.mutations.mutations.extend(batch.mutations);
         Ok(context.mutations.mutations.len())
     }
 
@@ -713,7 +710,7 @@ pub struct RedCoreTenantExecutor {
 
 impl RedCoreTenantExecutor {
     fn new(store: RedCoreGraphStore, tenant_memory_quota_bytes: usize) -> GraphStoreResult<Self> {
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(store.graph_snapshot())?;
+        let committed_snapshot = store.committed_view();
         Ok(Self {
             writer: Mutex::new(store),
             committed_snapshot: RwLock::new(committed_snapshot),
@@ -756,7 +753,7 @@ impl RedCoreTenantExecutor {
         let mut writer = self.lock_writer()?;
         self.enforce_tenant_memory_quota(&writer, &batch)?;
         let transaction = writer.commit_batch(batch)?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        let committed_snapshot = writer.committed_view();
         *self.committed_snapshot.write().map_err(|_| {
             GraphStoreError::new(
                 "redcore_snapshot_lock_poisoned",
@@ -818,7 +815,7 @@ impl RedCoreTenantExecutor {
     pub fn rebuild_indexes(&self) -> GraphStoreResult<GraphRebuildReport> {
         let mut writer = self.lock_writer()?;
         let report = writer.rebuild_indexes()?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        let committed_snapshot = writer.committed_view();
         *self.committed_snapshot.write().map_err(|_| {
             GraphStoreError::new(
                 "redcore_snapshot_lock_poisoned",
@@ -870,7 +867,7 @@ impl RedCoreTenantExecutor {
     ) -> GraphStoreResult<()> {
         let mut writer = self.lock_writer()?;
         writer.designate_vector_property(label, property_name, dimension)?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        let committed_snapshot = writer.committed_view();
         *self.committed_snapshot.write().map_err(|_| {
             GraphStoreError::new(
                 "redcore_snapshot_lock_poisoned",
@@ -2000,6 +1997,64 @@ mod tests {
     }
 
     #[test]
+    fn redcore_executor_vector_search_designate_then_upsert() {
+        // Regression: the read-side committed snapshot was rebuilt from a
+        // node/edge-only GraphSnapshot, which dropped vector designations, so
+        // vector_search through the executor always returned []. The committed
+        // view must carry designations and the HNSW index.
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
+        executor
+            .designate_vector_property("Claim", "embedding", 3)
+            .unwrap();
+        executor
+            .upsert_node(NodeRecord::new(
+                "claim:a",
+                ["Claim"],
+                json!({ "embedding": [1.0, 0.0, 0.0] }),
+            ))
+            .unwrap();
+        executor
+            .upsert_node(NodeRecord::new(
+                "claim:b",
+                ["Claim"],
+                json!({ "embedding": [0.0, 1.0, 0.0] }),
+            ))
+            .unwrap();
+
+        let results = executor
+            .vector_search(Some("Claim"), "embedding", &[1.0, 0.0, 0.0], 5)
+            .unwrap();
+
+        assert!(
+            results.iter().any(|(id, _)| id == "claim:a"),
+            "designate-then-upsert must be vector-searchable through the executor, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn redcore_executor_vector_search_upsert_then_designate_backfills() {
+        // The other ordering: designating after nodes exist must backfill the
+        // committed view's index too.
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
+        executor
+            .upsert_node(NodeRecord::new(
+                "claim:a",
+                ["Claim"],
+                json!({ "embedding": [1.0, 0.0, 0.0] }),
+            ))
+            .unwrap();
+        executor
+            .designate_vector_property("Claim", "embedding", 3)
+            .unwrap();
+
+        let results = executor
+            .vector_search(Some("Claim"), "embedding", &[1.0, 0.0, 0.0], 5)
+            .unwrap();
+
+        assert_eq!(results.first().map(|(id, _)| id.as_str()), Some("claim:a"));
+    }
+
+    #[test]
     fn redcore_executor_reads_only_committed_snapshots() {
         let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
         let error = executor
@@ -2051,7 +2106,7 @@ mod tests {
             executor.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
             "node:b"
         );
-        assert_eq!(executor.verify().unwrap().ok, true);
+        assert!(executor.verify().unwrap().ok);
     }
 
     #[test]

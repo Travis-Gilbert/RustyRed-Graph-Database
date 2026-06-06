@@ -606,7 +606,7 @@ pub struct GraphRebuildReport {
     pub after: VerifyReport,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct InMemoryGraphStore {
     version: u64,
     nodes: BTreeMap<String, NodeRecord>,
@@ -618,23 +618,6 @@ pub struct InMemoryGraphStore {
     property_index: BTreeMap<(String, String), BTreeSet<String>>,
     vector_designations: HashMap<(String, String), usize>,
     vector_indexes: HashMap<(String, String), VectorIndex>,
-}
-
-impl Default for InMemoryGraphStore {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            nodes: BTreeMap::new(),
-            edges: BTreeMap::new(),
-            out_adjacency: BTreeMap::new(),
-            in_adjacency: BTreeMap::new(),
-            label_index: BTreeMap::new(),
-            edge_type_index: BTreeMap::new(),
-            property_index: BTreeMap::new(),
-            vector_designations: HashMap::new(),
-            vector_indexes: HashMap::new(),
-        }
-    }
 }
 
 impl InMemoryGraphStore {
@@ -1718,6 +1701,17 @@ impl RedCoreGraphStore {
         self.store.snapshot()
     }
 
+    /// A clone of the committed in-memory store, including vector designations
+    /// and their HNSW indexes — which `GraphSnapshot` intentionally omits.
+    /// Read-side consumers (e.g. the tenant executor's committed snapshot) must
+    /// use this rather than rebuilding from `graph_snapshot()`, otherwise vector
+    /// and hybrid search read an index with no designations and return nothing.
+    /// `VectorIndex::clone` rebuilds the HNSW, so the view is immediately
+    /// searchable and still isolated from the writer.
+    pub fn committed_view(&self) -> InMemoryGraphStore {
+        self.store.clone()
+    }
+
     pub fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
         self.commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]))?
             .writes
@@ -2249,6 +2243,7 @@ fn acquire_redcore_directory_lock(data_dir: &Path) -> GraphStoreResult<RedCoreDi
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|err| {
             release_redcore_process_lock(&process_key);
@@ -3886,7 +3881,7 @@ mod tests {
             store.neighbors(NeighborQuery::in_("node:b").with_edge_type("KNOWS"))[0].node_id,
             "node:a"
         );
-        assert_eq!(store.verify().ok, true);
+        assert!(store.verify().ok);
     }
 
     #[test]
@@ -3963,7 +3958,7 @@ mod tests {
         assert!(store
             .node_ids_for_property("kind", &json!("scientist"))
             .is_empty());
-        assert_eq!(store.verify().ok, true);
+        assert!(store.verify().ok);
     }
 
     #[test]
@@ -4004,7 +3999,7 @@ mod tests {
             vec!["path".to_string(), "rank".to_string(), "repo".to_string()]
         );
         assert_eq!(store.stats().property_indexes_total, 5);
-        assert_eq!(store.verify().ok, true);
+        assert!(store.verify().ok);
     }
 
     #[test]
@@ -4060,7 +4055,7 @@ mod tests {
 
         let report = store.verify();
 
-        assert_eq!(report.ok, false);
+        assert!(!report.ok);
         assert!(report
             .problems
             .iter()
@@ -4113,9 +4108,9 @@ mod tests {
         assert!(store.query_nodes(NodeQuery::label("Person")).is_empty());
         let report = store.rebuild_indexes().unwrap();
 
-        assert_eq!(report.repaired, true);
-        assert_eq!(report.before.ok, false);
-        assert_eq!(report.after.ok, true);
+        assert!(report.repaired);
+        assert!(!report.before.ok);
+        assert!(report.after.ok);
         assert_eq!(store.query_nodes(NodeQuery::label("Person")).len(), 2);
         assert_eq!(
             store.neighbors(NeighborQuery::out("node:a"))[0].node_id,
@@ -4153,8 +4148,8 @@ mod tests {
 
         let report = store.rebuild_indexes().unwrap();
 
-        assert_eq!(report.repaired, false);
-        assert_eq!(report.after.ok, false);
+        assert!(!report.repaired);
+        assert!(!report.after.ok);
         assert!(report
             .after
             .problems
@@ -4186,7 +4181,7 @@ mod tests {
         write_fixture(&mut store);
 
         assert_eq!(store.stats().nodes_total, 2);
-        assert_eq!(store.verify().ok, true);
+        assert!(store.verify().ok);
         assert_eq!(
             store.neighbors(NeighborQuery::out("node:a"))[0].node_id,
             "node:b"
@@ -4226,7 +4221,7 @@ mod tests {
                     json!({ "rank": 1 }),
                 ))
                 .unwrap();
-            assert_eq!(store.verify().unwrap().ok, true);
+            assert!(store.verify().unwrap().ok);
         }
 
         let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
@@ -4245,7 +4240,7 @@ mod tests {
             "node:b"
         );
         assert_eq!(store.status().recovered_frames, 3);
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -4289,7 +4284,7 @@ mod tests {
         assert_eq!(transaction.graph_version, 3);
         assert_eq!(transaction.writes.len(), 3);
         assert_eq!(store.status().last_txn_id, 1);
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
     }
 
     #[test]
@@ -4338,7 +4333,7 @@ mod tests {
             store.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
             "node:b"
         );
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -4392,7 +4387,7 @@ mod tests {
         assert!(store.get_edge("edge:orphan-created-by").unwrap().is_none());
         assert_eq!(store.status().recovered_frames, 2);
         assert_eq!(store.status().last_txn_id, 2);
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -4419,7 +4414,7 @@ mod tests {
 
         assert!(store.get_node("actor:sandbox").is_some());
         assert!(store.get_edge("edge:orphan-created-by").is_none());
-        assert_eq!(store.verify().ok, true);
+        assert!(store.verify().ok);
     }
 
     #[test]
@@ -4529,7 +4524,7 @@ mod tests {
             vec!["Snapshot".to_string()]
         );
         assert_eq!(store.status().snapshot_txn_id, 1);
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -4659,7 +4654,7 @@ mod tests {
         drop(store);
         let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
         assert!(store.get_node("node:after-recovery").unwrap().is_some());
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -4699,7 +4694,7 @@ mod tests {
         assert!(store.get_node("node:first").unwrap().is_some());
         assert!(store.get_node("node:second").unwrap().is_some());
         assert_eq!(store.status().last_txn_id, 2);
-        assert_eq!(store.verify().unwrap().ok, true);
+        assert!(store.verify().unwrap().ok);
 
         std::fs::remove_dir_all(data_dir).ok();
     }
