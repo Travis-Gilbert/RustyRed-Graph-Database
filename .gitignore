@@ -4,6 +4,7 @@
 *.pyd
 __pycache__/
 .theorem/
+.DS_Store
 
 # Local operator config. Never commit; tokens live here.
 .env
