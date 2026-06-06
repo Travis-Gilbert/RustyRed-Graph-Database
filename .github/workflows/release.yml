@@ -1,0 +1,86 @@
+name: Release
+
+# Builds prebuilt `rustyred-server` binaries for macOS (arm64 + x86_64),
+# Linux (x86_64), and Windows (x86_64) and attaches them to the GitHub
+# Release when a vX.Y.Z tag is pushed. Triggered by the maintainer pushing a
+# tag; nothing publishes on a normal push.
+#
+# For the curl|sh installer + Homebrew formula + npm shim, run `dist init`
+# (config is staged under [workspace.metadata.dist] in Cargo.toml); cargo-dist
+# regenerates this workflow with the full installer ecosystem.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install protobuf-compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install protobuf-compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protobuf-compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p rustyred-server --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dir="target/${{ matrix.target }}/release"
+          tar -czf "rustyred-${{ matrix.target }}.tar.gz" -C "$dir" rustyred-server
+          shasum -a 256 "rustyred-${{ matrix.target }}.tar.gz" > "rustyred-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/rustyred-server.exe"
+          Compress-Archive -Path $bin -DestinationPath "rustyred-${{ matrix.target }}.zip"
+          (Get-FileHash "rustyred-${{ matrix.target }}.zip" -Algorithm SHA256).Hash | Out-File "rustyred-${{ matrix.target }}.zip.sha256"
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rustyred-${{ matrix.target }}.*
