@@ -1,4 +1,5 @@
 use axum::http::{HeaderMap, StatusCode};
+use subtle::ConstantTimeEq;
 
 const ALL_SCOPES: [&str; 16] = [
     "run:write",
@@ -90,9 +91,11 @@ pub fn require_scope(
         .ok_or(StatusCode::UNAUTHORIZED)?
         .to_string();
 
+    // Constant-time comparison so a matching token cannot be recovered by
+    // timing the bearer check byte by byte. Length is allowed to leak.
     let matched = valid_tokens
         .iter()
-        .find(|candidate| candidate.token == token)
+        .find(|candidate| bool::from(candidate.token.as_bytes().ct_eq(token.as_bytes())))
         .ok_or(StatusCode::FORBIDDEN)?;
     if !matched.allows(required_scope) {
         return Err(StatusCode::FORBIDDEN);
@@ -148,6 +151,20 @@ mod tests {
 
         assert_eq!(result.token, "secret");
         assert_eq!(result.scopes, vec!["run:read"]);
+    }
+
+    #[test]
+    fn rejects_wrong_token_of_equal_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer wrong0"));
+        let tokens = vec![ApiToken {
+            token: "right0".to_string(),
+            scopes: vec!["run:read".to_string()],
+        }];
+
+        let result = require_scope(&headers, &tokens, "run:read", true);
+
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
     #[test]
