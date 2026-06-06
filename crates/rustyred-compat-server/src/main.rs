@@ -2,10 +2,10 @@ use std::env;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
+use rustyred_compat_server::{serve, SharedExecutor};
 use rustyred_core::executor::StoreBackedRustyredExecutor;
 use rustyred_core::store::RedisRustyredStore;
 use rustyred_core::InMemoryRustyredExecutor;
-use rustyred_compat_server::{serve, SharedExecutor};
 
 fn main() -> std::io::Result<()> {
     let config = Config::from_env_and_args();
@@ -18,8 +18,10 @@ fn main() -> std::io::Result<()> {
             env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
         });
         let store = RedisRustyredStore::new(&redis_url, config.redis_key.clone())
-            .map_err(|exc| std::io::Error::new(std::io::ErrorKind::Other, exc.to_string()))?;
-        Arc::new(Mutex::new(Box::new(StoreBackedRustyredExecutor::new(store))))
+            .map_err(|exc| std::io::Error::other(exc.to_string()))?;
+        Arc::new(Mutex::new(Box::new(StoreBackedRustyredExecutor::new(
+            store,
+        ))))
     } else {
         Arc::new(Mutex::new(Box::new(InMemoryRustyredExecutor::new())))
     };
@@ -50,8 +52,8 @@ impl Config {
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(7379);
         let store = env::var("RUSTYRED_STORE").unwrap_or_else(|_| "memory".to_string());
-        let redis_key =
-            env::var("RUSTYRED_REDIS_KEY").unwrap_or_else(|_| "theseus:rustyred:tenant:state:v1".to_string());
+        let redis_key = env::var("RUSTYRED_REDIS_KEY")
+            .unwrap_or_else(|_| "theseus:rustyred:tenant:state:v1".to_string());
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {

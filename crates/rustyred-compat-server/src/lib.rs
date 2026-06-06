@@ -3,8 +3,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use serde_json::{json, Value};
 use rustyred_core::{RustyredExecutor, RustyredRequest};
+use serde_json::{json, Value};
 
 pub type SharedExecutor = Arc<Mutex<Box<dyn RustyredExecutor + Send>>>;
 
@@ -149,7 +149,7 @@ fn request_complete(bytes: &[u8]) -> bool {
         })
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    body.as_bytes().len() >= content_length
+    body.len() >= content_length
 }
 
 struct ParsedRequest {
@@ -182,20 +182,21 @@ fn json_response(status: u16, body: Value) -> String {
     let encoded = serde_json::to_string(&body).unwrap();
     format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{encoded}",
-        encoded.as_bytes().len()
+        encoded.len()
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{handle_http_request, SharedExecutor};
+    use rustyred_core::{InMemoryRustyredExecutor, RustyredExecutor, RustyredRequest};
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
-    use rustyred_core::{InMemoryRustyredExecutor, RustyredExecutor, RustyredRequest};
 
     #[test]
     fn command_endpoint_executes_core_command() {
-        let executor: SharedExecutor = Arc::new(Mutex::new(Box::new(InMemoryRustyredExecutor::new())));
+        let executor: SharedExecutor =
+            Arc::new(Mutex::new(Box::new(InMemoryRustyredExecutor::new())));
         let body = r#"{"command":"RUSTYRED.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#;
         let raw = format!(
             "POST /v1/command HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
@@ -212,7 +213,8 @@ mod tests {
 
     #[test]
     fn http_sequence_matches_direct_core_state_hash() {
-        let executor: SharedExecutor = Arc::new(Mutex::new(Box::new(InMemoryRustyredExecutor::new())));
+        let executor: SharedExecutor =
+            Arc::new(Mutex::new(Box::new(InMemoryRustyredExecutor::new())));
         let commands = [
             r#"{"command":"RUSTYRED.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#,
             r#"{"command":"RUSTYRED.RUN.STEP","args":{"run_id":"run:1","step_id":"step:1"}}"#,

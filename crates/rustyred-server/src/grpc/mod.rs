@@ -12,6 +12,8 @@ pub mod service;
 
 // Re-export the tonic-generated code at a stable path. The macro below
 // is what `tonic-build` produces from rustyred.v1.proto at compile time.
+// Generated tonic code; suppress lints over code we do not control.
+#[allow(dead_code, clippy::all)]
 pub mod proto {
     tonic::include_proto!("rustyred.v1");
 }

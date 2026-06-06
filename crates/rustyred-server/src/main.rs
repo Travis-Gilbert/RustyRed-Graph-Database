@@ -1,4 +1,12 @@
 #![recursion_limit = "512"]
+// `result_large_err`/`too_many_arguments`: the graph error enum is intentionally
+// rich and several query/graph entrypoints are parameter-heavy by design;
+// `type_complexity`: the Cypher planner uses a few expressive nested types.
+#![allow(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 mod auth;
 mod bulk;

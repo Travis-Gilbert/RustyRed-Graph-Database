@@ -147,7 +147,7 @@ fn title_from_url(url: &str) -> String {
     if let Ok(parsed) = Url::parse(url) {
         if let Some(segment) = parsed
             .path_segments()
-            .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
+            .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         {
             return segment.to_string();
         }

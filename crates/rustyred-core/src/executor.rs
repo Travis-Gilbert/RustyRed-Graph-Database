@@ -6,12 +6,17 @@ use crate::graph_store::{
     EdgeRecord, GraphStoreError, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
 };
 use crate::state::{
-    stable_hash, ContextState, PatchState, RunState, StepState, RustyredEdge, RustyredNode, RustyredState,
+    stable_hash, ContextState, PatchState, RunState, RustyredEdge, RustyredNode, RustyredState,
+    StepState,
 };
 use crate::store::RustyredStore;
 
 pub trait RustyredExecutor {
-    fn execute(&mut self, command: RustyredCommand, args: Value) -> RustyredResult<RustyredResponse>;
+    fn execute(
+        &mut self,
+        command: RustyredCommand,
+        args: Value,
+    ) -> RustyredResult<RustyredResponse>;
     fn execute_request(&mut self, request: RustyredRequest) -> RustyredResponse;
     fn state(&self) -> &RustyredState;
 }
@@ -489,7 +494,11 @@ impl<S: RustyredStore> StoreBackedRustyredExecutor<S> {
 }
 
 impl RustyredExecutor for InMemoryRustyredExecutor {
-    fn execute(&mut self, command: RustyredCommand, args: Value) -> RustyredResult<RustyredResponse> {
+    fn execute(
+        &mut self,
+        command: RustyredCommand,
+        args: Value,
+    ) -> RustyredResult<RustyredResponse> {
         Ok(match command {
             RustyredCommand::RunBegin => self.run_begin(args),
             RustyredCommand::RunStep => self.run_step(args),
@@ -515,9 +524,9 @@ impl RustyredExecutor for InMemoryRustyredExecutor {
     fn execute_request(&mut self, request: RustyredRequest) -> RustyredResponse {
         let command_name = request.command.clone();
         match RustyredCommand::from_name(&request.command) {
-            Ok(command) => self
-                .execute(command, request.args)
-                .unwrap_or_else(|error| RustyredResponse::err(command_name, error, self.state_hash())),
+            Ok(command) => self.execute(command, request.args).unwrap_or_else(|error| {
+                RustyredResponse::err(command_name, error, self.state_hash())
+            }),
             Err(error) => RustyredResponse::err(command_name, error, self.state_hash()),
         }
     }
@@ -528,7 +537,11 @@ impl RustyredExecutor for InMemoryRustyredExecutor {
 }
 
 impl<S: RustyredStore> RustyredExecutor for StoreBackedRustyredExecutor<S> {
-    fn execute(&mut self, command: RustyredCommand, args: Value) -> RustyredResult<RustyredResponse> {
+    fn execute(
+        &mut self,
+        command: RustyredCommand,
+        args: Value,
+    ) -> RustyredResult<RustyredResponse> {
         let response = self.inner.execute(command, args)?;
         if response.ok {
             self.persist();
@@ -539,9 +552,9 @@ impl<S: RustyredStore> RustyredExecutor for StoreBackedRustyredExecutor<S> {
     fn execute_request(&mut self, request: RustyredRequest) -> RustyredResponse {
         let command_name = request.command.clone();
         match RustyredCommand::from_name(&request.command) {
-            Ok(command) => self
-                .execute(command, request.args)
-                .unwrap_or_else(|error| RustyredResponse::err(command_name, error, self.state_hash())),
+            Ok(command) => self.execute(command, request.args).unwrap_or_else(|error| {
+                RustyredResponse::err(command_name, error, self.state_hash())
+            }),
             Err(error) => RustyredResponse::err(command_name, error, self.state_hash()),
         }
     }
@@ -849,8 +862,10 @@ mod tests {
             RustyredCommand::GraphNeighbors.name(),
             json!({ "node_id": "node:a", "direction": "out" }),
         ));
-        let verify =
-            executor.execute_request(RustyredRequest::new(RustyredCommand::GraphVerify.name(), json!({})));
+        let verify = executor.execute_request(RustyredRequest::new(
+            RustyredCommand::GraphVerify.name(),
+            json!({}),
+        ));
         let rebuild = executor.execute_request(RustyredRequest::new(
             RustyredCommand::GraphRebuildIndexes.name(),
             json!({}),

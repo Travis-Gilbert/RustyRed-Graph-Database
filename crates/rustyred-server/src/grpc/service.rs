@@ -191,7 +191,7 @@ fn properties_to_proto(value: &Value) -> proto::PropertyMap {
                 .map(|(key, value)| (key.clone(), property_to_proto(value)))
                 .collect()
         })
-        .unwrap_or_else(HashMap::new);
+        .unwrap_or_default();
     proto::PropertyMap { properties }
 }
 

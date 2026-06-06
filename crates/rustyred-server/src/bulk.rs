@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use rustyred_core::{EdgeRecord, NodeRecord};
+use serde_json::{json, Value};
 
 /// Buffers byte chunks across an HTTP streaming body and emits complete
 /// newline-delimited lines as they become available.

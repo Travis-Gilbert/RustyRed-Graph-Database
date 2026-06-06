@@ -700,7 +700,7 @@ fn parse_value(
     pair: Pair<Rule>,
     params: &BTreeMap<String, Value>,
 ) -> Result<Value, QuerySurfaceError> {
-    for inner in pair.into_inner() {
+    if let Some(inner) = pair.into_inner().next() {
         return match inner.as_rule() {
             Rule::param => {
                 let name = inner.as_str().trim_start_matches('$').to_string();

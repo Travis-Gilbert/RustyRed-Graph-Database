@@ -1,3 +1,7 @@
+// `result_large_err`/`too_many_arguments`: mirrors rustyred-core; the shared
+// error enum is rich and several adapter calls are parameter-heavy by design.
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
 use std::collections::HashMap;
 
 use rustyred_core::{

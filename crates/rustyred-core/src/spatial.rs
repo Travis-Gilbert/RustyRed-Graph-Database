@@ -196,6 +196,83 @@ pub(crate) fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * r_km * a.sqrt().asin()
 }
 
+// §P8-A pa8.1: SpatialBackend trait impl for the default (H3) index. Signature
+// matches the existing inherent `upsert`/`remove`/etc., minus the cell-return
+// detail (the trait returns `()`).
+impl SpatialBackend for SpatialIndex {
+    fn designation(&self) -> &SpatialDesignation {
+        &self.designation
+    }
+
+    fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError> {
+        SpatialIndex::upsert(self, node_id, lat, lon).map(|_| ())
+    }
+
+    fn remove(&mut self, node_id: &str) {
+        SpatialIndex::remove(self, node_id);
+    }
+
+    fn radius_search(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> Result<Vec<String>, SpatialError> {
+        SpatialIndex::radius_search(self, lat, lon, radius_km)
+    }
+
+    fn bbox_search(&self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Vec<String> {
+        SpatialIndex::bbox_search(self, min_lat, min_lon, max_lat, max_lon)
+    }
+
+    fn node_count(&self) -> usize {
+        self.node_to_cell.len()
+    }
+}
+
+/// §P8-A pa8.3: env-switch factory. Reads `RUSTY_RED_SPATIAL_BACKEND` and
+/// forwards to the pure dispatcher below.
+pub fn make_spatial_backend(
+    designation: SpatialDesignation,
+) -> Result<Box<dyn SpatialBackend>, SpatialError> {
+    let raw = std::env::var(RUSTY_RED_SPATIAL_BACKEND_ENV).unwrap_or_default();
+    make_spatial_backend_from_value(designation, &raw)
+}
+
+/// Pure dispatcher: takes the env-var value as an explicit parameter so unit
+/// tests can run in parallel without mutating global state. Default ("" /
+/// "h3" / "hand_rolled" / "hand-rolled") returns the H3 impl. `"s2"` returns
+/// the S2 impl when compiled with `--features s2`; otherwise an explicit
+/// error so the caller knows to rebuild.
+pub fn make_spatial_backend_from_value(
+    designation: SpatialDesignation,
+    raw: &str,
+) -> Result<Box<dyn SpatialBackend>, SpatialError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | SPATIAL_BACKEND_H3 | "hand_rolled" | "hand-rolled" => {
+            Ok(Box::new(SpatialIndex::for_designation(designation)))
+        }
+        SPATIAL_BACKEND_S2 => {
+            #[cfg(feature = "s2")]
+            {
+                Ok(Box::new(crate::spatial_s2::S2SpatialBackend::new(
+                    designation,
+                )))
+            }
+            #[cfg(not(feature = "s2"))]
+            {
+                let _ = designation;
+                Err(SpatialError::UnknownBackend(
+                    "s2 backend requires building with --features s2".to_string(),
+                ))
+            }
+        }
+        other => Err(SpatialError::UnknownBackend(format!(
+            "unknown {RUSTY_RED_SPATIAL_BACKEND_ENV} value: {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,82 +397,5 @@ mod tests {
             .expect_err("s2 backend without feature should error");
         assert_eq!(err.code(), "unknown_spatial_backend");
         assert!(err.message().to_ascii_lowercase().contains("s2"));
-    }
-}
-
-// §P8-A pa8.1: SpatialBackend trait impl for the default (H3) index. Signature
-// matches the existing inherent `upsert`/`remove`/etc., minus the cell-return
-// detail (the trait returns `()`).
-impl SpatialBackend for SpatialIndex {
-    fn designation(&self) -> &SpatialDesignation {
-        &self.designation
-    }
-
-    fn upsert(&mut self, node_id: &str, lat: f64, lon: f64) -> Result<(), SpatialError> {
-        SpatialIndex::upsert(self, node_id, lat, lon).map(|_| ())
-    }
-
-    fn remove(&mut self, node_id: &str) {
-        SpatialIndex::remove(self, node_id);
-    }
-
-    fn radius_search(
-        &self,
-        lat: f64,
-        lon: f64,
-        radius_km: f64,
-    ) -> Result<Vec<String>, SpatialError> {
-        SpatialIndex::radius_search(self, lat, lon, radius_km)
-    }
-
-    fn bbox_search(&self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Vec<String> {
-        SpatialIndex::bbox_search(self, min_lat, min_lon, max_lat, max_lon)
-    }
-
-    fn node_count(&self) -> usize {
-        self.node_to_cell.len()
-    }
-}
-
-/// §P8-A pa8.3: env-switch factory. Reads `RUSTY_RED_SPATIAL_BACKEND` and
-/// forwards to the pure dispatcher below.
-pub fn make_spatial_backend(
-    designation: SpatialDesignation,
-) -> Result<Box<dyn SpatialBackend>, SpatialError> {
-    let raw = std::env::var(RUSTY_RED_SPATIAL_BACKEND_ENV).unwrap_or_default();
-    make_spatial_backend_from_value(designation, &raw)
-}
-
-/// Pure dispatcher: takes the env-var value as an explicit parameter so unit
-/// tests can run in parallel without mutating global state. Default ("" /
-/// "h3" / "hand_rolled" / "hand-rolled") returns the H3 impl. `"s2"` returns
-/// the S2 impl when compiled with `--features s2`; otherwise an explicit
-/// error so the caller knows to rebuild.
-pub fn make_spatial_backend_from_value(
-    designation: SpatialDesignation,
-    raw: &str,
-) -> Result<Box<dyn SpatialBackend>, SpatialError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | SPATIAL_BACKEND_H3 | "hand_rolled" | "hand-rolled" => {
-            Ok(Box::new(SpatialIndex::for_designation(designation)))
-        }
-        SPATIAL_BACKEND_S2 => {
-            #[cfg(feature = "s2")]
-            {
-                Ok(Box::new(crate::spatial_s2::S2SpatialBackend::new(
-                    designation,
-                )))
-            }
-            #[cfg(not(feature = "s2"))]
-            {
-                let _ = designation;
-                Err(SpatialError::UnknownBackend(
-                    "s2 backend requires building with --features s2".to_string(),
-                ))
-            }
-        }
-        other => Err(SpatialError::UnknownBackend(format!(
-            "unknown {RUSTY_RED_SPATIAL_BACKEND_ENV} value: {other}"
-        ))),
     }
 }

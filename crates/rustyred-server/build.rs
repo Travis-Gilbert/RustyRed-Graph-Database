@@ -22,8 +22,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vendored_root = workspace_root.join("vendor").join("proto");
     let submodule_root = workspace_root.join("proto");
 
-    let vendored_proto = vendored_root.join("rustyred").join("v1").join("rustyred.proto");
-    let submodule_proto = submodule_root.join("rustyred").join("v1").join("rustyred.proto");
+    let vendored_proto = vendored_root
+        .join("rustyred")
+        .join("v1")
+        .join("rustyred.proto");
+    let submodule_proto = submodule_root
+        .join("rustyred")
+        .join("v1")
+        .join("rustyred.proto");
 
     // Re-run if either source changes. cargo:rerun-if-changed is additive
     // and tolerates missing paths, so listing both is safe. Emit before

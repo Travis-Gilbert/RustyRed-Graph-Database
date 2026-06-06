@@ -909,9 +909,8 @@ pub fn build_web_commons_ingest_plan(
         .collect::<BTreeMap<_, _>>();
     let accepted_pages = disposition_by_page
         .iter()
-        .filter_map(|(page_id, disposition)| {
-            (disposition.disposition != "dropped").then(|| page_id.clone())
-        })
+        .filter(|&(_page_id, disposition)| disposition.disposition != "dropped")
+        .map(|(page_id, _disposition)| page_id.clone())
         .collect::<BTreeSet<_>>();
     let page_by_id = fragment
         .pages

@@ -807,7 +807,7 @@ fn ingest_web_commons_fragment(
             .into_response();
     }
     let transaction =
-        match commit_batch_with_indexes(&state, &tenant_id, &mut store, plan.batch.clone()) {
+        match commit_batch_with_indexes(state, tenant_id, &mut store, plan.batch.clone()) {
             Ok(transaction) => transaction,
             Err(error) => return graph_store_error_response(error),
         };
@@ -3001,7 +3001,7 @@ fn cache_state_hash(
 ) -> String {
     cache
         .stats(graph_version)
-        .map(|stats| stable_hash(stats))
+        .map(stable_hash)
         .unwrap_or_else(|_| format!("cache:unavailable:{graph_version}"))
 }
 
@@ -3741,7 +3741,7 @@ fn flush_node_batch(
     if pending.is_empty() {
         return;
     }
-    let snapshot: Vec<(usize, rustyred_core::NodeRecord)> = pending.drain(..).collect();
+    let snapshot: Vec<(usize, rustyred_core::NodeRecord)> = std::mem::take(pending);
     let mutations: Vec<rustyred_core::GraphMutation> = snapshot
         .iter()
         .map(|(_, node)| rustyred_core::GraphMutation::NodeUpsert(node.clone()))
@@ -3944,7 +3944,7 @@ fn flush_edge_batch(
     if pending.is_empty() {
         return;
     }
-    let snapshot: Vec<(usize, rustyred_core::EdgeRecord)> = pending.drain(..).collect();
+    let snapshot: Vec<(usize, rustyred_core::EdgeRecord)> = std::mem::take(pending);
     let mutations: Vec<rustyred_core::GraphMutation> = snapshot
         .iter()
         .map(|(_, edge)| rustyred_core::GraphMutation::EdgeUpsert(edge.clone()))
@@ -4668,13 +4668,7 @@ mod tests {
     };
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
-        serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap()
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
 
     fn memory_product_state() -> AppState {

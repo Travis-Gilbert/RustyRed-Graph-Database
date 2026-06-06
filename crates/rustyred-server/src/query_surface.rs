@@ -1026,9 +1026,9 @@ pub fn parse_tx_cypher_mutations(
         }
     }
     if upper.starts_with("CREATE ") {
-        parse_tx_create_mutation(&normalized["CREATE ".len()..].trim(), params)
+        parse_tx_create_mutation(normalized["CREATE ".len()..].trim(), params)
     } else if upper.starts_with("MERGE ") {
-        parse_tx_create_mutation(&normalized["MERGE ".len()..].trim(), params)
+        parse_tx_create_mutation(normalized["MERGE ".len()..].trim(), params)
     } else {
         Err(QuerySurfaceError::unsupported(
             "tx_mode",
@@ -1688,13 +1688,7 @@ fn parse_tx_create_node(
         &mut pattern.properties,
     )?;
     let labels = pattern.label.into_iter().collect::<Vec<_>>();
-    let properties = Value::Object(
-        pattern
-            .properties
-            .into_iter()
-            .map(|(key, value)| (key, value))
-            .collect(),
-    );
+    let properties = Value::Object(pattern.properties.into_iter().collect());
     Ok(GraphMutationBatch::new([GraphMutation::NodeUpsert(
         NodeRecord::new(id, labels, properties),
     )]))
@@ -1730,21 +1724,16 @@ fn parse_tx_create_relationship(
     let mut right_pattern = parse_node_pattern(&format!("({right}"), params)?;
     let from_id = extract_required_id(
         "left node",
-        &left_pattern.label.as_deref().unwrap_or("<unknown>"),
+        left_pattern.label.as_deref().unwrap_or("<unknown>"),
         &mut left_pattern.properties,
     )?;
     let to_id = extract_required_id(
         "right node",
-        &right_pattern.label.as_deref().unwrap_or("<unknown>"),
+        right_pattern.label.as_deref().unwrap_or("<unknown>"),
         &mut right_pattern.properties,
     )?;
 
-    let edge_properties = Value::Object(
-        edge_properties
-            .into_iter()
-            .map(|(key, value)| (key, value))
-            .collect(),
-    );
+    let edge_properties = Value::Object(edge_properties.into_iter().collect());
     Ok(GraphMutationBatch::new([GraphMutation::EdgeUpsert(
         EdgeRecord::new(edge_id, from_id, edge_type, to_id, edge_properties),
     )]))

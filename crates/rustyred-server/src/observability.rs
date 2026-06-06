@@ -75,10 +75,13 @@ impl Histogram {
         }
     }
 
+    // Retained as part of the Histogram metric API surface.
+    #[allow(dead_code)]
     pub fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn sum_nanos(&self) -> u64 {
         self.sum_nanos.load(Ordering::Relaxed)
     }

@@ -3,6 +3,12 @@
 //! This crate has no Python or network-server dependencies. The standalone
 //! helper crate, MCP adapter, and HTTP server call this same executor.
 
+// `result_large_err`: GraphStoreError is intentionally rich (it carries context
+// used for HTTP/MCP error mapping); boxing it to shrink Result is a post-0.9.1
+// cleanup. `too_many_arguments`: several graph entrypoints (e.g. hybrid_search)
+// take many parameters by design.
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
 pub mod commands;
 pub mod errors;
 pub mod executor;

@@ -5,8 +5,8 @@
 //! of the post-MATCH state and are resolved by the executor in router.rs;
 //! they show up as empty entries here.
 
-use serde_json::{json, Map, Value};
 use rustyred_core::{EdgeRecord, GraphMutation, GraphMutationBatch, NodeRecord};
+use serde_json::{json, Map, Value};
 
 use crate::cypher::ast::{EdgePattern, NodePattern, WriteClause};
 use crate::query_surface::QuerySurfaceError;

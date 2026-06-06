@@ -232,17 +232,13 @@ pub struct GraphCheckoutResult {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum GraphMergeStrategy {
+    #[default]
     AutoConfidence,
     PreferOurs,
     PreferTheirs,
     Manual,
-}
-
-impl Default for GraphMergeStrategy {
-    fn default() -> Self {
-        Self::AutoConfidence
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -787,13 +783,10 @@ fn parent_nodes(children: &[GraphTreeNode], level: u32) -> Vec<GraphTreeNode> {
     chunk_by_boundary(descriptors, |chunk| make_parent_node(level, chunk.to_vec()))
 }
 
-fn chunk_by_boundary<T: Clone>(
+fn chunk_by_boundary<T: Clone + Serialize>(
     items: Vec<T>,
     make_node: impl Fn(&[T]) -> GraphTreeNode,
-) -> Vec<GraphTreeNode>
-where
-    T: Serialize,
-{
+) -> Vec<GraphTreeNode> {
     let mut nodes = Vec::new();
     let mut chunk = Vec::new();
     for item in items {
@@ -1023,6 +1016,9 @@ impl MergeRecord {
     }
 }
 
+// `Resolved` legitimately carries more than `Conflict`; this private enum is not
+// stored in bulk, so the size difference is not worth a Box indirection.
+#[allow(clippy::large_enum_variant)]
 enum MergeDecision {
     Resolved {
         selected: Option<GraphMergeSide>,

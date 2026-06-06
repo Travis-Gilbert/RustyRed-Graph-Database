@@ -47,7 +47,9 @@ impl RustyredCommand {
             "RUSTYRED.GRAPH.NEIGHBORS" => Ok(Self::GraphNeighbors),
             "RUSTYRED.GRAPH.STATS" => Ok(Self::GraphStats),
             "RUSTYRED.GRAPH.VERIFY" => Ok(Self::GraphVerify),
-            "RUSTYRED.GRAPH.REBUILD_INDEXES" | "RUSTYRED.GRAPH.REBUILD" => Ok(Self::GraphRebuildIndexes),
+            "RUSTYRED.GRAPH.REBUILD_INDEXES" | "RUSTYRED.GRAPH.REBUILD" => {
+                Ok(Self::GraphRebuildIndexes)
+            }
             _ => Err(RustyredError::unsupported_command(name)),
         }
     }
@@ -126,7 +128,11 @@ impl RustyredResponse {
         }
     }
 
-    pub fn err(command: impl Into<String>, error: RustyredError, state_hash: impl Into<String>) -> Self {
+    pub fn err(
+        command: impl Into<String>,
+        error: RustyredError,
+        state_hash: impl Into<String>,
+    ) -> Self {
         Self {
             ok: false,
             command: command.into(),
