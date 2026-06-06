@@ -1,6 +1,6 @@
 # RustyRed GraphDB — Technical Documentation
 
-Technical reference for **RustyRed GraphDB `0.6.0`**, derived from the source tree rather than
+Technical reference for **RustyRed GraphDB `0.9.1`**, derived from the source tree rather than
 marketing copy. Two audiences are covered:
 
 - **Integration developers** — building against the HTTP, gRPC, or MCP surfaces.
@@ -28,11 +28,12 @@ sidecar required.
 
 ## At a glance
 
-- **Latest version:** `0.6.0` (workspace `Cargo.toml`), Rust edition 2021, MSRV 1.85.
+- **Latest version:** `0.9.1` (workspace `Cargo.toml` `[workspace.package]`; every crate inherits it), Rust edition 2021, MSRV 1.85.
 - **Default storage mode:** `embedded` (RedCore native engine; in-memory graph + AOF + snapshots).
 - **Default HTTP/gRPC port:** `8380` (HTTP and gRPC share one listener).
 - **Default RESP port:** `6380` (experimental scaffold — see [Architecture](architecture.md)).
-- **Auth:** Bearer tokens with scopes; `RUSTY_RED_REQUIRE_AUTH` defaults to **true**.
+- **Auth:** Bearer tokens with scopes; `RUSTY_RED_REQUIRE_AUTH` defaults to **true**. With auth on and no tokens configured, the server refuses to boot (fail-fast) rather than rejecting every request.
+- **Benchmarks:** ingest rate and PPR latency, measured and reproducible — see [Benchmarks](../benchmarks.md).
 - **On-disk format version:** `1` (`CURRENT_FORMAT_VERSION`); migrate with `rustyred-upgrade-format`.
 
 > Source of truth for configuration is `crates/rustyred-server/src/config.rs`; for the data model,

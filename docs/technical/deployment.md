@@ -20,11 +20,11 @@ The image ships **security-by-default** environment values: `RUSTY_RED_REQUIRE_A
 `RUSTY_RED_MCP_ALLOW_ADMIN=false`, and `RUSTY_RED_HOST=[::]`.
 
 ```bash
-docker build -t rustyred:0.6.0 .
+docker build -t rustyred:0.9.1 .
 docker run -p 8380:8380 \
   -e RUSTY_RED_API_TOKENS="$(openssl rand -hex 32)=*" \
   -e RUSTY_RED_REQUIRE_VOLUME=false \
-  rustyred:0.6.0
+  rustyred:0.9.1
 ```
 
 > `RUSTY_RED_REQUIRE_VOLUME` is `true` in the image. For a throwaway local run without a volume,

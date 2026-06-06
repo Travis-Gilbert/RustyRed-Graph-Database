@@ -1,14 +1,16 @@
 # RustyRed GraphDB
 
-RustyRed is a remarkably fast Graph + Vector database.
-It runs entirely in RAM.
-Designed to help humans and their agents work well together.
+**The graph + vector database your AI agent can drive natively.** MCP built in — read-only by default, scoped tokens, 30+ tools. Deploy in one click.
 
-Current public release: `0.6.0`.
+RustyRed is an in-memory graph **and** vector database built so humans and their agents work the same graph. It exposes a first-class [Model Context Protocol](docs/technical/mcp.md) port alongside HTTP and gRPC on one listener: point an agent at `/mcp` and it can query, traverse, search, and reason — no glue code, no ORM, no second service.
 
-Featuring GraphCache graph state-aware cache, a first-class MCP agent port, built-in-RAG both graph and vector
-multi-tenancy, HNSW vector search, confidence-weighted epistemic edges, and document storage.
-Written in Rust, the best way to write a database. In my humble opinion.
+Current public release: `0.9.1`.
+
+Under the hood: a RAM-first store with append-only-file + snapshot durability, HNSW vector search, BM25 full-text, H3 spatial indexing, confidence-weighted epistemic edges (Supports / Contradicts / Tension / Derives / Cites), a graph-state-aware cache, a bounded Cypher surface, and Git-like content-addressed version packs. Multi-tenant data namespacing — run one instance per security boundary. Written in Rust, the best way to write a database. In my humble opinion.
+
+<!-- BENCH_HEADLINE_START -->
+**Measured, not asserted.** On a 20,000-node / 40,000-edge graph (Apple Silicon, release build, loopback HTTP), RustyRed sustains **~8,300 node upserts/sec** through the bulk loader and answers Personalized PageRank in **27 ms median** (p95 42 ms), full round trip. Numbers are reproducible with a one-command harness — see [Benchmarks](docs/benchmarks.md).
+<!-- BENCH_HEADLINE_END -->
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/rustyred-graphdb?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
 
@@ -50,6 +52,67 @@ curl -H "Authorization: Bearer <your-token>" \
 ```
 
 For the full operator guide — backups, scaling, upgrade path, troubleshooting — see [docs/railway-template.md](docs/railway-template.md).
+
+### Connect your agent (MCP)
+
+RustyRed serves a Model Context Protocol port at `/mcp` over streamable HTTP. The default token is read-only (`graph:read`), so an agent can query but not mutate until you hand it a `graph:write` token.
+
+Add it to **Claude Desktop**, **Cursor**, or any client that takes an `mcpServers` block:
+
+```json
+{
+  "mcpServers": {
+    "rustyred": {
+      "url": "https://<your-service>.up.railway.app/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+**Claude Code** (one line):
+
+```bash
+claude mcp add --transport http rustyred \
+  https://<your-service>.up.railway.app/mcp \
+  --header "Authorization: Bearer <your-token>"
+```
+
+For a client that only speaks stdio MCP, bridge with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote): `npx mcp-remote https://<your-service>.up.railway.app/mcp --header "Authorization: Bearer <your-token>"`.
+
+The tool catalog (graph reads, vector/fulltext/spatial search, epistemic traversal, the four graph algorithms, version packs) is listed under [MCP tools](#mcp-tools) and documented in [docs/technical/mcp.md](docs/technical/mcp.md).
+
+### First 60 seconds
+
+Five HTTP calls that go from empty to a vector search and a graph-algorithm result. Set `BASE` to your service URL and `TOKEN` to a `graph:write` token, then paste:
+
+```bash
+BASE=https://<your-service>.up.railway.app
+AUTH="Authorization: Bearer <your-token>"
+JSON="Content-Type: application/json"
+
+# 1 & 2 — create two claims, each carrying a 4-dim embedding property
+curl -s -X POST "$BASE/v1/tenants/demo/graph/nodes" -H "$AUTH" -H "$JSON" \
+  -d '{"id":"claim:water","labels":["Claim"],"properties":{"text":"Water boils at 100C","embedding":[0.90,0.10,0.00,0.20]}}'
+curl -s -X POST "$BASE/v1/tenants/demo/graph/nodes" -H "$AUTH" -H "$JSON" \
+  -d '{"id":"claim:steam","labels":["Claim"],"properties":{"text":"Steam is vaporized water","embedding":[0.85,0.15,0.05,0.18]}}'
+
+# 3 — connect them with a confidence-weighted epistemic edge
+curl -s -X POST "$BASE/v1/tenants/demo/graph/edges" -H "$AUTH" -H "$JSON" \
+  -d '{"id":"e:1","from_id":"claim:steam","to_id":"claim:water","type":"SUPPORTS","confidence":0.9,"epistemic_type":"supports"}'
+
+# 4 — register the embedding property as a 4-dim HNSW vector index, then search
+curl -s -X POST "$BASE/v1/tenants/demo/graph/vector/designate" -H "$AUTH" -H "$JSON" \
+  -d '{"label":"Claim","property":"embedding","dimension":4}'
+curl -s -X POST "$BASE/v1/tenants/demo/graph/vector/search" -H "$AUTH" -H "$JSON" \
+  -d '{"label":"Claim","property":"embedding","k":5,"query":[0.90,0.10,0.00,0.20]}'
+
+# 5 — Personalized PageRank seeded on one node
+curl -s -X POST "$BASE/v1/tenants/demo/graph/algorithms/ppr" -H "$AUTH" -H "$JSON" \
+  -d '{"seeds":{"claim:water":1.0},"top_k":10}'
+```
 
 ### Manual Railway deploy (without the template)
 
@@ -170,6 +233,8 @@ These are on the roadmap, in roughly this priority order:
 5. CSV/JSONL `LOAD CSV` syntactic form (JSONL bulk endpoints exist already)
 6. Distributed snapshot replication
 7. Per-query spatial backend selection; H3 ships by default and S2 is available behind the `s2` feature plus `RUSTY_RED_SPATIAL_BACKEND=s2`
+8. Edge / relationship vector indexes — vector search is node-only today. `EdgeRecord` already carries properties, so this is index-and-search work, not a data-model change; reifying a relationship into a node already gets it covered.
+9. Expanded durability and crash-recovery test coverage — AOF replay, snapshot integrity, and concurrency tests promoted into a top-level suite
 
 ### Crate structure
 
@@ -213,13 +278,25 @@ The product server runs in `RUSTY_RED_MODE=embedded` with RedCore RAM-first stor
 Run the product server locally:
 
 ```bash
-RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
+RUSTY_RED_REQUIRE_AUTH=false RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
 ```
+
+> Local examples set `RUSTY_RED_REQUIRE_AUTH=false`. With auth on (the shipped default) the server now refuses to start unless `RUSTY_RED_API_TOKENS` is also set — a `REQUIRE_AUTH=true` instance with no tokens can authenticate no one, so it fails fast instead of 403ing every request. Generate a token with `openssl rand -hex 32`.
 
 For low-memory local builds, cap Cargo's parallel compiler jobs:
 
 ```bash
-CARGO_BUILD_JOBS=2 RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
+CARGO_BUILD_JOBS=2 RUSTY_RED_REQUIRE_AUTH=false RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-server
+```
+
+Kick the tires with the published image — ephemeral, no volume, no auth, data discarded on exit (available once the image is published per [RELEASING.md](RELEASING.md)):
+
+```bash
+docker run --rm -p 8380:8380 \
+  -e RUSTY_RED_REQUIRE_VOLUME=false \
+  -e RUSTY_RED_DURABILITY=none \
+  -e RUSTY_RED_REQUIRE_AUTH=false \
+  ghcr.io/travis-gilbert/rustyred:latest
 ```
 
 For a low-memory local Docker build and run:
@@ -237,6 +314,7 @@ docker run --rm \
 Strict local durability mode is explicit:
 
 ```bash
+RUSTY_RED_REQUIRE_AUTH=false \
 RUSTY_RED_MODE=embedded \
 RUSTY_RED_CONCURRENCY=single_writer \
 RUSTY_RED_TXN_ISOLATION=serializable \
@@ -385,7 +463,7 @@ let adjacency = HashMap::from([
 let seeds = HashMap::from([(0, 1.0)]);
 
 let scores = rusty_red_native::push_ppr(&adjacency, &seeds, 0.15, 1e-4, 200_000);
-assert_eq!(rusty_red_native::VERSION, "0.6.0");
+assert_eq!(rusty_red_native::VERSION, "0.9.1");
 ```
 
 ### Downstream integrations
