@@ -31,6 +31,11 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[features]
+default = []
+geometry = ["rustyred-core/geometry", "rustyred-mcp/geometry"]
+s2 = ["rustyred-core/s2", "rustyred-mcp/s2"]
+
 [build-dependencies]
 tonic-build = "0.12"
 

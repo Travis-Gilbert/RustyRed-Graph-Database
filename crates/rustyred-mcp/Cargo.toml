@@ -10,6 +10,8 @@ publish = false
 [features]
 default = []
 redis-store = ["rustyred-core/redis-store"]
+geometry = ["rustyred-core/geometry"]
+s2 = ["rustyred-core/s2"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

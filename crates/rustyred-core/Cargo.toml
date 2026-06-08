@@ -18,9 +18,13 @@ tantivy = ["dep:tantivy"]
 # §P8-A pa8.1+pa8.2: S2 cells as alternative spatial backend behind
 # RUSTY_RED_SPATIAL_BACKEND=s2. Default builds keep H3.
 s2 = ["dep:s2"]
+geometry = ["dep:geo", "dep:geo-types", "dep:geozero"]
 
 [dependencies]
 fs2 = "0.4"
+geo = { version = "0.32.0", optional = true }
+geo-types = { version = "0.7.19", optional = true }
+geozero = { version = "0.15.1", default-features = false, features = ["with-geo", "with-wkb", "with-wkt"], optional = true }
 h3o = "0.7"
 instant-distance = "0.6.1"
 redis = { version = "0.27", optional = true }

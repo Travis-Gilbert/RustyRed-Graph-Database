@@ -68,6 +68,7 @@ service GraphDatabase {
   rpc SpatialRadius(SpatialRadiusRequest) returns (SpatialResponse);
   rpc SpatialBoundingBox(SpatialBboxRequest) returns (SpatialResponse);
   rpc DesignateSpatialProperty(DesignateSpatialRequest) returns (DesignateAck);
+  rpc ExecutePluginOperation(PluginOperationRequest) returns (PluginOperationResponse);
 
   // ---- Epistemic traversal -------------------------------------------------
   rpc EpistemicNeighbors(EpistemicNeighborsRequest) returns (EpistemicNeighborsResponse);
@@ -433,6 +434,16 @@ message DesignateSpatialRequest {
   string tenant_id = 1;
   string label = 2;
   string property_name = 3;
+}
+
+message PluginOperationRequest {
+  string tenant_id = 1;
+  string operation = 2;
+  string args_json = 3;
+}
+
+message PluginOperationResponse {
+  string result_json = 1;
 }
 
 

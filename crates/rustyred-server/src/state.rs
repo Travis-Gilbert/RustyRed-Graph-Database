@@ -15,8 +15,12 @@ use rustyred_core::{
     NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
+#[cfg(feature = "geometry")]
+use rustyred_core::{GeometryDesignation, GeometryEncoding, GeometryIndex};
 use rustyred_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
 use serde_json::json;
+#[cfg(feature = "geometry")]
+use serde_json::Value;
 
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
@@ -40,6 +44,9 @@ type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), Box<dy
 /// (label, property).
 type FullTextIndexes = BTreeMap<String, BTreeMap<(String, String), Box<dyn FullTextBackend>>>;
 
+#[cfg(feature = "geometry")]
+type GeometryIndexes = BTreeMap<String, BTreeMap<(String, String), GeometryIndex>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -50,6 +57,8 @@ pub struct AppState {
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
+    #[cfg(feature = "geometry")]
+    geometry_indexes: Arc<Mutex<GeometryIndexes>>,
 }
 
 impl AppState {
@@ -68,6 +77,8 @@ impl AppState {
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(feature = "geometry")]
+            geometry_indexes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -329,6 +340,125 @@ impl AppState {
         Ok(index.bbox_search(min_lat, min_lon, max_lat, max_lon))
     }
 
+    #[cfg(feature = "geometry")]
+    pub fn designate_geometry_property(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        property: &str,
+        encoding: GeometryEncoding,
+        resolution: u8,
+    ) -> Result<(), StoreAccessError> {
+        if !(0..=15).contains(&resolution) {
+            return Err(StoreAccessError::unsupported(format!(
+                "geometry resolution {resolution} is outside 0..=15"
+            )));
+        }
+        let store = self.tenant_graph_store(tenant_id)?;
+        let designation = GeometryDesignation::property(
+            label.to_string(),
+            property.to_string(),
+            encoding,
+            resolution,
+        );
+        let mut index = GeometryIndex::new(designation)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))?;
+        let nodes = store
+            .query_nodes(NodeQuery {
+                label: Some(label.to_string()),
+                ..NodeQuery::default()
+            })
+            .map_err(StoreAccessError::from)?;
+        for node in nodes {
+            let _ = index.upsert_from_properties(&node.id, &node.properties);
+        }
+        let mut indexes = self
+            .geometry_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+        indexes
+            .entry(tenant_id.to_string())
+            .or_default()
+            .insert((label.to_string(), property.to_string()), index);
+        Ok(())
+    }
+
+    #[cfg(feature = "geometry")]
+    pub fn maybe_index_node_geometry(&self, tenant_id: &str, node: &NodeRecord) {
+        let Ok(mut indexes) = self.geometry_indexes.lock() else {
+            return;
+        };
+        let Some(tenant_map) = indexes.get_mut(tenant_id) else {
+            return;
+        };
+        for ((label, _property), index) in tenant_map.iter_mut() {
+            if !node.labels.iter().any(|node_label| node_label == label) {
+                continue;
+            }
+            match index.upsert_from_properties(&node.id, &node.properties) {
+                Ok(()) => {}
+                Err(_) => index.remove(&node.id),
+            }
+        }
+    }
+
+    #[cfg(feature = "geometry")]
+    pub fn geometry_contains_point(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        property: &str,
+        lat: f64,
+        lon: f64,
+    ) -> Result<Vec<String>, StoreAccessError> {
+        let indexes = self
+            .geometry_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+        let index = geometry_index(&indexes, tenant_id, label, property)?;
+        index
+            .contains_point(lat, lon)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))
+    }
+
+    #[cfg(feature = "geometry")]
+    pub fn geometry_intersects(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        property: &str,
+        encoding: GeometryEncoding,
+        geometry: &Value,
+    ) -> Result<Vec<String>, StoreAccessError> {
+        let indexes = self
+            .geometry_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+        let index = geometry_index(&indexes, tenant_id, label, property)?;
+        index
+            .intersects_value(encoding, geometry)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))
+    }
+
+    #[cfg(feature = "geometry")]
+    pub fn geometry_within(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        property: &str,
+        encoding: GeometryEncoding,
+        geometry: &Value,
+    ) -> Result<Vec<String>, StoreAccessError> {
+        let indexes = self
+            .geometry_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+        let index = geometry_index(&indexes, tenant_id, label, property)?;
+        index
+            .within_value(encoding, geometry)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))
+    }
+
     pub fn begin_graph_transaction(&self, tenant_id: &str) -> Result<String, StoreAccessError> {
         self.purge_expired_graph_transactions()?;
         let store = match self.tenant_graph_store(tenant_id)? {
@@ -428,9 +558,18 @@ impl AppState {
                 "graph transaction snapshot conflict",
             ));
         }
+        let committed_mutations = context.mutations.clone();
         let transaction = store
-            .commit_batch(context.mutations)
+            .commit_batch(committed_mutations.clone())
             .map_err(StoreAccessError::from)?;
+        for mutation in &committed_mutations.mutations {
+            if let GraphMutation::NodeUpsert(node) = mutation {
+                self.maybe_index_node_spatially(tenant_id, node);
+                self.maybe_index_node_fulltext(tenant_id, node);
+                #[cfg(feature = "geometry")]
+                self.maybe_index_node_geometry(tenant_id, node);
+            }
+        }
         let mut transactions = self
             .graph_transactions
             .lock()
@@ -984,6 +1123,27 @@ impl RedCoreTenantExecutor {
     }
 }
 
+#[cfg(feature = "geometry")]
+fn geometry_index<'a>(
+    indexes: &'a GeometryIndexes,
+    tenant_id: &str,
+    label: &str,
+    property: &str,
+) -> Result<&'a GeometryIndex, StoreAccessError> {
+    let Some(tenant_map) = indexes.get(tenant_id) else {
+        return Err(StoreAccessError::unsupported(
+            "no geometry designations for this tenant",
+        ));
+    };
+    tenant_map
+        .get(&(label.to_string(), property.to_string()))
+        .ok_or_else(|| {
+            StoreAccessError::unsupported(
+                "geometry designation not found; call /spatial/designate_geometry first",
+            )
+        })
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1511,6 +1671,8 @@ impl McpGraphBackend for ProductMcpBackend {
         self.state
             .maybe_index_node_spatially(&self.tenant_id, &node);
         self.state.maybe_index_node_fulltext(&self.tenant_id, &node);
+        #[cfg(feature = "geometry")]
+        self.state.maybe_index_node_geometry(&self.tenant_id, &node);
         Ok(())
     }
 
@@ -1668,6 +1830,61 @@ impl McpGraphBackend for ProductMcpBackend {
             .map_err(|error| GraphStoreError::new(error.code, error.message))
     }
 
+    #[cfg(feature = "geometry")]
+    fn designate_geometry_property(
+        &mut self,
+        label: &str,
+        property: &str,
+        encoding: &str,
+        resolution: u8,
+    ) -> GraphStoreResult<()> {
+        let encoding = parse_geometry_encoding_for_mcp(encoding)?;
+        self.state
+            .designate_geometry_property(&self.tenant_id, label, property, encoding, resolution)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    #[cfg(feature = "geometry")]
+    fn spatial_contains_point(
+        &self,
+        label: &str,
+        property: &str,
+        lat: f64,
+        lon: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        self.state
+            .geometry_contains_point(&self.tenant_id, label, property, lat, lon)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    #[cfg(feature = "geometry")]
+    fn spatial_intersects_geometry(
+        &self,
+        label: &str,
+        property: &str,
+        encoding: &str,
+        geometry: &Value,
+    ) -> GraphStoreResult<Vec<String>> {
+        let encoding = parse_geometry_encoding_for_mcp(encoding)?;
+        self.state
+            .geometry_intersects(&self.tenant_id, label, property, encoding, geometry)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
+    #[cfg(feature = "geometry")]
+    fn spatial_within_geometry(
+        &self,
+        label: &str,
+        property: &str,
+        encoding: &str,
+        geometry: &Value,
+    ) -> GraphStoreResult<Vec<String>> {
+        let encoding = parse_geometry_encoding_for_mcp(encoding)?;
+        self.state
+            .geometry_within(&self.tenant_id, label, property, encoding, geometry)
+            .map_err(|error| GraphStoreError::new(error.code, error.message))
+    }
+
     fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -1677,6 +1894,20 @@ impl McpGraphBackend for ProductMcpBackend {
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
         self.store
             .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+    }
+}
+
+#[cfg(feature = "geometry")]
+fn parse_geometry_encoding_for_mcp(raw: &str) -> GraphStoreResult<GeometryEncoding> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "point" => Ok(GeometryEncoding::Point),
+        "wkb" => Ok(GeometryEncoding::Wkb),
+        "wkt" => Ok(GeometryEncoding::Wkt),
+        "subgraph" => Ok(GeometryEncoding::Subgraph),
+        other => Err(GraphStoreError::new(
+            "invalid_geometry_encoding",
+            format!("unsupported geometry encoding: {other}"),
+        )),
     }
 }
 

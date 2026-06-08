@@ -9,10 +9,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
+use rustyred_core::executor::StoreBackedRustyredExecutor;
+#[cfg(feature = "geometry")]
+use rustyred_core::GeometryEncoding;
 use rustyred_core::{
-    connected_components, label_propagation_communities, pagerank, personalized_pagerank,
-    Direction, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch, GraphStoreError,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    builtin_plugin_registry, connected_components, label_propagation_communities, pagerank,
+    personalized_pagerank, Direction, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
+    GraphStoreError, InMemoryRustyredExecutor, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    RustyredExecutor, RustyredRequest,
 };
 use serde_json::{json, Number, Value};
 use tonic::{Request, Response, Status};
@@ -20,6 +24,7 @@ use tonic::{Request, Response, Status};
 use super::proto;
 use super::proto::graph_database_server::GraphDatabase;
 use crate::auth::require_scope;
+use crate::config::StorageMode;
 use crate::graph_cache::{GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody};
 use crate::query_surface::{
     execute_cypher_query, explain_cypher_query, parse_tx_cypher_mutations, PublicCypherBody,
@@ -317,6 +322,193 @@ fn spatial_property_pair(property_name: &str) -> Result<(String, String), Status
     Err(Status::invalid_argument(
         "spatial property_name must encode the latitude and longitude properties as \"lat,lon\"",
     ))
+}
+
+fn normalize_plugin_operation(operation: &str) -> String {
+    operation.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn plugin_operation_requires_write(operation: &str) -> bool {
+    matches!(
+        normalize_plugin_operation(operation).as_str(),
+        "designate_geometry" | "spatial_designate_geometry" | "rustyred.spatial.designate_geometry"
+    )
+}
+
+#[cfg(feature = "geometry")]
+fn required_plugin_arg_str<'a>(
+    args: &'a Value,
+    key: &str,
+    operation: &str,
+) -> Result<&'a str, Status> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Status::invalid_argument(format!("{operation} requires string arg {key}")))
+}
+
+#[cfg(feature = "geometry")]
+fn required_plugin_arg_f64(args: &Value, key: &str, operation: &str) -> Result<f64, Status> {
+    args.get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| Status::invalid_argument(format!("{operation} requires numeric arg {key}")))
+}
+
+#[cfg(feature = "geometry")]
+fn parse_geometry_encoding_for_grpc(raw: &str) -> Result<GeometryEncoding, Status> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "point" => Ok(GeometryEncoding::Point),
+        "wkb" => Ok(GeometryEncoding::Wkb),
+        "wkt" => Ok(GeometryEncoding::Wkt),
+        "subgraph" => Ok(GeometryEncoding::Subgraph),
+        other => Err(Status::invalid_argument(format!(
+            "unsupported geometry encoding: {other}"
+        ))),
+    }
+}
+
+#[cfg(feature = "geometry")]
+fn execute_geometry_plugin_operation(
+    state: &AppState,
+    tenant_id: &str,
+    operation: &str,
+    args: &Value,
+) -> Result<Option<Value>, Status> {
+    let normalized = normalize_plugin_operation(operation);
+    match normalized.as_str() {
+        "designate_geometry"
+        | "spatial_designate_geometry"
+        | "rustyred.spatial.designate_geometry" => {
+            let label = required_plugin_arg_str(args, "label", operation)?;
+            let property = required_plugin_arg_str(args, "property", operation)?;
+            let encoding = args
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkb");
+            let resolution = args
+                .get("resolution")
+                .and_then(Value::as_u64)
+                .unwrap_or(9)
+                .min(u8::MAX as u64) as u8;
+            state
+                .designate_geometry_property(
+                    tenant_id,
+                    label,
+                    property,
+                    parse_geometry_encoding_for_grpc(encoding)?,
+                    resolution,
+                )
+                .map_err(|err| state_status(operation, err))?;
+            Ok(Some(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "operation": normalized,
+                "designated": {
+                    "label": label,
+                    "property": property,
+                    "encoding": encoding,
+                    "resolution": resolution
+                }
+            })))
+        }
+        "contains" | "spatial_contains" | "rustyred.spatial.contains" => {
+            let label = required_plugin_arg_str(args, "label", operation)?;
+            let property = required_plugin_arg_str(args, "property", operation)?;
+            let lat = required_plugin_arg_f64(args, "lat", operation)?;
+            let lon = required_plugin_arg_f64(args, "lon", operation)?;
+            let node_ids = state
+                .geometry_contains_point(tenant_id, label, property, lat, lon)
+                .map_err(|err| state_status(operation, err))?;
+            Ok(Some(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "operation": normalized,
+                "count": node_ids.len(),
+                "node_ids": node_ids
+            })))
+        }
+        "intersects" | "spatial_intersects" | "rustyred.spatial.intersects" => {
+            let label = required_plugin_arg_str(args, "label", operation)?;
+            let property = required_plugin_arg_str(args, "property", operation)?;
+            let encoding = args
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkt");
+            let geometry = args.get("geometry").ok_or_else(|| {
+                Status::invalid_argument(format!("{operation} requires geometry"))
+            })?;
+            let node_ids = state
+                .geometry_intersects(
+                    tenant_id,
+                    label,
+                    property,
+                    parse_geometry_encoding_for_grpc(encoding)?,
+                    geometry,
+                )
+                .map_err(|err| state_status(operation, err))?;
+            Ok(Some(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "operation": normalized,
+                "count": node_ids.len(),
+                "node_ids": node_ids
+            })))
+        }
+        "within" | "spatial_within" | "rustyred.spatial.within" => {
+            let label = required_plugin_arg_str(args, "label", operation)?;
+            let property = required_plugin_arg_str(args, "property", operation)?;
+            let encoding = args
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkt");
+            let geometry = args.get("geometry").ok_or_else(|| {
+                Status::invalid_argument(format!("{operation} requires geometry"))
+            })?;
+            let node_ids = state
+                .geometry_within(
+                    tenant_id,
+                    label,
+                    property,
+                    parse_geometry_encoding_for_grpc(encoding)?,
+                    geometry,
+                )
+                .map_err(|err| state_status(operation, err))?;
+            Ok(Some(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "operation": normalized,
+                "count": node_ids.len(),
+                "node_ids": node_ids
+            })))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "geometry"))]
+fn execute_geometry_plugin_operation(
+    _state: &AppState,
+    _tenant_id: &str,
+    operation: &str,
+    _args: &Value,
+) -> Result<Option<Value>, Status> {
+    match normalize_plugin_operation(operation).as_str() {
+        "designate_geometry"
+        | "spatial_designate_geometry"
+        | "rustyred.spatial.designate_geometry"
+        | "contains"
+        | "spatial_contains"
+        | "rustyred.spatial.contains"
+        | "intersects"
+        | "spatial_intersects"
+        | "rustyred.spatial.intersects"
+        | "within"
+        | "spatial_within"
+        | "rustyred.spatial.within" => Err(Status::unimplemented(
+            "geometry plugin operations require building rustyred-server with --features geometry,s2",
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn epistemic_types_from_proto(values: Vec<i32>) -> Result<Option<Vec<EpistemicType>>, Status> {
@@ -691,6 +883,9 @@ impl GraphDatabase for GraphDatabaseService {
                 .maybe_index_node_fulltext(&request.tenant_id, &node);
             self.state
                 .maybe_index_node_spatially(&request.tenant_id, &node);
+            #[cfg(feature = "geometry")]
+            self.state
+                .maybe_index_node_geometry(&request.tenant_id, &node);
         } else {
             self.state
                 .append_graph_transaction_mutations(
@@ -890,6 +1085,9 @@ impl GraphDatabase for GraphDatabaseService {
                         .maybe_index_node_fulltext(&request.tenant_id, node);
                     self.state
                         .maybe_index_node_spatially(&request.tenant_id, node);
+                    #[cfg(feature = "geometry")]
+                    self.state
+                        .maybe_index_node_geometry(&request.tenant_id, node);
                 }
                 transaction.graph_version
             }
@@ -1240,6 +1438,67 @@ impl GraphDatabase for GraphDatabaseService {
         Ok(Response::new(proto::DesignateAck {
             designated: true,
             reason: String::new(),
+        }))
+    }
+
+    async fn execute_plugin_operation(
+        &self,
+        request: Request<proto::PluginOperationRequest>,
+    ) -> Result<Response<proto::PluginOperationResponse>, Status> {
+        let scope = if plugin_operation_requires_write(&request.get_ref().operation) {
+            "graph:write"
+        } else {
+            "graph:read"
+        };
+        self.require_request_scope(&request, scope)?;
+        let request = request.into_inner();
+        let args = if request.args_json.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<Value>(&request.args_json).map_err(|err| {
+                Status::invalid_argument(format!("args_json is invalid JSON: {err}"))
+            })?
+        };
+
+        if let Some(result) = execute_geometry_plugin_operation(
+            &self.state,
+            &request.tenant_id,
+            &request.operation,
+            &args,
+        )? {
+            return Ok(Response::new(proto::PluginOperationResponse {
+                result_json: result.to_string(),
+            }));
+        }
+
+        if builtin_plugin_registry()
+            .operation(&request.operation)
+            .is_none()
+        {
+            return Err(Status::invalid_argument(format!(
+                "unknown plugin operation: {}",
+                request.operation
+            )));
+        }
+
+        let response = match self.state.tenant_store(&request.tenant_id) {
+            Ok(store) => {
+                let mut executor = StoreBackedRustyredExecutor::new(store);
+                executor.execute_request(RustyredRequest::new(request.operation, args))
+            }
+            Err(_error) if self.state.config.storage_mode != StorageMode::Redis => {
+                let mut executor = InMemoryRustyredExecutor::new();
+                executor.execute_request(RustyredRequest::new(request.operation, args))
+            }
+            Err(error) => return Err(state_status("execute_plugin_operation", error)),
+        };
+        let result_json = serde_json::to_string(&response).map_err(|err| {
+            Status::internal(format!(
+                "plugin operation response serialization failed: {err}"
+            ))
+        })?;
+        Ok(Response::new(proto::PluginOperationResponse {
+            result_json,
         }))
     }
 
@@ -1769,6 +2028,76 @@ mod tests {
         assert_eq!(neighbors.neighbors[0].node.as_ref().unwrap().id, "node:b");
         assert_eq!(neighbors.neighbors[0].edge.as_ref().unwrap().id, "edge:ab");
         assert_eq!(neighbors.neighbors[0].score, 0.82);
+    }
+
+    #[cfg(feature = "geometry")]
+    #[tokio::test]
+    async fn grpc_plugin_operation_executes_geometry_and_registry_operations() {
+        let service = service_with_graph();
+
+        let designated = service
+            .execute_plugin_operation(Request::new(proto::PluginOperationRequest {
+                tenant_id: "smoke".to_string(),
+                operation: "rustyred.spatial.designate_geometry".to_string(),
+                args_json: json!({
+                    "label": "Parcel",
+                    "property": "geom",
+                    "encoding": "wkt",
+                    "resolution": 9
+                })
+                .to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let designated_payload: Value = serde_json::from_str(&designated.result_json).unwrap();
+        assert_eq!(designated_payload["ok"], true);
+
+        service
+            .upsert_node(Request::new(proto::UpsertNodeRequest {
+                tenant_id: "smoke".to_string(),
+                node: Some(proto::Node {
+                    id: "parcel:grpc".to_string(),
+                    labels: vec!["Parcel".to_string()],
+                    properties: Some(properties_to_proto(&json!({
+                        "geom": "POLYGON((0 0,4 0,4 4,0 4,0 0))"
+                    }))),
+                }),
+                transaction_id: String::new(),
+            }))
+            .await
+            .unwrap();
+
+        let contains = service
+            .execute_plugin_operation(Request::new(proto::PluginOperationRequest {
+                tenant_id: "smoke".to_string(),
+                operation: "rustyred.spatial.contains".to_string(),
+                args_json: json!({
+                    "label": "Parcel",
+                    "property": "geom",
+                    "lat": 2.0,
+                    "lon": 2.0
+                })
+                .to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let contains_payload: Value = serde_json::from_str(&contains.result_json).unwrap();
+        assert_eq!(contains_payload["node_ids"], json!(["parcel:grpc"]));
+
+        let echo = service
+            .execute_plugin_operation(Request::new(proto::PluginOperationRequest {
+                tenant_id: "smoke".to_string(),
+                operation: "RUSTYRED.PLUGIN.ECHO".to_string(),
+                args_json: json!({ "ping": "pong" }).to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let echo_payload: Value = serde_json::from_str(&echo.result_json).unwrap();
+        assert_eq!(echo_payload["ok"], true);
+        assert_eq!(echo_payload["payload"]["args"], json!({ "ping": "pong" }));
     }
 
     #[tokio::test]
