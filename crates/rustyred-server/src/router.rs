@@ -424,6 +424,10 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_spatial_bbox),
         )
         .route(
+            "/v1/tenants/:tenant_id/graph/spatial/:operation",
+            post(graph_spatial_plugin_operation),
+        )
+        .route(
             "/v1/tenants/:tenant_id/graph/fulltext/designate",
             post(graph_fulltext_designate),
         )
@@ -902,6 +906,8 @@ fn index_committed_batch(
         if let rustyred_core::GraphMutation::NodeUpsert(node) = mutation {
             state.maybe_index_node_spatially(tenant_id, node);
             state.maybe_index_node_fulltext(tenant_id, node);
+            #[cfg(feature = "geometry")]
+            state.maybe_index_node_geometry(tenant_id, node);
         }
     }
 }
@@ -2223,6 +2229,8 @@ async fn graph_node_upsert(
             state.observability.record_mutation();
             state.maybe_index_node_spatially(&tenant_id, &index_clone);
             state.maybe_index_node_fulltext(&tenant_id, &index_clone);
+            #[cfg(feature = "geometry")]
+            state.maybe_index_node_geometry(&tenant_id, &index_clone);
             Json(json!({ "ok": true, "node": result })).into_response()
         }
         Err(error) => {
@@ -2693,7 +2701,27 @@ fn execute_tenant_graph_command(
             )
         }
     };
-    execute_graph_store_command(&mut store, command_name, args)
+    let node_for_hooks = matches!(
+        RustyredCommand::from_name(command_name),
+        Ok(RustyredCommand::GraphNodeUpsert)
+    )
+    .then(|| {
+        serde_json::from_value::<NodeWriteBody>(args.clone())
+            .ok()
+            .map(NodeWriteBody::into_record)
+    })
+    .flatten();
+    let response = execute_graph_store_command(&mut store, command_name, args);
+    if response.ok {
+        if let Some(node) = node_for_hooks {
+            state.observability.record_mutation();
+            state.maybe_index_node_spatially(tenant_id, &node);
+            state.maybe_index_node_fulltext(tenant_id, &node);
+            #[cfg(feature = "geometry")]
+            state.maybe_index_node_geometry(tenant_id, &node);
+        }
+    }
+    response
 }
 
 fn execute_tenant_cache_command(
@@ -3808,6 +3836,8 @@ fn flush_node_batch(
                 state.observability.record_mutation();
                 state.maybe_index_node_spatially(tenant_id, node);
                 state.maybe_index_node_fulltext(tenant_id, node);
+                #[cfg(feature = "geometry")]
+                state.maybe_index_node_geometry(tenant_id, node);
             }
         }
         Err(_) => {
@@ -3822,6 +3852,8 @@ fn flush_node_batch(
                         state.observability.record_mutation();
                         state.maybe_index_node_spatially(tenant_id, &node);
                         state.maybe_index_node_fulltext(tenant_id, &node);
+                        #[cfg(feature = "geometry")]
+                        state.maybe_index_node_geometry(tenant_id, &node);
                     }
                     Err(err) => {
                         *failed += 1;
@@ -4308,6 +4340,245 @@ async fn graph_spatial_bbox(
         .into_response(),
         Err(error) => store_unavailable_response(error),
     }
+}
+
+#[cfg(feature = "geometry")]
+#[derive(Debug, Deserialize)]
+struct SpatialGeometryDesignateBody {
+    label: String,
+    property: String,
+    #[serde(default = "default_geometry_encoding")]
+    encoding: String,
+    #[serde(default = "default_h3_resolution")]
+    resolution: u8,
+}
+
+#[cfg(feature = "geometry")]
+#[derive(Debug, Deserialize)]
+struct SpatialContainsBody {
+    label: String,
+    property: String,
+    lat: f64,
+    lon: f64,
+}
+
+#[cfg(feature = "geometry")]
+#[derive(Debug, Deserialize)]
+struct SpatialGeometryQueryBody {
+    label: String,
+    property: String,
+    geometry: Value,
+    #[serde(default = "default_query_geometry_encoding")]
+    encoding: String,
+}
+
+#[cfg(feature = "geometry")]
+fn default_geometry_encoding() -> String {
+    "wkb".to_string()
+}
+
+#[cfg(feature = "geometry")]
+fn default_query_geometry_encoding() -> String {
+    "wkt".to_string()
+}
+
+async fn graph_spatial_plugin_operation(
+    State(state): State<AppState>,
+    Path((tenant_id, operation)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    #[cfg(feature = "geometry")]
+    {
+        return graph_spatial_plugin_operation_enabled(
+            state, tenant_id, operation, headers, payload,
+        );
+    }
+    #[cfg(not(feature = "geometry"))]
+    {
+        let _ = (state, tenant_id, operation, headers, payload);
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "geometry_feature_disabled",
+                "message": "geometry operations require building rustyred-server with --features geometry,s2"
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(feature = "geometry")]
+fn graph_spatial_plugin_operation_enabled(
+    state: AppState,
+    tenant_id: String,
+    operation: String,
+    headers: HeaderMap,
+    payload: Value,
+) -> axum::response::Response {
+    let operation = operation.trim().to_ascii_lowercase().replace('-', "_");
+    let scope = if matches!(
+        operation.as_str(),
+        "designate_geometry" | "spatial_designate_geometry"
+    ) {
+        "graph:write"
+    } else {
+        "graph:read"
+    };
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_spatial_search();
+    match operation.as_str() {
+        "designate_geometry" | "spatial_designate_geometry" => {
+            let body = match serde_json::from_value::<SpatialGeometryDesignateBody>(payload) {
+                Ok(body) => body,
+                Err(error) => return invalid_body_response(error),
+            };
+            let encoding = match parse_geometry_encoding(&body.encoding) {
+                Ok(encoding) => encoding,
+                Err(response) => return response,
+            };
+            match state.designate_geometry_property(
+                &tenant_id,
+                &body.label,
+                &body.property,
+                encoding,
+                body.resolution,
+            ) {
+                Ok(()) => Json(json!({
+                    "ok": true,
+                    "tenant": tenant_id,
+                    "operation": operation,
+                    "designated": {
+                        "label": body.label,
+                        "property": body.property,
+                        "encoding": body.encoding,
+                        "resolution": body.resolution,
+                    }
+                }))
+                .into_response(),
+                Err(error) => store_unavailable_response(error),
+            }
+        }
+        "contains" | "spatial_contains" => {
+            let body = match serde_json::from_value::<SpatialContainsBody>(payload) {
+                Ok(body) => body,
+                Err(error) => return invalid_body_response(error),
+            };
+            match state.geometry_contains_point(
+                &tenant_id,
+                &body.label,
+                &body.property,
+                body.lat,
+                body.lon,
+            ) {
+                Ok(ids) => geometry_ids_response(&tenant_id, &operation, ids),
+                Err(error) => store_unavailable_response(error),
+            }
+        }
+        "intersects" | "spatial_intersects" => {
+            let body = match serde_json::from_value::<SpatialGeometryQueryBody>(payload) {
+                Ok(body) => body,
+                Err(error) => return invalid_body_response(error),
+            };
+            let encoding = match parse_geometry_encoding(&body.encoding) {
+                Ok(encoding) => encoding,
+                Err(response) => return response,
+            };
+            match state.geometry_intersects(
+                &tenant_id,
+                &body.label,
+                &body.property,
+                encoding,
+                &body.geometry,
+            ) {
+                Ok(ids) => geometry_ids_response(&tenant_id, &operation, ids),
+                Err(error) => store_unavailable_response(error),
+            }
+        }
+        "within" | "spatial_within" => {
+            let body = match serde_json::from_value::<SpatialGeometryQueryBody>(payload) {
+                Ok(body) => body,
+                Err(error) => return invalid_body_response(error),
+            };
+            let encoding = match parse_geometry_encoding(&body.encoding) {
+                Ok(encoding) => encoding,
+                Err(response) => return response,
+            };
+            match state.geometry_within(
+                &tenant_id,
+                &body.label,
+                &body.property,
+                encoding,
+                &body.geometry,
+            ) {
+                Ok(ids) => geometry_ids_response(&tenant_id, &operation, ids),
+                Err(error) => store_unavailable_response(error),
+            }
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "unknown_spatial_operation",
+                "message": format!("unknown spatial plugin operation: {operation}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "geometry")]
+fn parse_geometry_encoding(
+    raw: &str,
+) -> Result<rustyred_core::GeometryEncoding, axum::response::Response> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "point" => Ok(rustyred_core::GeometryEncoding::Point),
+        "wkb" => Ok(rustyred_core::GeometryEncoding::Wkb),
+        "wkt" => Ok(rustyred_core::GeometryEncoding::Wkt),
+        "subgraph" => Ok(rustyred_core::GeometryEncoding::Subgraph),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_geometry_encoding",
+                "message": format!("unsupported geometry encoding: {other}")
+            })),
+        )
+            .into_response()),
+    }
+}
+
+#[cfg(feature = "geometry")]
+fn geometry_ids_response(
+    tenant_id: &str,
+    operation: &str,
+    ids: Vec<String>,
+) -> axum::response::Response {
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "operation": operation,
+        "count": ids.len(),
+        "node_ids": ids,
+    }))
+    .into_response()
+}
+
+#[cfg(feature = "geometry")]
+fn invalid_body_response(error: serde_json::Error) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_request_body",
+            "message": error.to_string(),
+        })),
+    )
+        .into_response()
 }
 
 async fn graph_algorithm_communities(
@@ -4958,6 +5229,110 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("content_snapshot:"));
+    }
+
+    #[cfg(feature = "geometry")]
+    #[tokio::test]
+    async fn spatial_geometry_plugin_routes_use_node_upsert_hooks_and_preserve_bbox() {
+        let state = memory_product_state();
+        let tenant_id = "geometry-tenant";
+
+        let designate = super::graph_spatial_plugin_operation(
+            State(state.clone()),
+            Path((tenant_id.to_string(), "designate_geometry".to_string())),
+            HeaderMap::new(),
+            Json(json!({
+                "label": "Parcel",
+                "property": "geom",
+                "encoding": "wkt",
+                "resolution": 9
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(designate.status(), StatusCode::OK);
+
+        let upsert = execute_tenant_command(
+            &state,
+            tenant_id,
+            "RUSTYRED.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "parcel-1",
+                "labels": ["Parcel"],
+                "properties": {
+                    "geom": "POLYGON((0 0,4 0,4 4,0 4,0 0))",
+                    "lat": 2.0,
+                    "lon": 2.0
+                }
+            }),
+        );
+        let upsert_payload = response_payload_json(upsert).await;
+        assert_eq!(upsert_payload["ok"], true);
+
+        for (operation, payload) in [
+            (
+                "contains",
+                json!({
+                    "label": "Parcel",
+                    "property": "geom",
+                    "lat": 2.0,
+                    "lon": 2.0
+                }),
+            ),
+            (
+                "intersects",
+                json!({
+                    "label": "Parcel",
+                    "property": "geom",
+                    "encoding": "wkt",
+                    "geometry": "LINESTRING(2 -1,2 5)"
+                }),
+            ),
+            (
+                "within",
+                json!({
+                    "label": "Parcel",
+                    "property": "geom",
+                    "encoding": "wkt",
+                    "geometry": "POLYGON((-1 -1,5 -1,5 5,-1 5,-1 -1))"
+                }),
+            ),
+        ] {
+            let response = super::graph_spatial_plugin_operation(
+                State(state.clone()),
+                Path((tenant_id.to_string(), operation.to_string())),
+                HeaderMap::new(),
+                Json(payload),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = response_payload_json(response).await;
+            assert_eq!(payload["node_ids"], json!(["parcel-1"]));
+        }
+
+        state
+            .designate_spatial_property(tenant_id, "Parcel", "lat", "lon", 9)
+            .unwrap();
+        let bbox = super::graph_spatial_bbox(
+            State(state),
+            Path(tenant_id.to_string()),
+            HeaderMap::new(),
+            Json(super::SpatialBboxBody {
+                label: "Parcel".to_string(),
+                lat_property: "lat".to_string(),
+                lon_property: "lon".to_string(),
+                min_lat: 1.0,
+                min_lon: 1.0,
+                max_lat: 3.0,
+                max_lon: 3.0,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(bbox.status(), StatusCode::OK);
+        let bbox_payload = response_payload_json(bbox).await;
+        assert_eq!(bbox_payload["node_ids"], json!(["parcel-1"]));
     }
 
     #[tokio::test]

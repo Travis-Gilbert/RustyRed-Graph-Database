@@ -248,29 +248,14 @@ pub fn make_spatial_backend_from_value(
     designation: SpatialDesignation,
     raw: &str,
 ) -> Result<Box<dyn SpatialBackend>, SpatialError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | SPATIAL_BACKEND_H3 | "hand_rolled" | "hand-rolled" => {
-            Ok(Box::new(SpatialIndex::for_designation(designation)))
-        }
-        SPATIAL_BACKEND_S2 => {
-            #[cfg(feature = "s2")]
-            {
-                Ok(Box::new(crate::spatial_s2::S2SpatialBackend::new(
-                    designation,
-                )))
-            }
-            #[cfg(not(feature = "s2"))]
-            {
-                let _ = designation;
-                Err(SpatialError::UnknownBackend(
-                    "s2 backend requires building with --features s2".to_string(),
-                ))
-            }
-        }
-        other => Err(SpatialError::UnknownBackend(format!(
-            "unknown {RUSTY_RED_SPATIAL_BACKEND_ENV} value: {other}"
-        ))),
+    let registry = crate::plugin::builtin_plugin_registry();
+    if let Some(backend) = registry.spatial_backend(raw) {
+        return (backend.constructor)(designation);
     }
+    Err(SpatialError::UnknownBackend(format!(
+        "unknown {RUSTY_RED_SPATIAL_BACKEND_ENV} value: {}",
+        raw.trim().to_ascii_lowercase()
+    )))
 }
 
 #[cfg(test)]

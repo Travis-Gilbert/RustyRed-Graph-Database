@@ -1469,6 +1469,98 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/tenants/{tenant_id}/graph/spatial/designate_geometry": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Designate a geometry index",
+                    "description": "Registers a node label and property holding geometry (point, WKB, or WKT) for the S2-cover geometry index. Served by the spatial plugin-operation route. Upserts of matching nodes refresh the cover.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialGeometryDesignateRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/GeometryDesignationResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/within": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a geometry within query",
+                    "description": "Returns node ids whose designated geometry lies within the query geometry. Two-phase: S2 cover broad phase, then an exact geo predicate narrow phase.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialGeometryQueryRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/GeometryIdsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/intersects": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a geometry intersects query",
+                    "description": "Returns node ids whose designated geometry intersects the query geometry. Two-phase: S2 cover broad phase, then an exact geo predicate narrow phase.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialGeometryQueryRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/GeometryIdsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/v1/tenants/{tenant_id}/graph/spatial/contains": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a geometry contains-point query",
+                    "description": "Returns node ids whose designated polygon or multipolygon geometry contains the given lat/lon point. Two-phase: S2 cell lookup broad phase, then an exact geo contains narrow phase.",
+                    "parameters": [tenant_parameter.clone()],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SpatialContainsRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/GeometryIdsResponse" },
+                        "400": { "$ref": "#/components/responses/GraphStoreError" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
             "/v1/tenants/{tenant_id}/graph/fulltext/designate": {
                 "post": {
                     "tags": ["graph"],
@@ -1834,6 +1926,22 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "content": {
                         "application/json": {
                             "schema": { "$ref": "#/components/schemas/SpatialIdsResponseBody" }
+                        }
+                    }
+                },
+                "GeometryIdsResponse": {
+                    "description": "Geometry topology query result (within, intersects, contains).",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/GeometryIdsResponseBody" }
+                        }
+                    }
+                },
+                "GeometryDesignationResponse": {
+                    "description": "Geometry index designation acknowledgement.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/GeometryDesignationResponseBody" }
                         }
                     }
                 },
@@ -2725,6 +2833,72 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     },
                     "additionalProperties": false
                 },
+                "SpatialGeometryDesignateRequest": {
+                    "type": "object",
+                    "required": ["label", "property"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "encoding": { "type": "string", "enum": ["point", "wkb", "wkt", "subgraph"], "default": "wkb" },
+                        "resolution": { "type": "integer", "minimum": 0, "maximum": 15, "default": 8 }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialContainsRequest": {
+                    "type": "object",
+                    "required": ["label", "property", "lat", "lon"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "lat": { "type": "number" },
+                        "lon": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "SpatialGeometryQueryRequest": {
+                    "type": "object",
+                    "required": ["label", "property", "geometry"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "property": { "type": "string" },
+                        "geometry": { "description": "Query geometry whose concrete shape depends on encoding: a WKT string, a WKB byte array, or a point value." },
+                        "encoding": { "type": "string", "enum": ["point", "wkb", "wkt", "subgraph"], "default": "wkt" }
+                    },
+                    "additionalProperties": false
+                },
+                "GeometryIdsResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "operation", "count", "node_ids"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "operation": { "type": "string" },
+                        "count": { "type": "integer", "minimum": 0 },
+                        "node_ids": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "additionalProperties": false
+                },
+                "GeometryDesignationResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "operation", "designated"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "tenant": { "type": "string" },
+                        "operation": { "type": "string" },
+                        "designated": {
+                            "type": "object",
+                            "required": ["label", "property", "encoding", "resolution"],
+                            "properties": {
+                                "label": { "type": "string" },
+                                "property": { "type": "string" },
+                                "encoding": { "type": "string" },
+                                "resolution": { "type": "integer" }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
                 "FullTextDesignateRequest": {
                     "type": "object",
                     "required": ["label", "property"],
@@ -3456,6 +3630,13 @@ mod tests {
             ("/v1/tenants/{tenant_id}/graph/spatial/designate", "post"),
             ("/v1/tenants/{tenant_id}/graph/spatial/radius", "post"),
             ("/v1/tenants/{tenant_id}/graph/spatial/bbox", "post"),
+            (
+                "/v1/tenants/{tenant_id}/graph/spatial/designate_geometry",
+                "post",
+            ),
+            ("/v1/tenants/{tenant_id}/graph/spatial/within", "post"),
+            ("/v1/tenants/{tenant_id}/graph/spatial/intersects", "post"),
+            ("/v1/tenants/{tenant_id}/graph/spatial/contains", "post"),
             ("/v1/tenants/{tenant_id}/graph/fulltext/designate", "post"),
             ("/v1/tenants/{tenant_id}/graph/fulltext/search", "post"),
             ("/v1/tenants/{tenant_id}/graph/bulk/nodes", "post"),

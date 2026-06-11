@@ -15,9 +15,12 @@ pub mod executor;
 pub mod fulltext;
 #[cfg(feature = "tantivy")]
 pub mod fulltext_tantivy;
+#[cfg(feature = "geometry")]
+pub mod geometry;
 pub mod graph;
 pub mod graph_store;
 pub mod instant_kg;
+pub mod plugin;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -31,6 +34,11 @@ pub use executor::{execute_request_json, InMemoryRustyredExecutor, RustyredExecu
 pub use fulltext::{
     make_fulltext_backend, make_fulltext_backend_from_value, FullTextBackend, FullTextBackendError,
     FullTextDesignation, FullTextIndex, RUSTY_RED_FULLTEXT_BACKEND_ENV,
+};
+#[cfg(feature = "geometry")]
+pub use geometry::{
+    GeometryDesignation, GeometryEncoder, GeometryEncoding, GeometryError, GeometryIndex,
+    GeometryPlugin, PointEncoder, WkbEncoder, WktEncoder,
 };
 #[allow(deprecated)]
 pub use graph::louvain_communities;
@@ -54,6 +62,11 @@ pub use instant_kg::{
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
+};
+pub use plugin::{
+    builtin_plugin_registry, FullTextBackendRegistration, PluginCapability, PluginCapabilityKind,
+    PluginOperationContext, PluginOperationRegistration, PluginRegistry, RustyRedPlugin,
+    SpatialBackendRegistration,
 };
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,

@@ -347,30 +347,14 @@ pub fn make_fulltext_backend_from_value(
     designation: FullTextDesignation,
     raw: &str,
 ) -> Result<Box<dyn FullTextBackend>, FullTextBackendError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | FULLTEXT_BACKEND_HAND_ROLLED | "hand-rolled" | "bm25" => {
-            Ok(Box::new(FullTextIndex::for_designation(designation)))
-        }
-        FULLTEXT_BACKEND_TANTIVY => {
-            #[cfg(feature = "tantivy")]
-            {
-                Ok(Box::new(
-                    crate::fulltext_tantivy::TantivyFullTextBackend::new(designation)
-                        .map_err(FullTextBackendError::TantivyInit)?,
-                ))
-            }
-            #[cfg(not(feature = "tantivy"))]
-            {
-                let _ = designation;
-                Err(FullTextBackendError::UnknownBackend(
-                    "tantivy backend requires building with --features tantivy".to_string(),
-                ))
-            }
-        }
-        other => Err(FullTextBackendError::UnknownBackend(format!(
-            "unknown {RUSTY_RED_FULLTEXT_BACKEND_ENV} value: {other}"
-        ))),
+    let registry = crate::plugin::builtin_plugin_registry();
+    if let Some(backend) = registry.fulltext_backend(raw) {
+        return (backend.constructor)(designation);
     }
+    Err(FullTextBackendError::UnknownBackend(format!(
+        "unknown {RUSTY_RED_FULLTEXT_BACKEND_ENV} value: {}",
+        raw.trim().to_ascii_lowercase()
+    )))
 }
 
 #[derive(Debug, Clone)]

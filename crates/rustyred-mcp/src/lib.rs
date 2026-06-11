@@ -169,6 +169,54 @@ pub trait McpGraphBackend {
             "spatial bbox search is not supported by this MCP backend",
         ))
     }
+    fn designate_geometry_property(
+        &mut self,
+        _label: &str,
+        _property: &str,
+        _encoding: &str,
+        _resolution: u8,
+    ) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "geometry designation is not supported by this MCP backend",
+        ))
+    }
+    fn spatial_contains_point(
+        &self,
+        _label: &str,
+        _property: &str,
+        _lat: f64,
+        _lon: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "geometry contains search is not supported by this MCP backend",
+        ))
+    }
+    fn spatial_intersects_geometry(
+        &self,
+        _label: &str,
+        _property: &str,
+        _encoding: &str,
+        _geometry: &Value,
+    ) -> GraphStoreResult<Vec<String>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "geometry intersects search is not supported by this MCP backend",
+        ))
+    }
+    fn spatial_within_geometry(
+        &self,
+        _label: &str,
+        _property: &str,
+        _encoding: &str,
+        _geometry: &Value,
+    ) -> GraphStoreResult<Vec<String>> {
+        Err(GraphStoreError::new(
+            "unsupported_operation",
+            "geometry within search is not supported by this MCP backend",
+        ))
+    }
     fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -828,6 +876,79 @@ fn call_tool<P: McpGraphProvider>(
                     "lon_property": lon_property,
                     "resolution": resolution
                 }
+            })
+        }
+        "rustyred.spatial.designate_geometry" | "rustyred.graph.spatial.designate_geometry" => {
+            if let Some(error) = require_write_tool(config, context, name) {
+                return Ok(error);
+            }
+            let label = required_str(&arguments, "label", name)?;
+            let property = required_str(&arguments, "property", name)?;
+            let encoding = arguments
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkb");
+            let resolution = arguments
+                .get("resolution")
+                .and_then(Value::as_u64)
+                .unwrap_or(9)
+                .min(u8::MAX as u64) as u8;
+            backend.designate_geometry_property(label, property, encoding, resolution)?;
+            json!({
+                "tenant": tenant,
+                "designated": {
+                    "label": label,
+                    "property": property,
+                    "encoding": encoding,
+                    "resolution": resolution
+                }
+            })
+        }
+        "rustyred.spatial.contains" | "rustyred.graph.spatial.contains" => {
+            let label = required_str(&arguments, "label", name)?;
+            let property = required_str(&arguments, "property", name)?;
+            let lat = required_f64(&arguments, "lat", name)?;
+            let lon = required_f64(&arguments, "lon", name)?;
+            let node_ids = backend.spatial_contains_point(label, property, lat, lon)?;
+            json!({
+                "tenant": tenant,
+                "node_ids": node_ids,
+                "stats": { "returned": node_ids.len() }
+            })
+        }
+        "rustyred.spatial.intersects" | "rustyred.graph.spatial.intersects" => {
+            let label = required_str(&arguments, "label", name)?;
+            let property = required_str(&arguments, "property", name)?;
+            let encoding = arguments
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkt");
+            let geometry = arguments.get("geometry").ok_or_else(|| {
+                McpError::invalid_params("rustyred.spatial.intersects requires geometry")
+            })?;
+            let node_ids =
+                backend.spatial_intersects_geometry(label, property, encoding, geometry)?;
+            json!({
+                "tenant": tenant,
+                "node_ids": node_ids,
+                "stats": { "returned": node_ids.len() }
+            })
+        }
+        "rustyred.spatial.within" | "rustyred.graph.spatial.within" => {
+            let label = required_str(&arguments, "label", name)?;
+            let property = required_str(&arguments, "property", name)?;
+            let encoding = arguments
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("wkt");
+            let geometry = arguments.get("geometry").ok_or_else(|| {
+                McpError::invalid_params("rustyred.spatial.within requires geometry")
+            })?;
+            let node_ids = backend.spatial_within_geometry(label, property, encoding, geometry)?;
+            json!({
+                "tenant": tenant,
+                "node_ids": node_ids,
+                "stats": { "returned": node_ids.len() }
             })
         }
         "rustyred.bulk.nodes" | "rustyred.graph.bulk.nodes" => {
@@ -2182,6 +2303,51 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     tools.push(tool(
+        "rustyred.spatial.contains",
+        "Search designated geometry properties for polygons containing a point.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "property": { "type": "string" },
+                "lat": { "type": "number" },
+                "lon": { "type": "number" }
+            },
+            "required": ["label", "property", "lat", "lon"]
+        }),
+    ));
+    tools.push(tool(
+        "rustyred.spatial.intersects",
+        "Search designated geometry properties that intersect a query geometry.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "property": { "type": "string" },
+                "encoding": { "type": "string", "enum": ["wkb", "wkt"], "default": "wkt" },
+                "geometry": {}
+            },
+            "required": ["label", "property", "geometry"]
+        }),
+    ));
+    tools.push(tool(
+        "rustyred.spatial.within",
+        "Search designated geometry properties contained within a query geometry.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "label": { "type": "string" },
+                "property": { "type": "string" },
+                "encoding": { "type": "string", "enum": ["wkb", "wkt"], "default": "wkt" },
+                "geometry": {}
+            },
+            "required": ["label", "property", "geometry"]
+        }),
+    ));
+    tools.push(tool(
         "rustyred.vector.search",
         "Run a pure vector similarity search using HNSW indexes. Returns top-k nearest nodes.",
         json!({
@@ -2261,6 +2427,21 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "resolution": { "type": "integer", "default": 9 }
                 },
                 "required": ["label", "lat_property", "lon_property"]
+            }),
+        ));
+        tools.push(tool_write(
+            "rustyred.spatial.designate_geometry",
+            "Designate a node geometry property for geometry predicate search.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "label": { "type": "string" },
+                    "property": { "type": "string" },
+                    "encoding": { "type": "string", "enum": ["point", "wkb", "wkt", "subgraph"], "default": "wkb" },
+                    "resolution": { "type": "integer", "default": 9 }
+                },
+                "required": ["label", "property"]
             }),
         ));
         tools.push(tool_write(
@@ -2903,6 +3084,15 @@ mod tests {
             .any(|tool| tool["name"] == "rustyred.spatial.radius"));
         assert!(tools
             .iter()
+            .any(|tool| tool["name"] == "rustyred.spatial.contains"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.spatial.intersects"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.spatial.within"));
+        assert!(tools
+            .iter()
             .any(|tool| tool["name"] == "rustyred.graph.version.compile"));
         assert!(tools
             .iter()
@@ -3272,6 +3462,9 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred.spatial.designate"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred.spatial.designate_geometry"));
     }
 
     #[test]
@@ -3282,6 +3475,7 @@ mod tests {
         for tool_name in [
             "rustyred.fulltext.designate",
             "rustyred.spatial.designate",
+            "rustyred.spatial.designate_geometry",
             "rustyred.bulk.nodes",
             "rustyred.bulk.edges",
             "rustyred.vector.designate",

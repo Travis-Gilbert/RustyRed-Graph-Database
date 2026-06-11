@@ -523,6 +523,13 @@ impl RustyredExecutor for InMemoryRustyredExecutor {
 
     fn execute_request(&mut self, request: RustyredRequest) -> RustyredResponse {
         let command_name = request.command.clone();
+        if let Some(operation) = crate::plugin::builtin_plugin_registry().operation(&command_name) {
+            let context = crate::plugin::PluginOperationContext {
+                command: operation.command,
+                state_hash: self.state_hash(),
+            };
+            return (operation.handler)(context, request.args);
+        }
         match RustyredCommand::from_name(&request.command) {
             Ok(command) => self.execute(command, request.args).unwrap_or_else(|error| {
                 RustyredResponse::err(command_name, error, self.state_hash())
@@ -551,6 +558,17 @@ impl<S: RustyredStore> RustyredExecutor for StoreBackedRustyredExecutor<S> {
 
     fn execute_request(&mut self, request: RustyredRequest) -> RustyredResponse {
         let command_name = request.command.clone();
+        if let Some(operation) = crate::plugin::builtin_plugin_registry().operation(&command_name) {
+            let context = crate::plugin::PluginOperationContext {
+                command: operation.command,
+                state_hash: self.state_hash(),
+            };
+            let response = (operation.handler)(context, request.args);
+            if response.ok {
+                self.persist();
+            }
+            return response;
+        }
         match RustyredCommand::from_name(&request.command) {
             Ok(command) => self.execute(command, request.args).unwrap_or_else(|error| {
                 RustyredResponse::err(command_name, error, self.state_hash())
@@ -906,5 +924,18 @@ mod tests {
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("missing_graph_endpoint")
         );
+    }
+
+    #[test]
+    fn plugin_operation_round_trips_through_json_executor() {
+        let mut executor = InMemoryRustyredExecutor::new();
+        let raw = executor.execute_json(
+            r#"{"command":"RUSTYRED.PLUGIN.ECHO","args":{"message":"hello plugin"}}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["command"], "RUSTYRED.PLUGIN.ECHO");
+        assert_eq!(parsed["payload"]["args"]["message"], "hello plugin");
     }
 }
