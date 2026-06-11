@@ -16,7 +16,7 @@ COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
 
-RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo build --locked -p rustyred-server --profile railway
+RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo build --locked -p rustyred-server --profile railway --features "geometry s2"
 
 FROM debian:bookworm-slim
 
