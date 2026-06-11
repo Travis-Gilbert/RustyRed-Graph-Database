@@ -44,6 +44,11 @@ codegen-units = 1
 debug = false
 strip = "symbols"
 
+[profile.railway]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # Staged config for cargo-dist / `dist` (https://opensource.axo.dev/cargo-dist/).
 # Inert for normal `cargo build`. Run `dist init` to generate a release
 # workflow that produces a curl|sh installer, a Homebrew formula, and an npm
