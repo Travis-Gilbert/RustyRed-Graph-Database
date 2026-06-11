@@ -7,7 +7,7 @@ Redis sidecar in the default (`embedded`) mode.
 
 The `Dockerfile` is a two-stage build:
 
-1. **Builder** — `rust:1.88-bookworm`, installs `protobuf-compiler` (needed because
+1. **Builder** — `rust:1.95-bookworm`, installs `protobuf-compiler` (needed because
    `build.rs` compiles the vendored `.proto` with `tonic-build`), copies `vendor/`, `crates/`, and
    `src/`, then runs `cargo build -p rustyred-server --release`. `CARGO_BUILD_JOBS` (default `2`)
    bounds parallelism for memory-limited CI builders.

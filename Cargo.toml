@@ -27,7 +27,7 @@ version = "0.9.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Travis-Gilbert/RustyRed-Graph-Database"
-rust-version = "1.85"
+rust-version = "1.95"
 keywords = ["graph", "database", "vector-search", "mcp", "knowledge-graph"]
 categories = ["database-implementations", "data-structures", "algorithms"]
 

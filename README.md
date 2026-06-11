@@ -287,7 +287,7 @@ These are on the roadmap, in roughly this priority order:
 
 ### Build (local development)
 
-Requires Rust 1.85+. The repo vendors the `rustyred.v1` proto at `vendor/proto/` so a fresh clone builds without any submodule init step:
+Requires Rust 1.95+. The repo vendors the `rustyred.v1` proto at `vendor/proto/` so a fresh clone builds without any submodule init step:
 
 ```bash
 git clone https://github.com/Travis-Gilbert/RustyRed-Graph-Database.git

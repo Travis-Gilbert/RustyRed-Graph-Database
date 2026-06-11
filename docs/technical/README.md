@@ -28,7 +28,7 @@ sidecar required.
 
 ## At a glance
 
-- **Latest version:** `0.9.1` (workspace `Cargo.toml` `[workspace.package]`; every crate inherits it), Rust edition 2021, MSRV 1.85.
+- **Latest version:** `0.9.1` (workspace `Cargo.toml` `[workspace.package]`; every crate inherits it), Rust edition 2021, MSRV 1.95.
 - **Default storage mode:** `embedded` (RedCore native engine; in-memory graph + AOF + snapshots).
 - **Default HTTP/gRPC port:** `8380` (HTTP and gRPC share one listener).
 - **Default RESP port:** `6380` (experimental scaffold — see [Architecture](architecture.md)).
