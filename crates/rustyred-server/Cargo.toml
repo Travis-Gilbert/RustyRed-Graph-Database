@@ -9,7 +9,9 @@ build = "build.rs"
 
 [dependencies]
 async-trait = "0.1"
-axum = "0.7"
+base64 = "0.22"
+futures-util = "0.3"
+axum = { version = "0.7", features = ["ws"] }
 ed25519-dalek = "2"
 hex = "0.4"
 http = "1"
@@ -30,6 +32,7 @@ tonic = "0.12"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
+yrs = "0.27"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [build-dependencies]

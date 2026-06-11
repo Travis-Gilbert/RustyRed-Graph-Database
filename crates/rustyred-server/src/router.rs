@@ -512,6 +512,11 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/memory/self_recall_archive",
             post(crate::memory::memory_self_recall_archive),
         )
+        // ----- Yjs sync (yrs): collaborative doc endpoint for BlockSuite -----
+        .route(
+            "/v1/tenants/:tenant_id/sync/yjs/:doc_id",
+            get(crate::yjs_sync::yjs_sync_ws),
+        )
         .layer(cors)
         .with_state(state)
 }

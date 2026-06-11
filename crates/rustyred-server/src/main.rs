@@ -21,6 +21,7 @@ mod openapi;
 mod query_surface;
 mod router;
 mod state;
+mod yjs_sync;
 
 use std::net::SocketAddr;
 
