@@ -14,6 +14,7 @@ mod config;
 mod cypher;
 mod graph_cache;
 mod grpc;
+mod memory;
 mod metrics;
 mod observability;
 mod openapi;

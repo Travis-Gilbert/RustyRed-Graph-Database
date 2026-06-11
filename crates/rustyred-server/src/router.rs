@@ -463,6 +463,55 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/instant-kg/explain-edge",
             post(instant_kg_explain_edge),
         )
+        // ----- memory-verb endpoints (canonical user-memory write+read path) -----
+        .route(
+            "/v1/tenants/:tenant_id/memory/encode",
+            post(crate::memory::memory_encode),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/coordinate",
+            post(crate::memory::memory_coordinate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/presence",
+            post(crate::memory::memory_presence),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/mentions",
+            post(crate::memory::memory_mentions),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/mentions/wait",
+            post(crate::memory::memory_mentions_wait),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/subscribe",
+            post(crate::memory::memory_subscribe),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/recall",
+            post(crate::memory::memory_recall),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/remember",
+            post(crate::memory::memory_remember),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/self_note",
+            post(crate::memory::memory_self_note),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/self_revise",
+            post(crate::memory::memory_self_revise),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/self_archive",
+            post(crate::memory::memory_self_archive),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/memory/self_recall_archive",
+            post(crate::memory::memory_self_recall_archive),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -3242,7 +3291,7 @@ fn query_surface_error_response(error: QuerySurfaceError) -> axum::response::Res
     (error.status(), Json(error.payload())).into_response()
 }
 
-fn store_unavailable_response(error: StoreAccessError) -> axum::response::Response {
+pub(crate) fn store_unavailable_response(error: StoreAccessError) -> axum::response::Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(error.as_payload())).into_response()
 }
 
@@ -3254,7 +3303,7 @@ fn transaction_state_error(error: StoreAccessError) -> GraphStoreError {
     }
 }
 
-fn graph_store_error_response(error: GraphStoreError) -> axum::response::Response {
+pub(crate) fn graph_store_error_response(error: GraphStoreError) -> axum::response::Response {
     (
         graph_error_status(error.code.as_str()),
         Json(json!({
