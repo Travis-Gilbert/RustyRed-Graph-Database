@@ -253,7 +253,10 @@ impl AppState {
     }
 
     /// Index a node into any designations for its label whose lat+lon
-    /// properties are present. Called on the write path.
+    /// properties are present. Called on the write path. Symmetric with the
+    /// fulltext hook: a node upserted WITHOUT coordinates (tombstones carry
+    /// none; an unplaced civic row loses its location) is REMOVED from the
+    /// index, so spatial queries never return deleted or unplaced rows.
     pub fn maybe_index_node_spatially(&self, tenant_id: &str, node: &NodeRecord) {
         let Ok(mut indexes) = self.spatial_indexes.lock() else {
             return;
@@ -269,6 +272,8 @@ impl AppState {
             let lon = node.properties.get(lon_prop).and_then(|v| v.as_f64());
             if let (Some(lat), Some(lon)) = (lat, lon) {
                 let _ = SpatialBackend::upsert(index.as_mut(), &node.id, lat, lon);
+            } else {
+                let _ = SpatialBackend::remove(index.as_mut(), &node.id);
             }
         }
     }
@@ -381,6 +386,62 @@ impl AppState {
             .or_default()
             .insert((label.to_string(), property.to_string()), index);
         Ok(())
+    }
+
+    /// Idempotently register a point-encoding geometry designation for a
+    /// tenant. Returns true when the designation was newly registered, false
+    /// when it already existed. Unlike the HTTP designate route this skips
+    /// the 0..=15 resolution bound: that bound mirrors H3, while point
+    /// designations map resolution to S2 levels (resolution * 2, clamped to
+    /// 30), so the civic projection's 16 selects the finest point cells.
+    #[cfg(feature = "geometry")]
+    pub fn ensure_geometry_point_designation(
+        &self,
+        tenant_id: &str,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        resolution: u8,
+    ) -> Result<bool, StoreAccessError> {
+        let designation = GeometryDesignation::point(label, lat_property, lon_property, resolution);
+        let key = (designation.label.clone(), designation.property.clone());
+        {
+            let indexes = self
+                .geometry_indexes
+                .lock()
+                .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+            if indexes
+                .get(tenant_id)
+                .is_some_and(|tenant_map| tenant_map.contains_key(&key))
+            {
+                return Ok(false);
+            }
+        }
+        let store = self.tenant_graph_store(tenant_id)?;
+        let mut index = GeometryIndex::new(designation)
+            .map_err(|err| StoreAccessError::unsupported(err.message()))?;
+        let nodes = store
+            .query_nodes(NodeQuery {
+                label: Some(label.to_string()),
+                ..NodeQuery::default()
+            })
+            .map_err(StoreAccessError::from)?;
+        for node in nodes {
+            // Nodes without coordinates are legitimate (unplaced civic
+            // rows); per-node indexing failures must not block registration.
+            let _ = index.upsert_from_properties(&node.id, &node.properties);
+        }
+        let mut indexes = self
+            .geometry_indexes
+            .lock()
+            .map_err(|_| StoreAccessError::internal("geometry index lock poisoned"))?;
+        let tenant_map = indexes.entry(tenant_id.to_string()).or_default();
+        if tenant_map.contains_key(&key) {
+            // Lost a registration race; the first index wins.
+            return Ok(false);
+        }
+        tenant_map.insert(key, index);
+        Ok(true)
     }
 
     #[cfg(feature = "geometry")]

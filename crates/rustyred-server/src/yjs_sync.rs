@@ -62,11 +62,13 @@ const TAG_UPDATE: u8 = 0x02;
 /// receive its own update back.
 type RoomBroadcast = (u64, Arc<Vec<u8>>);
 
-struct YjsRoom {
+pub(crate) struct YjsRoom {
     /// `tenant:doc` key, also the broadcast identity in logs.
-    key: String,
+    pub(crate) key: String,
+    /// Raw doc id; the civic projection matches on its `civic:` prefix.
+    pub(crate) doc_id: String,
     storage_node_id: String,
-    doc: TokioMutex<Doc>,
+    pub(crate) doc: TokioMutex<Doc>,
     tx: broadcast::Sender<RoomBroadcast>,
 }
 
@@ -158,11 +160,18 @@ async fn get_or_open_room(state: &AppState, tenant_id: &str, doc_id: &str) -> Ar
     let (tx, _) = broadcast::channel(256);
     let room = Arc::new(YjsRoom {
         key: key.clone(),
+        doc_id: doc_id.to_string(),
         storage_node_id: node_id,
         doc: TokioMutex::new(doc),
         tx,
     });
     registry.insert(key, Arc::clone(&room));
+    // Prime the civic projection on room open (not only on push): after a
+    // server restart the in-memory geometry designation is gone, and a
+    // quiescent doc would otherwise leave geometry queries empty until the
+    // next organizer edit. The first client connection re-projects from the
+    // loaded doc, which re-registers the designation and backfills indexes.
+    crate::civic_projection::schedule_civic_projection(state, tenant_id, &room);
     room
 }
 
@@ -289,6 +298,9 @@ async fn handle_frame(
             };
             if applied {
                 let _ = room.tx.send((conn_id, Arc::new(frame.to_vec())));
+                // Civic docs mirror into the tenant graph. The projection is
+                // debounced and best-effort: it never blocks or fails sync.
+                crate::civic_projection::schedule_civic_projection(state, tenant_id, room);
             }
             None
         }

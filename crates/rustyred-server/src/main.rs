@@ -10,6 +10,7 @@
 
 mod auth;
 mod bulk;
+mod civic_projection;
 mod config;
 mod cypher;
 mod graph_cache;

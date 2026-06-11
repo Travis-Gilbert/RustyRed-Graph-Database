@@ -884,7 +884,7 @@ fn ingest_web_commons_fragment(
     .into_response()
 }
 
-fn commit_batch_with_indexes(
+pub(crate) fn commit_batch_with_indexes(
     state: &AppState,
     tenant_id: &str,
     store: &mut TenantGraphStore,
