@@ -12,7 +12,8 @@ The `Dockerfile` is a two-stage build:
    `src/`, then runs `cargo build -p rustyred-server --profile railway`. `CARGO_BUILD_JOBS`
    (default `2`) bounds parallelism for memory-limited CI builders. The `railway` profile
    inherits `release` but disables fat LTO so Railway cold builds do not spend minutes in
-   release linking.
+   release linking; the resulting binary is copied from
+   `target/railway/rustyred-server`.
 2. **Runtime** — `debian:bookworm-slim` with `ca-certificates`. The binary is installed as
    `/usr/local/bin/rusty-red-graph-server`. `EXPOSE 8380`. `CMD ["rusty-red-graph-server"]`.
 

@@ -24,7 +24,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/rustyred-server /usr/local/bin/rusty-red-graph-server
+COPY --from=builder /app/target/railway/rustyred-server /usr/local/bin/rusty-red-graph-server
 
 # Security-by-default. RUSTY_RED_REQUIRE_AUTH=true means /v1/* and /mcp
 # refuse unauthenticated requests; operators must provision scoped
