@@ -57,6 +57,29 @@ impl InMemoryRustyredExecutor {
         }
     }
 
+    /// Dispatch a registered graph-algorithm operation against this executor's
+    /// in-memory graph store, honoring the mode-plus-estimate contract. Returns
+    /// `None` when `command` is not a registered algorithm operation, so callers
+    /// fall through to the command enum.
+    pub fn run_algorithm_operation(
+        &mut self,
+        command: &str,
+        args: &Value,
+    ) -> Option<RustyredResponse> {
+        let registry = crate::plugin::builtin_plugin_registry();
+        let operation = registry.algorithm_operation(command)?.clone();
+        let outcome =
+            crate::operation::dispatch_operation(operation.as_ref(), &mut self.graph_store, args);
+        let state_hash = self.state_hash();
+        let response = match outcome {
+            Ok(payload) => RustyredResponse::ok(command.to_string(), "ok", payload, state_hash),
+            Err(error) => {
+                RustyredResponse::err(command.to_string(), RustyredError::from(error), state_hash)
+            }
+        };
+        Some(response)
+    }
+
     fn run_begin(&mut self, args: Value) -> RustyredResponse {
         self.state.next_seq();
         let run_id =
@@ -530,6 +553,9 @@ impl RustyredExecutor for InMemoryRustyredExecutor {
             };
             return (operation.handler)(context, request.args);
         }
+        if let Some(response) = self.run_algorithm_operation(&command_name, &request.args) {
+            return response;
+        }
         match RustyredCommand::from_name(&request.command) {
             Ok(command) => self.execute(command, request.args).unwrap_or_else(|error| {
                 RustyredResponse::err(command_name, error, self.state_hash())
@@ -564,6 +590,15 @@ impl<S: RustyredStore> RustyredExecutor for StoreBackedRustyredExecutor<S> {
                 state_hash: self.state_hash(),
             };
             let response = (operation.handler)(context, request.args);
+            if response.ok {
+                self.persist();
+            }
+            return response;
+        }
+        if let Some(response) = self
+            .inner
+            .run_algorithm_operation(&command_name, &request.args)
+        {
             if response.ok {
                 self.persist();
             }
@@ -923,6 +958,75 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("missing_graph_endpoint")
+        );
+    }
+
+    #[test]
+    fn pagerank_operation_round_trips_three_modes_through_execute_request_json() {
+        use super::execute_request_json;
+        let mut executor = InMemoryRustyredExecutor::new();
+        // Build a small directed cycle a->b->c->a plus a->c.
+        for id in ["a", "b", "c"] {
+            executor.execute_request(RustyredRequest::new(
+                RustyredCommand::GraphNodeUpsert.name(),
+                json!({ "id": id, "labels": ["Node"] }),
+            ));
+        }
+        for (id, from, to) in [
+            ("e1", "a", "b"),
+            ("e2", "b", "c"),
+            ("e3", "c", "a"),
+            ("e4", "a", "c"),
+        ] {
+            executor.execute_request(RustyredRequest::new(
+                RustyredCommand::GraphEdgeUpsert.name(),
+                json!({ "id": id, "from_id": from, "type": "REL", "to_id": to }),
+            ));
+        }
+
+        let call = |executor: &mut InMemoryRustyredExecutor, mode: &str| -> serde_json::Value {
+            let request = format!(
+                r#"{{"command":"rustyred.algorithm.pagerank","args":{{"mode":"{mode}"}}}}"#
+            );
+            serde_json::from_str(&execute_request_json(executor, &request)).unwrap()
+        };
+
+        let stream = call(&mut executor, "stream");
+        assert_eq!(stream["ok"], true);
+        assert_eq!(stream["payload"]["mode"], "stream");
+        assert!(stream["payload"]["scores"].as_array().unwrap().len() >= 3);
+
+        let stats = call(&mut executor, "stats");
+        assert_eq!(stats["payload"]["mode"], "stats");
+        assert!(stats["payload"]["stats"]["count"].as_u64().unwrap() >= 3);
+
+        let estimate = call(&mut executor, "estimate");
+        assert_eq!(estimate["payload"]["mode"], "estimate");
+        assert!(
+            estimate["payload"]["estimate"]["bytes_min"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        let mutate = call(&mut executor, "mutate");
+        assert_eq!(mutate["ok"], true);
+        assert_eq!(mutate["payload"]["mode"], "mutate");
+
+        // The mutate-written `pagerank` property is readable via node fetch.
+        let fetched = executor.execute_request(RustyredRequest::new(
+            RustyredCommand::GraphNodesQuery.name(),
+            json!({ "label": "Node" }),
+        ));
+        let has_pagerank = fetched.nodes.iter().all(|node| {
+            node.properties
+                .get("pagerank")
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        });
+        assert!(
+            has_pagerank,
+            "every node should carry a pagerank property after mutate"
         );
     }
 

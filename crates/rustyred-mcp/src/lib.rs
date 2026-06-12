@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 
 use rustyred_core::{
-    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
-    merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
-    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStoreError,
-    GraphStoreResult, GraphVersionRepository, HarnessInstantKg, HybridScoringConfig,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
-    SessionDelta, VectorDesignation, VerifyReport,
+    builtin_plugin_registry, checkout_graph_version, compile_graph_pack, diff_graph_snapshots,
+    dispatch_operation, graph_version_log, merge_graph_snapshots, update_graph_ref, AlgorithmGraph,
+    CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphCompileOptions, GraphCounts,
+    GraphMergeOptions, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
+    GraphVersionRepository, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, OperationError, RedCoreGraphStore, SessionDelta,
+    VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1202,10 +1203,116 @@ fn call_tool<P: McpGraphProvider>(
                 "message": "rustyred.admin.verify is hidden unless RUSTYRED_MCP_ALLOW_ADMIN/RUSTY_RED_MCP_ALLOW_ADMIN is true."
             })))
         }
-        other => return Err(McpError::method_not_found(other)),
+        // Generated algorithm operations: any tool name registered through the
+        // plugin registry is dispatched here with no per-tool wiring. Unknown
+        // names fall through to method_not_found inside the helper.
+        other => run_algorithm_operation_tool(other, &mut backend, &tenant, &arguments)?,
     };
 
     Ok(tool_result(payload))
+}
+
+/// Adapter exposing an MCP graph backend as the core [`AlgorithmGraph`] view, so
+/// registered algorithm operations run over the tenant graph. A newtype is
+/// required because a blanket impl would violate the orphan rule.
+struct McpAlgorithmGraph<'a, B: McpGraphBackend>(&'a mut B);
+
+impl<B: McpGraphBackend> AlgorithmGraph for McpAlgorithmGraph<'_, B> {
+    fn graph_counts(&self) -> GraphStoreResult<GraphCounts> {
+        let snapshot = self.0.graph_snapshot()?;
+        Ok(GraphCounts {
+            node_count: snapshot.nodes.iter().filter(|node| !node.tombstone).count(),
+            relationship_count: snapshot.edges.iter().filter(|edge| !edge.tombstone).count(),
+        })
+    }
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        Ok(self
+            .0
+            .list_edges()?
+            .into_iter()
+            .filter(|edge| !edge.tombstone)
+            .collect())
+    }
+    fn nodes_with_label(&self, label: &str) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.0.query_nodes(NodeQuery::label(label))
+    }
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.0.get_node(id)
+    }
+    fn vector_top_k(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        Ok(self
+            .0
+            .vector_search(Some(label), property, query, k)?
+            .into_iter()
+            .map(|(id, distance)| (id, 1.0 - distance))
+            .collect())
+    }
+    fn write_node_property(&mut self, id: &str, key: &str, value: Value) -> GraphStoreResult<()> {
+        let mut node = self.0.get_node(id)?.ok_or_else(|| {
+            GraphStoreError::new("node_not_found", format!("no node with id {id}"))
+        })?;
+        rustyred_core::operation::set_property(&mut node.properties, key, value);
+        self.0.upsert_node(node)
+    }
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.0.upsert_edge(edge)
+    }
+}
+
+/// Run a registered algorithm operation over any MCP graph backend, honoring the
+/// mode-plus-estimate contract. Returns `Ok(None)` when `command` is not a
+/// registered algorithm operation. This is the single generation/dispatch entry
+/// shared by the MCP tool surface and the HTTP route surface, so adding an
+/// operation in `rustyred-core` surfaces it on both with no per-adapter edits.
+pub fn run_algorithm_operation<B: McpGraphBackend>(
+    command: &str,
+    backend: &mut B,
+    args: &Value,
+) -> Result<Option<Value>, OperationError> {
+    let registry = builtin_plugin_registry();
+    let Some(operation) = registry.algorithm_operation(command) else {
+        return Ok(None);
+    };
+    let operation = operation.clone();
+    let mut adapter = McpAlgorithmGraph(backend);
+    Ok(Some(dispatch_operation(
+        operation.as_ref(),
+        &mut adapter,
+        args,
+    )?))
+}
+
+/// Dispatch a registered algorithm operation as a generated MCP tool. Returns
+/// `method_not_found` when the name is not a registered operation. The tenant id
+/// is merged into the result payload to match the hand-wired algorithm tools.
+fn run_algorithm_operation_tool<B: McpGraphBackend>(
+    name: &str,
+    backend: &mut B,
+    tenant: &str,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    match run_algorithm_operation(name, backend, arguments).map_err(operation_error_to_mcp)? {
+        Some(mut payload) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("tenant".to_string(), json!(tenant));
+            }
+            Ok(payload)
+        }
+        None => Err(McpError::method_not_found(name)),
+    }
+}
+
+fn operation_error_to_mcp(error: OperationError) -> McpError {
+    match error.code.as_str() {
+        "invalid_params" | "unsupported_mode" => McpError::invalid_params(error.message),
+        _ => McpError::internal(format!("{}: {}", error.code, error.message)),
+    }
 }
 
 fn read_resource<P: McpGraphProvider>(
@@ -2493,6 +2600,27 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
     }
+    // Generated algorithm-operation tools: one per registered operation, surfaced
+    // straight from the plugin registry. The four legacy algorithm tools above
+    // (pagerank, ppr, components, communities) keep their hand-wired descriptors,
+    // so they are skipped here to avoid duplicate listings. Adding a new
+    // algorithm operation in rustyred-core surfaces a new tool with no edit here.
+    const LEGACY_ALGORITHM_TOOLS: [&str; 4] = [
+        "rustyred.algorithm.pagerank",
+        "rustyred.algorithm.ppr",
+        "rustyred.algorithm.components",
+        "rustyred.algorithm.communities",
+    ];
+    for operation in builtin_plugin_registry().algorithm_operations() {
+        if LEGACY_ALGORITHM_TOOLS.contains(&operation.command()) {
+            continue;
+        }
+        tools.push(tool(
+            operation.command(),
+            operation.summary(),
+            operation.input_schema(),
+        ));
+    }
     tools
 }
 
@@ -3384,6 +3512,92 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn generated_algorithm_tools_dispatch_and_list() {
+        let (provider, config) = fixture();
+
+        // tools/list surfaces the generated operations beside the legacy four.
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({ "jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {} }),
+        );
+        let names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "rustyred.algorithm.leiden",
+            "rustyred.algorithm.betweenness",
+            "rustyred.algorithm.scc",
+            "rustyred.algorithm.similarity_knn",
+            "rustyred.algorithm.node_similarity",
+            "rustyred.algorithm.link_prediction",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing generated tool {expected}"
+            );
+        }
+        // The legacy pagerank tool stays present exactly once (no duplicate).
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.as_str() == "rustyred.algorithm.pagerank")
+                .count(),
+            1
+        );
+
+        // Leiden dispatches through the generic generated path.
+        let leiden = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "leiden", "method": "tools/call",
+                "params": { "name": "rustyred.algorithm.leiden", "arguments": { "tenant": "smoke", "mode": "stream" } }
+            }),
+        );
+        assert_eq!(
+            leiden["result"]["structuredContent"]["operation"],
+            "rustyred.algorithm.leiden"
+        );
+        assert!(
+            leiden["result"]["structuredContent"]["community_count"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+
+        // SCC reports the fixture is acyclic (a -> b, a -> c).
+        let scc = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "scc", "method": "tools/call",
+                "params": { "name": "rustyred.algorithm.scc", "arguments": { "tenant": "smoke", "mode": "stream" } }
+            }),
+        );
+        assert_eq!(scc["result"]["structuredContent"]["is_dag"], true);
+
+        // The estimate companion works through a generated tool.
+        let estimate = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "est", "method": "tools/call",
+                "params": { "name": "rustyred.algorithm.betweenness", "arguments": { "tenant": "smoke", "mode": "estimate" } }
+            }),
+        );
+        assert!(
+            estimate["result"]["structuredContent"]["estimate"]["bytes_min"]
+                .as_u64()
+                .unwrap()
+                > 0
         );
     }
 

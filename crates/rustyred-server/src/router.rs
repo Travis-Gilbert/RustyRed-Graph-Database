@@ -24,7 +24,8 @@ use rustyred_core::{
     NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
 };
 use rustyred_mcp::{
-    agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
+    agent_manifest, handle_mcp_request_with_context, mcp_manifest, run_algorithm_operation,
+    McpRequestContext,
 };
 use rustyred_search::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
@@ -410,6 +411,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/algorithms/communities",
             post(graph_algorithm_communities),
+        )
+        // Generated algorithm-operation surface (singular `algorithm`): one
+        // dispatcher route serving every registered operation under the
+        // mode-plus-estimate contract, plus a catalog. The legacy plural
+        // `algorithms/*` routes above stay byte-stable. Adding an operation in
+        // rustyred-core surfaces it here with no edit.
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithm",
+            get(graph_algorithm_catalog),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithm/:operation",
+            post(graph_algorithm_operation),
         )
         .route(
             "/v1/tenants/:tenant_id/graph/spatial/designate",
@@ -3655,6 +3669,104 @@ async fn graph_algorithm_pagerank(
     }
 }
 
+// ===== Generated algorithm-operation surface =====
+//
+// One dispatcher route (`POST /v1/tenants/:tenant_id/graph/algorithm/:operation`)
+// serves every registered algorithm operation through the same shared generation
+// path the MCP tools use (`rustyred_mcp::run_algorithm_operation`). The request
+// body is the operation's argument object (including `mode`). A registered
+// operation needs no handler here.
+
+async fn graph_algorithm_operation(
+    State(state): State<AppState>,
+    Path((tenant_id, operation)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // `mutate` writes to the graph; everything else is read-only.
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("stream");
+    let scope = if mode.eq_ignore_ascii_case("mutate") {
+        "graph:write"
+    } else {
+        "graph:read"
+    };
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let command = format!("rustyred.algorithm.{operation}");
+    match run_algorithm_operation(&command, &mut store, &body) {
+        Ok(Some(mut payload)) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("ok".to_string(), json!(true));
+                object.insert("tenant".to_string(), json!(tenant_id));
+            }
+            Json(payload).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": "unknown_operation",
+                "message": format!("no algorithm operation named {operation:?}"),
+            })),
+        )
+            .into_response(),
+        Err(error) => operation_error_response(error),
+    }
+}
+
+async fn graph_algorithm_catalog(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let operations: Vec<Value> = rustyred_core::builtin_plugin_registry()
+        .algorithm_operations()
+        .into_iter()
+        .map(|operation| {
+            json!({
+                "command": operation.command(),
+                "name": operation.name(),
+                "summary": operation.summary(),
+                "modes": operation.modes().iter().map(|mode| mode.as_str()).collect::<Vec<_>>(),
+                "input_schema": operation.input_schema(),
+                "route": format!("/v1/tenants/{tenant_id}/graph/algorithm/{}", operation.name()),
+            })
+        })
+        .collect();
+    Json(json!({ "ok": true, "tenant": tenant_id, "operations": operations })).into_response()
+}
+
+fn operation_error_response(error: rustyred_core::OperationError) -> axum::response::Response {
+    let status = match error.code.as_str() {
+        "invalid_params" | "unsupported_mode" => StatusCode::BAD_REQUEST,
+        "node_not_found" => StatusCode::NOT_FOUND,
+        other => graph_error_status(other),
+    };
+    (
+        status,
+        Json(json!({ "ok": false, "error": error.code, "message": error.message })),
+    )
+        .into_response()
+}
+
 // ===== Phase 3: Bulk loader =====
 //
 // Streaming JSONL + CSV. The handler consumes the HTTP body as it arrives,
@@ -4965,12 +5077,13 @@ mod tests {
         commit_batch_with_indexes, crawl_submit, default_ppr_alpha, default_ppr_epsilon,
         default_ppr_max_pushes, default_pr_damping, default_pr_max_iter, default_pr_tolerance,
         execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        federate_submit, graph_algorithm_communities, graph_algorithm_components,
-        graph_algorithm_pagerank, graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes,
-        graph_error_status, graph_fulltext_search, graph_vector_hybrid, graph_vector_search,
-        graph_version_checkout, graph_version_compile, graph_version_diff, graph_version_log_route,
-        graph_version_merge, graph_version_ref, instant_kg_explain_edge, instant_kg_impact,
-        instant_kg_ppr, instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
+        federate_submit, graph_algorithm_catalog, graph_algorithm_communities,
+        graph_algorithm_components, graph_algorithm_operation, graph_algorithm_pagerank,
+        graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
+        graph_fulltext_search, graph_vector_hybrid, graph_vector_search, graph_version_checkout,
+        graph_version_compile, graph_version_diff, graph_version_log_route, graph_version_merge,
+        graph_version_ref, instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr,
+        instant_kg_search, instant_kg_status, is_cache_command, is_graph_command,
         mcp_origin_allowed, public_cypher, public_peer_id_from_private_key,
         required_scope_for_command, search_json, sign_web_commons_fragment,
         submit_web_commons_fragment, transaction_begin, transaction_commit, transaction_rollback,
@@ -6196,6 +6309,104 @@ mod tests {
         assert_eq!(explain_response.status(), StatusCode::OK);
         let explain = response_payload_json(explain_response).await;
         assert_eq!(explain["explanations"][0]["layer"], "delta");
+    }
+
+    #[tokio::test]
+    async fn generated_algorithm_route_dispatches_stream_mutate_and_catalog() {
+        let state = memory_product_state();
+        let tenant_id = "tenant-algo".to_string();
+        let mut store = state.tenant_graph_store(&tenant_id).unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .upsert_node(rustyred_core::NodeRecord::new(id, ["Node"], json!({})))
+                .unwrap();
+        }
+        for (id, from, to) in [
+            ("a->b", "a", "b"),
+            ("b->c", "b", "c"),
+            ("c->a", "c", "a"),
+            ("c->d", "c", "d"),
+        ] {
+            store
+                .upsert_edge(rustyred_core::EdgeRecord::new(
+                    id,
+                    from,
+                    "REL",
+                    to,
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        drop(store);
+
+        // SCC stream over the generated route: the planted cycle is not a DAG.
+        let scc = graph_algorithm_operation(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((tenant_id.clone(), "scc".to_string())),
+            HeaderMap::new(),
+            Json(json!({ "mode": "stream" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(scc.status(), StatusCode::OK);
+        let scc_body = response_payload_json(scc).await;
+        assert_eq!(scc_body["ok"], true);
+        assert_eq!(scc_body["is_dag"], false);
+
+        // Leiden mutate writes community_id, readable back through the store.
+        let leiden = graph_algorithm_operation(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((tenant_id.clone(), "leiden".to_string())),
+            HeaderMap::new(),
+            Json(json!({ "mode": "mutate" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(leiden.status(), StatusCode::OK);
+        let store = state.tenant_graph_store(&tenant_id).unwrap();
+        let node_a = store.get_node("a").unwrap().unwrap();
+        assert!(node_a.properties.get("community_id").is_some());
+        drop(store);
+
+        // The catalog lists the generated operations.
+        let catalog = graph_algorithm_catalog(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let catalog_body = response_payload_json(catalog).await;
+        let names: Vec<String> = catalog_body["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|op| op["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "leiden",
+            "betweenness",
+            "scc",
+            "similarity_knn",
+            "node_similarity",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "catalog missing {expected}"
+            );
+        }
+
+        // Unknown operation -> 404.
+        let unknown = graph_algorithm_operation(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((tenant_id.clone(), "does_not_exist".to_string())),
+            HeaderMap::new(),
+            Json(json!({ "mode": "stream" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

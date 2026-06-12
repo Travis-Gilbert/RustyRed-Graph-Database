@@ -9,6 +9,7 @@ use crate::fulltext::{
     FullTextBackend, FullTextBackendError, FullTextDesignation, FullTextIndex,
     FULLTEXT_BACKEND_HAND_ROLLED, FULLTEXT_BACKEND_TANTIVY,
 };
+use crate::operation::AlgorithmOperation;
 use crate::spatial::{
     SpatialBackend, SpatialDesignation, SpatialError, SpatialIndex, SPATIAL_BACKEND_H3,
     SPATIAL_BACKEND_S2,
@@ -107,6 +108,13 @@ pub trait RustyRedPlugin: Send + Sync + std::fmt::Debug {
     fn operations(&self) -> Vec<PluginOperationRegistration> {
         Vec::new()
     }
+
+    /// Graph-algorithm operations carrying the mode-plus-estimate contract. The
+    /// MCP tool and HTTP route surfaces are generated from these, so adding one
+    /// needs no per-adapter edits.
+    fn algorithm_operations(&self) -> Vec<Arc<dyn AlgorithmOperation>> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -115,6 +123,7 @@ pub struct PluginRegistry {
     spatial_backends: BTreeMap<String, SpatialBackendRegistration>,
     fulltext_backends: BTreeMap<String, FullTextBackendRegistration>,
     operations: BTreeMap<String, PluginOperationRegistration>,
+    algorithm_operations: BTreeMap<String, Arc<dyn AlgorithmOperation>>,
 }
 
 impl PluginRegistry {
@@ -127,6 +136,7 @@ impl PluginRegistry {
         registry.register(CoreSpatialPlugin);
         registry.register(CoreFullTextPlugin);
         registry.register(CoreOperationsPlugin);
+        registry.register(crate::algorithm_ops::AlgorithmsPlugin);
         #[cfg(feature = "geometry")]
         registry.register(crate::geometry::GeometryPlugin);
         registry
@@ -143,6 +153,10 @@ impl PluginRegistry {
         for operation in plugin.operations() {
             self.operations
                 .insert(normalize_command(operation.command), operation);
+        }
+        for operation in plugin.algorithm_operations() {
+            self.algorithm_operations
+                .insert(normalize_command(operation.command()), operation);
         }
         self.plugins.push(plugin);
     }
@@ -177,6 +191,17 @@ impl PluginRegistry {
 
     pub fn operations(&self) -> Vec<&PluginOperationRegistration> {
         self.operations.values().collect()
+    }
+
+    /// Look up a registered algorithm operation by command (case-insensitive).
+    pub fn algorithm_operation(&self, command: &str) -> Option<&Arc<dyn AlgorithmOperation>> {
+        self.algorithm_operations.get(&normalize_command(command))
+    }
+
+    /// All registered algorithm operations, for MCP tool and HTTP route
+    /// generation.
+    pub fn algorithm_operations(&self) -> Vec<&Arc<dyn AlgorithmOperation>> {
+        self.algorithm_operations.values().collect()
     }
 
     fn insert_spatial_backend(&mut self, backend: SpatialBackendRegistration) {

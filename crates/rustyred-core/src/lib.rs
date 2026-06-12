@@ -9,6 +9,8 @@
 // take many parameters by design.
 #![allow(clippy::result_large_err, clippy::too_many_arguments)]
 
+pub mod algorithm_ops;
+pub mod algorithms;
 pub mod commands;
 pub mod errors;
 pub mod executor;
@@ -20,6 +22,7 @@ pub mod geometry;
 pub mod graph;
 pub mod graph_store;
 pub mod instant_kg;
+pub mod operation;
 pub mod plugin;
 pub mod spatial;
 #[cfg(feature = "s2")]
@@ -28,6 +31,14 @@ pub mod state;
 pub mod store;
 pub mod versioned_graph;
 
+pub use algorithm_ops::{algorithm_operations, AlgorithmsPlugin};
+pub use algorithms::{
+    adamic_adar, articulation_points_and_bridges, betweenness_centrality,
+    betweenness_centrality_sampled, common_neighbors, condense, leiden, neighbor_sets,
+    node_similarity, partition_modularity, resource_allocation, strongly_connected_components,
+    topological_sort, topological_sort_condensation, Condensation, CycleError, LeidenResult,
+    SimilarityMetric, SimilarityPair,
+};
 pub use commands::{RustyredCommand, RustyredRequest, RustyredResponse};
 pub use errors::{RustyredError, RustyredResult};
 pub use executor::{execute_request_json, InMemoryRustyredExecutor, RustyredExecutor};
@@ -62,6 +73,10 @@ pub use instant_kg::{
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
+};
+pub use operation::{
+    dispatch_operation, AlgorithmGraph, AlgorithmOperation, GraphCounts, MemoryEstimate,
+    OperationError, OperationMode,
 };
 pub use plugin::{
     builtin_plugin_registry, FullTextBackendRegistration, PluginCapability, PluginCapabilityKind,
