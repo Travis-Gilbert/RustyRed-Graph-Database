@@ -1,0 +1,319 @@
+# Instincts generated from https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+# Generated: 2026-06-11T18:11:18.488Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: RustyRed-Graph-Database-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(plugins): add geometry plugin API
+
+---
+id: RustyRed-Graph-Database-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Commit Length
+
+## Action
+
+Keep commit messages concise (~38 characters)
+
+## Evidence
+
+- Average commit message length: 38 chars
+- Based on 1 commits
+
+---
+id: RustyRed-Graph-Database-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: RustyRed-Graph-Database-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: RustyRed-Graph-Database-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: RustyRed-Graph-Database-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# RustyRed Graph Database Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: rustyred-graph-database-instinct-func-naming
+trigger: "When creating a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Func Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: rustyred-graph-database-instinct-file-naming
+trigger: "When creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct File Naming
+
+## Action
+
+Name the file using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: rustyred-graph-database-instinct-class-naming
+trigger: "When defining a new class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Class Naming
+
+## Action
+
+Name the class or struct using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: rustyred-graph-database-instinct-const-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Const Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: rustyred-graph-database-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: rustyred-graph-database-instinct-export-style
+trigger: "When exporting functions or types"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: rustyred-graph-database-instinct-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Commit Format
+
+## Action
+
+Use the conventional commit format with a prefix (e.g., 'feat:')
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Example: 'feat(plugins): add geometry plugin API'
+
+---
+id: rustyred-graph-database-instinct-commit-prefix
+trigger: "When adding a new feature"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Commit Prefix
+
+## Action
+
+Start the commit message with 'feat'
+
+## Evidence
+
+- Pattern in commits.prefixes: ['feat']
+- Example: 'feat(plugins): add geometry plugin API'
+
+---
+id: rustyred-graph-database-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 38 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 38
+
+---
+id: rustyred-graph-database-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Travis-Gilbert/RustyRed-Graph-Database
+---
+
+# Rustyred Graph Database Instinct Test Location
+
+## Action
+
+Place tests in a separate location from source code
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
