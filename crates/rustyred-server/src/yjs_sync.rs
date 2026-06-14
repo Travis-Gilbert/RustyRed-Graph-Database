@@ -172,9 +172,14 @@ fn load_provenance(state: &AppState, tenant_id: &str, node_id: &str) -> Provenan
 
 /// Persist a room's full current state as a YjsDoc node.
 fn save_doc(state: &AppState, tenant_id: &str, room: &YjsRoom, doc: &Doc, actor: &str) {
+    // `get_or_insert_text` opens its own mutable transaction internally, so the
+    // root type must be resolved BEFORE the read transaction below. Resolving it
+    // while `txn` is held deadlocks: the mutable transact blocks on the read
+    // transaction that never releases (yrs transactions are mutually exclusive).
+    let text = doc.get_or_insert_text("t");
     let txn = doc.transact();
     let bytes = txn.encode_state_as_update_v1(&StateVector::default());
-    let text_len = doc.get_or_insert_text("t").get_string(&txn).chars().count();
+    let text_len = text.get_string(&txn).chars().count();
     drop(txn);
     let updated_at_ms = now_ms();
     let mut store = match state.tenant_graph_store(tenant_id) {
