@@ -1119,22 +1119,27 @@ fn resolve_confidence_merge(
     let (Some(MergeRecord::Edge(ours)), Some(MergeRecord::Edge(theirs))) = (ours, theirs) else {
         return None;
     };
+    let (side, edge) = resolve_auto_confidence_edge(ours, theirs, min_confidence_delta)?;
+    Some(MergeDecision::Resolved {
+        selected: Some(side),
+        record: Some(MergeRecord::Edge(edge)),
+        reason: "higher_edge_confidence".to_string(),
+    })
+}
+
+pub fn resolve_auto_confidence_edge(
+    ours: &EdgeRecord,
+    theirs: &EdgeRecord,
+    min_confidence_delta: f64,
+) -> Option<(GraphMergeSide, EdgeRecord)> {
     let delta = (ours.effective_confidence() - theirs.effective_confidence()).abs();
     if delta <= min_confidence_delta.max(0.0) {
         return None;
     }
     if ours.effective_confidence() > theirs.effective_confidence() {
-        Some(MergeDecision::Resolved {
-            selected: Some(GraphMergeSide::Ours),
-            record: Some(MergeRecord::Edge(ours.clone())),
-            reason: "higher_edge_confidence".to_string(),
-        })
+        Some((GraphMergeSide::Ours, ours.clone()))
     } else {
-        Some(MergeDecision::Resolved {
-            selected: Some(GraphMergeSide::Theirs),
-            record: Some(MergeRecord::Edge(theirs.clone())),
-            reason: "higher_edge_confidence".to_string(),
-        })
+        Some((GraphMergeSide::Theirs, theirs.clone()))
     }
 }
 

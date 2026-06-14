@@ -255,9 +255,7 @@ fn sha1_hex(seed: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(seed.as_bytes());
     let out = hasher.finalize();
-    out.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
+    out.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
 
 fn atom_id(kind: &str, seed: &str) -> String {
@@ -297,8 +295,8 @@ fn parse_mentions(message: &str) -> Vec<String> {
     while i < bytes.len() {
         if bytes[i] == b'@' {
             // check preceding char is not word-class
-            let prev_is_word = i > 0
-                && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let prev_is_word =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             if !prev_is_word && i + 1 < bytes.len() {
                 let start = i + 1;
                 let first = bytes[start];
@@ -395,7 +393,9 @@ fn json_response(value: Value) -> axum::response::Response {
 
 // Reuse the canonical error renderers from router.rs so memory-verb
 // responses match the rest of the API's error envelopes.
-use crate::router::{graph_store_error_response as store_error, store_unavailable_response as unavailable_error};
+use crate::router::{
+    graph_store_error_response as store_error, store_unavailable_response as unavailable_error,
+};
 
 // ===== handlers =====
 
@@ -438,10 +438,13 @@ pub async fn memory_encode(
     let actor_id = require_str(body.actor).unwrap_or_else(|| "agent".to_string());
     let session_id = require_str(body.session_id).unwrap_or_default();
     let surface = require_str(body.surface).unwrap_or_default();
-    let title = body
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("{}: {}", kind, body.content.chars().take(80).collect::<String>()));
+    let title = body.title.clone().unwrap_or_else(|| {
+        format!(
+            "{}: {}",
+            kind,
+            body.content.chars().take(80).collect::<String>()
+        )
+    });
     let summary = body
         .summary
         .clone()
@@ -528,10 +531,12 @@ pub async fn memory_coordinate(
         .to_lowercase();
     let mentioned = parse_mentions(&body.message);
 
-    let doc_id = body
-        .doc_id
-        .clone()
-        .unwrap_or_else(|| atom_id("coord", &format!("{}|{}|{}", tenant_id, actor_id, sha1_hex(&body.message))));
+    let doc_id = body.doc_id.clone().unwrap_or_else(|| {
+        atom_id(
+            "coord",
+            &format!("{}|{}|{}", tenant_id, actor_id, sha1_hex(&body.message)),
+        )
+    });
     let title = body
         .title
         .clone()
@@ -583,24 +588,28 @@ pub async fn memory_coordinate(
         mp.insert("target_actor_id".to_string(), json!(target));
         mp.insert("parent_doc_id".to_string(), json!(doc_id));
         mp.insert("kind".to_string(), json!("mention"));
-        mp.insert("title".to_string(), json!(format!("@{} from @{}", target, actor_id)));
+        mp.insert(
+            "title".to_string(),
+            json!(format!("@{} from @{}", target, actor_id)),
+        );
         mp.insert("content".to_string(), json!(body.message));
         mp.insert("urgency".to_string(), json!(urgency));
         mp.insert("status".to_string(), json!("active"));
         mp.insert("captured_at".to_string(), json!(now_iso()));
         mp.insert("updated_at".to_string(), json!(now_iso()));
-        let mention_node = build_atom_node(
-            mention_id.clone(),
-            "Mention",
-            &[],
-            Value::Object(mp),
-        );
+        let mention_node = build_atom_node(mention_id.clone(), "Mention", &[], Value::Object(mp));
         if store.upsert_node(mention_node.clone()).is_ok() {
             state.maybe_index_node_fulltext(&tenant_id, &mention_node);
             mention_ids.push(mention_id.clone());
             // Edge: mention -> coord_doc
             let edge_id = format!("edge:{}:mentions:{}", mention_id, doc_id);
-            let edge = EdgeRecord::new(edge_id, mention_id, doc_id.clone(), "MENTIONS", Value::Object(Default::default()));
+            let edge = EdgeRecord::new(
+                edge_id,
+                mention_id,
+                doc_id.clone(),
+                "MENTIONS",
+                Value::Object(Default::default()),
+            );
             let _ = store.upsert_edge(edge);
         }
     }
@@ -942,8 +951,16 @@ pub async fn memory_recall(
 
     // Sort by fitness desc, then updated_at desc.
     hits.sort_by(|a, b| {
-        let fa = a.properties.get("fitness").and_then(Value::as_f64).unwrap_or(0.0);
-        let fb = b.properties.get("fitness").and_then(Value::as_f64).unwrap_or(0.0);
+        let fa = a
+            .properties
+            .get("fitness")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let fb = b
+            .properties
+            .get("fitness")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
     });
     hits.truncate(limit);
@@ -976,7 +993,10 @@ pub async fn memory_remember(
     let surface = require_str(body.surface).unwrap_or_default();
 
     let content_hash = sha1_hex(&body.observation);
-    let id = atom_id("remember", &format!("{}|{}|{}", tenant_id, actor_id, content_hash));
+    let id = atom_id(
+        "remember",
+        &format!("{}|{}|{}", tenant_id, actor_id, content_hash),
+    );
 
     let mut props = serde_json::Map::new();
     props.insert("tenant_slug".to_string(), json!(tenant_id));
@@ -1043,17 +1063,22 @@ pub async fn memory_self_note(
         .filter(|s| !s.is_empty())
         .unwrap_or("self_note")
         .to_lowercase();
-    let title = body
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("self_note: {}", body.content.chars().take(80).collect::<String>()));
+    let title = body.title.clone().unwrap_or_else(|| {
+        format!(
+            "self_note: {}",
+            body.content.chars().take(80).collect::<String>()
+        )
+    });
     let summary = body
         .summary
         .clone()
         .unwrap_or_else(|| body.content.chars().take(500).collect::<String>());
 
     let content_hash = sha1_hex(&body.content);
-    let id = atom_id("selfnote", &format!("{}|{}|{}", tenant_id, actor_id, content_hash));
+    let id = atom_id(
+        "selfnote",
+        &format!("{}|{}|{}", tenant_id, actor_id, content_hash),
+    );
 
     let mut props = serde_json::Map::new();
     props.insert("tenant_slug".to_string(), json!(tenant_id));
@@ -1132,7 +1157,10 @@ pub async fn memory_self_revise(
     let content_hash = sha1_hex(&body.content);
     let revised_id = atom_id(
         "revise",
-        &format!("{}|{}|{}|{}", tenant_id, actor_id, prior_doc_id, content_hash),
+        &format!(
+            "{}|{}|{}|{}",
+            tenant_id, actor_id, prior_doc_id, content_hash
+        ),
     );
     let prior_revision = prior
         .properties
@@ -1147,7 +1175,10 @@ pub async fn memory_self_revise(
             .unwrap_or("revised")
             .to_string()
     });
-    let summary = body.summary.clone().unwrap_or_else(|| body.content.chars().take(500).collect::<String>());
+    let summary = body
+        .summary
+        .clone()
+        .unwrap_or_else(|| body.content.chars().take(500).collect::<String>());
 
     let mut props = serde_json::Map::new();
     if let Value::Object(ref pm) = prior.properties {
@@ -1166,7 +1197,10 @@ pub async fn memory_self_revise(
     props.insert("revision".to_string(), json!(prior_revision + 1));
     props.insert("revision_of_doc_id".to_string(), json!(prior_doc_id));
     props.insert("supersedes_doc_id".to_string(), json!(prior_doc_id));
-    props.insert("revision_reason".to_string(), json!(body.reason.unwrap_or_default()));
+    props.insert(
+        "revision_reason".to_string(),
+        json!(body.reason.unwrap_or_default()),
+    );
     props.insert("status".to_string(), json!("active"));
     props.insert("updated_at".to_string(), json!(now_iso()));
     props.insert("captured_at".to_string(), json!(now_iso()));

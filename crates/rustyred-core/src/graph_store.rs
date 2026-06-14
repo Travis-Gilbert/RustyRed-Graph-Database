@@ -214,7 +214,19 @@ pub trait GraphStore {
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult>;
     fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult>;
     fn get_node(&self, id: &str) -> Option<&NodeRecord>;
+    fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
+        self.get_node(id).cloned()
+    }
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord>;
+    fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
+        self.get_edge(id).cloned()
+    }
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Err(GraphStoreError::new(
+            "snapshot_not_supported",
+            "this GraphStore implementation does not expose graph snapshots",
+        ))
+    }
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord>;
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit>;
     fn stats(&self) -> GraphStats;
@@ -3292,8 +3304,20 @@ impl GraphStore for InMemoryGraphStore {
         InMemoryGraphStore::get_node(self, id)
     }
 
+    fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
+        self.nodes.get(id).cloned()
+    }
+
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
         InMemoryGraphStore::get_edge(self, id)
+    }
+
+    fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
+        self.edges.get(id).cloned()
+    }
+
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(InMemoryGraphStore::snapshot(self))
     }
 
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {

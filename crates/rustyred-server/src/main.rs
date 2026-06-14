@@ -14,6 +14,7 @@ mod civic_projection;
 mod config;
 mod cypher;
 mod graph_cache;
+mod graph_sync;
 mod grpc;
 mod memory;
 mod metrics;

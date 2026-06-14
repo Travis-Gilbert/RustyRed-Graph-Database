@@ -535,6 +535,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/sync/yjs/:doc_id",
             get(crate::yjs_sync::yjs_sync_ws),
         )
+        .route(
+            "/v1/tenants/:tenant_id/sync/graph/:room_id",
+            get(crate::graph_sync::graph_sync_ws),
+        )
         .layer(cors)
         .with_state(state)
 }

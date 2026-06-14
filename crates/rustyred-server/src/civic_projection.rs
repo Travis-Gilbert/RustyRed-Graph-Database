@@ -152,9 +152,10 @@ pub fn decode_civic_rows(doc: &Doc) -> Result<Vec<CivicRow>, String> {
             };
             let mut option_values = BTreeMap::new();
             for option in options {
-                if let (Some(option_id), Some(option_value)) =
-                    (option.get("id").and_then(Value::as_str), option.get("value"))
-                {
+                if let (Some(option_id), Some(option_value)) = (
+                    option.get("id").and_then(Value::as_str),
+                    option.get("value"),
+                ) {
                     option_values.insert(option_id.to_string(), option_value.clone());
                 }
             }
@@ -549,7 +550,11 @@ mod tests {
 
         let database = blocks.insert(&mut txn, "block-db", MapPrelim::default());
         database.insert(&mut txn, "sys:flavour", "affine:database");
-        database.insert(&mut txn, "sys:children", ArrayPrelim::from(["row-1", "row-2"]));
+        database.insert(
+            &mut txn,
+            "sys:children",
+            ArrayPrelim::from(["row-1", "row-2"]),
+        );
         database.insert(
             &mut txn,
             "prop:columns",
@@ -603,7 +608,11 @@ mod tests {
         row_1.insert(&mut txn, "prop:text", TextPrelim::new("Whaley House Porch"));
         let row_2 = blocks.insert(&mut txn, "row-2", MapPrelim::default());
         row_2.insert(&mut txn, "sys:flavour", "affine:database-row");
-        row_2.insert(&mut txn, "prop:text", TextPrelim::new("Carriage Town Stage"));
+        row_2.insert(
+            &mut txn,
+            "prop:text",
+            TextPrelim::new("Carriage Town Stage"),
+        );
         drop(txn);
         doc
     }
@@ -660,7 +669,10 @@ mod tests {
         let nodes = store.query_nodes(NodeQuery::label(CIVIC_LABEL)).unwrap();
         assert_eq!(nodes.len(), 2);
 
-        let placed = store.get_node("civic-row:civic:porchfest-2026:row-1").unwrap().unwrap();
+        let placed = store
+            .get_node("civic-row:civic:porchfest-2026:row-1")
+            .unwrap()
+            .unwrap();
         assert!(placed.labels.iter().any(|label| label == CIVIC_LABEL));
         assert_eq!(placed.properties["title"], json!("Whaley House Porch"));
         assert_eq!(placed.properties["rowId"], json!("row-1"));
@@ -672,7 +684,10 @@ mod tests {
         assert_eq!(placed.properties["lat"], json!(43.0125));
         assert_eq!(placed.properties["lon"], json!(-83.6875));
 
-        let unplaced = store.get_node("civic-row:civic:porchfest-2026:row-2").unwrap().unwrap();
+        let unplaced = store
+            .get_node("civic-row:civic:porchfest-2026:row-2")
+            .unwrap()
+            .unwrap();
         assert!(unplaced.properties.get("lat").is_none());
         assert!(unplaced.properties.get("lon").is_none());
     }
@@ -711,7 +726,10 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id, "civic-row:civic:porchfest-2026:row-1");
         // Tombstoned nodes vanish from point reads as well.
-        assert!(store.get_node("civic-row:civic:porchfest-2026:row-2").unwrap().is_none());
+        assert!(store
+            .get_node("civic-row:civic:porchfest-2026:row-2")
+            .unwrap()
+            .is_none());
 
         // Re-projecting the shrunk doc tombstones nothing new.
         let again = project(&state, &doc);

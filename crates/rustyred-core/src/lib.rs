@@ -12,6 +12,7 @@
 pub mod algorithm_ops;
 pub mod algorithms;
 pub mod commands;
+pub mod crdt;
 pub mod errors;
 pub mod executor;
 pub mod fulltext;
@@ -40,6 +41,11 @@ pub use algorithms::{
     SimilarityMetric, SimilarityPair,
 };
 pub use commands::{RustyredCommand, RustyredRequest, RustyredResponse};
+pub use crdt::{
+    diff_since, diff_snapshot_since, join_delta, merge_edge_record, merge_node_record,
+    try_diff_since, try_join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch,
+    StampedMutation, VersionVector,
+};
 pub use errors::{RustyredError, RustyredResult};
 pub use executor::{execute_request_json, InMemoryRustyredExecutor, RustyredExecutor};
 pub use fulltext::{
@@ -90,12 +96,12 @@ pub use spatial::{
 pub use state::{stable_hash, RustyredEdge, RustyredNode, RustyredState};
 pub use versioned_graph::{
     build_prolly_tree, checkout_graph_version, compile_graph_pack, diff_graph_snapshots,
-    graph_version_log, merge_graph_snapshots, snapshot_content_objects, update_graph_ref,
-    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
-    GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
-    GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
-    GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate, GraphTreeChild,
-    GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog, GraphVersionRef,
-    GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
+    graph_version_log, merge_graph_snapshots, resolve_auto_confidence_edge,
+    snapshot_content_objects, update_graph_ref, CompiledGraphPack, GraphCheckoutResult,
+    GraphCommit, GraphCompileOptions, GraphCompilerCapability, GraphContentObject, GraphDiffEntry,
+    GraphMergeConflict, GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide,
+    GraphMergeStrategy, GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate,
+    GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog,
+    GraphVersionRef, GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
     VERSIONED_GRAPH_PROTOCOL_VERSION,
 };
