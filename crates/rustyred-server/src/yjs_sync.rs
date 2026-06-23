@@ -277,8 +277,9 @@ async fn handle_socket(
                         }
                     }
                     Message::Ping(payload) => {
-                        if sink.send(Message::Pong(payload)).await.is_err() {
-                            break;
+                        match sink.send(Message::Pong(payload)).await {
+                            Ok(()) => {}
+                            Err(_) => break,
                         }
                     }
                     Message::Close(_) => break,
@@ -457,6 +458,7 @@ impl ProvenanceSidecar {
     }
 
     /// Blame: which actor authored the item carrying this yrs `client_id`.
+    #[cfg(test)]
     pub(crate) fn writer_of(&self, client_id: u64) -> Option<&str> {
         self.clients.get(&client_id).map(|a| a.actor.as_str())
     }
@@ -482,8 +484,7 @@ mod tests {
     fn doc_text(doc: &Doc) -> String {
         let text = doc.get_or_insert_text("t");
         let txn = doc.transact();
-        let content = text.get_string(&txn);
-        content
+        text.get_string(&txn)
     }
 
     #[test]

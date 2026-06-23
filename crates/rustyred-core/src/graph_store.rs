@@ -2125,7 +2125,7 @@ impl RedCoreGraphStore {
 
     fn should_snapshot_for(&self, txn_id: u64) -> bool {
         let interval = self.options.snapshot_interval_writes;
-        interval > 0 && txn_id > self.snapshot_txn_id && txn_id % interval == 0
+        interval > 0 && txn_id > self.snapshot_txn_id && txn_id.is_multiple_of(interval)
     }
 
     fn write_snapshot(&mut self) -> GraphStoreResult<()> {

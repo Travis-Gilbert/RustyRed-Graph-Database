@@ -273,7 +273,7 @@ impl AppState {
             if let (Some(lat), Some(lon)) = (lat, lon) {
                 let _ = SpatialBackend::upsert(index.as_mut(), &node.id, lat, lon);
             } else {
-                let _ = SpatialBackend::remove(index.as_mut(), &node.id);
+                SpatialBackend::remove(index.as_mut(), &node.id);
             }
         }
     }

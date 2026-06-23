@@ -151,8 +151,9 @@ async fn handle_socket(state: AppState, tenant_id: String, room_id: String, sock
                         }
                     }
                     Message::Ping(payload) => {
-                        if sink.send(Message::Pong(payload)).await.is_err() {
-                            break;
+                        match sink.send(Message::Pong(payload)).await {
+                            Ok(()) => {}
+                            Err(_) => break,
                         }
                     }
                     Message::Close(_) => break,
