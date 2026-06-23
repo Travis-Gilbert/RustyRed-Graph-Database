@@ -592,7 +592,8 @@ mod tests {
             let before = server.transact().state_vector();
             {
                 let mut txn = server.transact_mut();
-                txn.apply_update(Update::decode_v1(&update).unwrap()).unwrap();
+                txn.apply_update(Update::decode_v1(&update).unwrap())
+                    .unwrap();
             }
             let after = server.transact().state_vector();
             sidecar.observe(&before, &after, actor, doc_client);

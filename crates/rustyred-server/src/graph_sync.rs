@@ -448,7 +448,11 @@ mod tests {
         let decoded: VersionVector = serde_json::from_slice(payload).unwrap();
 
         let diff = diff_since(&a, &decoded);
-        assert_eq!(diff.mutations.len(), 1, "diff is proportional, not the graph");
+        assert_eq!(
+            diff.mutations.len(),
+            1,
+            "diff is proportional, not the graph"
+        );
         match &diff.mutations[0].mutation {
             GraphMutation::NodeUpsert(node) => assert_eq!(node.id, "n:2"),
             _ => panic!("expected the missing node n:2"),
@@ -532,7 +536,11 @@ mod tests {
             &mut store,
             StampedBatch::new([StampedMutation::new(
                 GraphMutation::EdgeUpsert(EdgeRecord::new(
-                    "e:new", "n:0", "LINK", "n:49", json!({}),
+                    "e:new",
+                    "n:0",
+                    "LINK",
+                    "n:49",
+                    json!({}),
                 )),
                 Hlc::new(99, 0, ActorId::from_label("codex")),
             )]),
