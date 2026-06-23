@@ -8,7 +8,7 @@
 //! surfaces it through `execute_request_json`, the MCP tool generation, and the
 //! HTTP route generation with no per-surface code.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -24,6 +24,10 @@ use crate::graph::{
     pagerank, paths_shortest, paths_shortest_weighted, personalized_pagerank, EdgeTuple,
 };
 use crate::graph_store::EdgeRecord;
+use crate::morphology::{
+    default_relation_weights, is_morphological_relation, morphological_edges_from_records,
+    morphology_stats, MorphologicalEdge,
+};
 use crate::operation::{
     arg_bool, arg_f64, arg_str, arg_u64, arg_usize, estimate_from_coefficients, require_str,
     AlgorithmGraph, AlgorithmOperation, GraphCounts, MemoryEstimate, OperationError, OperationMode,
@@ -51,6 +55,7 @@ pub fn algorithm_operations() -> Vec<Arc<dyn AlgorithmOperation>> {
         Arc::new(SccOp),
         Arc::new(NodeSimilarityOp),
         Arc::new(LinkPredictionOp),
+        Arc::new(MorphologicalMessagePassingOp),
         Arc::new(PersonalizedPageRankOp),
         Arc::new(ConnectedComponentsOp),
         Arc::new(LabelPropagationOp),
@@ -889,6 +894,120 @@ impl AlgorithmOperation for LinkPredictionOp {
     }
 }
 
+// ===== Morphological graph message-passing scaffold =====
+
+#[derive(Clone, Copy, Debug)]
+pub struct MorphologicalMessagePassingOp;
+
+impl AlgorithmOperation for MorphologicalMessagePassingOp {
+    fn command(&self) -> &'static str {
+        "rustyred.algorithm.morphological_message_passing"
+    }
+    fn name(&self) -> &'static str {
+        "morphological_message_passing"
+    }
+    fn summary(&self) -> &'static str {
+        "Advisory message passing over city2graph-style touched_to / connected_to / faced_to edges."
+    }
+    fn modes(&self) -> &'static [OperationMode] {
+        STREAM_STATS_MUTATE
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["stream", "stats", "mutate", "estimate"], "default": "stream" },
+                "feature_property": { "type": "string", "default": "features" },
+                "mutate_property": { "type": "string", "default": "morphological_embedding" },
+                "iterations": { "type": "integer", "default": 1, "minimum": 1 },
+                "top_k": { "type": "integer" },
+                "relation_weights": {
+                    "type": "object",
+                    "additionalProperties": { "type": "number" },
+                    "default": { "touched_to": 1.0, "connected_to": 0.8, "faced_to": 0.6 }
+                }
+            }
+        })
+    }
+    fn estimate(&self, counts: GraphCounts, _args: &Value) -> MemoryEstimate {
+        // Feature table + accumulator table, bounded by the existing graph size.
+        estimate_from_coefficients(counts, 8192, 96, 192, 48, "Morphological message passing")
+    }
+    fn run(
+        &self,
+        graph: &mut dyn AlgorithmGraph,
+        mode: OperationMode,
+        args: &Value,
+    ) -> Result<Value, OperationError> {
+        let edges = graph.list_edges()?;
+        let morphological_edges = morphological_edges_from_records(&edges);
+        let stats = morphology_stats(&morphological_edges);
+        if mode == OperationMode::Stats {
+            return Ok(json!({
+                "operation": self.command(),
+                "mode": "stats",
+                "stats": stats,
+            }));
+        }
+        if morphological_edges.is_empty() {
+            return Ok(json!({
+                "operation": self.command(),
+                "mode": mode.as_str(),
+                "node_count": 0,
+                "edge_count": 0,
+                "rows": [],
+            }));
+        }
+
+        let feature_property = arg_str(args, "feature_property").unwrap_or("features");
+        let features = morphological_features(graph, &morphological_edges, feature_property)?;
+        if features.is_empty() {
+            return Err(OperationError::invalid_params(format!(
+                "no nodes incident to morphological edges carry a numeric array property {feature_property:?}"
+            )));
+        }
+        let iterations = arg_usize(args, "iterations", 1).max(1);
+        let weights = relation_weights_from_args(args);
+        let passed =
+            crate::morphology::message_pass(&features, &morphological_edges, iterations, &weights)
+                .map_err(|error| OperationError::invalid_params(error.to_string()))?;
+        let rows = morphological_rows(passed, args.get("top_k").and_then(Value::as_u64));
+
+        match mode {
+            OperationMode::Stream => Ok(json!({
+                "operation": self.command(),
+                "mode": "stream",
+                "iterations": iterations,
+                "feature_property": feature_property,
+                "relation_weights": weights,
+                "edge_count": stats.edge_count,
+                "node_count": rows.len(),
+                "rows": rows,
+            })),
+            OperationMode::Mutate => {
+                let property =
+                    arg_str(args, "mutate_property").unwrap_or("morphological_embedding");
+                for row in &rows {
+                    let node_id = row["node_id"].as_str().ok_or_else(|| {
+                        OperationError::invalid_params("internal row missing node_id")
+                    })?;
+                    graph.write_node_property(node_id, property, row["embedding"].clone())?;
+                }
+                Ok(json!({
+                    "operation": self.command(),
+                    "mode": "mutate",
+                    "iterations": iterations,
+                    "feature_property": feature_property,
+                    "mutate_property": property,
+                    "edge_count": stats.edge_count,
+                    "nodes_written": rows.len(),
+                }))
+            }
+            OperationMode::Stats | OperationMode::Estimate => unreachable!("handled earlier"),
+        }
+    }
+}
+
 // ===== Conform the pre-existing algorithms to the operation contract =====
 
 #[derive(Clone, Copy, Debug)]
@@ -1325,6 +1444,88 @@ fn edge_tuples(edges: &[EdgeRecord]) -> Vec<EdgeTuple> {
         .collect()
 }
 
+fn morphological_features(
+    graph: &dyn AlgorithmGraph,
+    edges: &[MorphologicalEdge],
+    feature_property: &str,
+) -> Result<BTreeMap<String, Vec<f64>>, OperationError> {
+    let mut node_ids = BTreeSet::new();
+    for edge in edges {
+        node_ids.insert(edge.source_id.as_str());
+        node_ids.insert(edge.target_id.as_str());
+    }
+
+    let mut features = BTreeMap::new();
+    for node_id in node_ids {
+        let Some(node) = graph.get_node(node_id)? else {
+            continue;
+        };
+        if let Some(vector) = read_f64_vector(&node.properties, feature_property) {
+            features.insert(node_id.to_string(), vector);
+        }
+    }
+    Ok(features)
+}
+
+fn read_f64_vector(properties: &Value, key: &str) -> Option<Vec<f64>> {
+    properties
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(Value::as_f64)
+        .collect()
+}
+
+fn relation_weights_from_args(args: &Value) -> BTreeMap<String, f64> {
+    let mut weights = default_relation_weights();
+    let Some(object) = args.get("relation_weights").and_then(Value::as_object) else {
+        return weights;
+    };
+    for (relation, value) in object {
+        if is_morphological_relation(relation) {
+            if let Some(weight) = value.as_f64() {
+                weights.insert(relation.trim().to_ascii_lowercase(), weight);
+            }
+        }
+    }
+    weights
+}
+
+fn morphological_rows(passed: BTreeMap<String, Vec<f64>>, top_k: Option<u64>) -> Vec<Value> {
+    let mut rows: Vec<Value> = passed
+        .into_iter()
+        .map(|(node_id, embedding)| {
+            let norm = embedding
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            json!({
+                "node_id": node_id,
+                "embedding": embedding,
+                "norm": norm,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        let left_norm = left["norm"].as_f64().unwrap_or(0.0);
+        let right_norm = right["norm"].as_f64().unwrap_or(0.0);
+        right_norm
+            .partial_cmp(&left_norm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left["node_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["node_id"].as_str().unwrap_or_default())
+            })
+    });
+    if let Some(top_k) = top_k {
+        rows.truncate(top_k as usize);
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1459,6 +1660,77 @@ mod tests {
             .map(|row| row["node_id"].as_str().unwrap().to_string())
             .collect();
         assert!(scored.contains("b") || scored.contains("c"));
+    }
+
+    #[test]
+    fn morphological_message_passing_stream_stats_and_mutate() {
+        let mut store = InMemoryGraphStore::new();
+        for (id, features) in [
+            ("place:a", vec![1.0, 0.0]),
+            ("place:b", vec![0.0, 1.0]),
+            ("movement:main", vec![0.25, 0.25]),
+        ] {
+            store
+                .upsert_node(NodeRecord::new(
+                    id,
+                    ["Morphology"],
+                    json!({ "features": features }),
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_edge(EdgeRecord::new(
+                "a-touch-b",
+                "place:a",
+                "touched_to",
+                "place:b",
+                json!({}),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "a-face-main",
+                "place:a",
+                "faced_to",
+                "movement:main",
+                json!({}),
+            ))
+            .unwrap();
+
+        let op = MorphologicalMessagePassingOp;
+        let stream = dispatch_operation(
+            &op,
+            &mut store,
+            &json!({
+                "mode": "stream",
+                "feature_property": "features",
+                "relation_weights": { "touched_to": 1.0, "faced_to": 1.0 }
+            }),
+        )
+        .unwrap();
+        assert_eq!(stream["mode"], "stream");
+        assert_eq!(stream["edge_count"], 2);
+        let place_b = stream["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["node_id"] == "place:b")
+            .expect("place:b row");
+        assert_eq!(place_b["embedding"], json!([0.5, 0.5]));
+
+        let stats = dispatch_operation(&op, &mut store, &json!({ "mode": "stats" })).unwrap();
+        assert_eq!(stats["stats"]["touched_to_count"], 1);
+        assert_eq!(stats["stats"]["faced_to_count"], 1);
+
+        let mutate = dispatch_operation(
+            &op,
+            &mut store,
+            &json!({ "mode": "mutate", "mutate_property": "morph" }),
+        )
+        .unwrap();
+        assert_eq!(mutate["nodes_written"], 3);
+        let node = GraphStore::get_node(&store, "place:b").unwrap();
+        assert_eq!(node.properties["morph"], json!([0.5, 0.5]));
     }
 
     #[test]

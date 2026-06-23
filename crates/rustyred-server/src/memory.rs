@@ -144,8 +144,10 @@ pub struct RecallBody {
     #[serde(default)]
     pub include_low_fitness: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     pub include_consolidation_sources: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     pub consume_handoffs: bool,
 }
 
@@ -207,6 +209,7 @@ pub struct SelfArchiveBody {
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub actor: Option<String>,
 }
 
@@ -347,9 +350,7 @@ fn strip_code(input: &str) -> String {
                 }
                 j += 1;
             }
-            for _ in i..j {
-                out.push(b' ');
-            }
+            out.resize(out.len() + (j - i), b' ');
             i = j;
             continue;
         }
@@ -362,9 +363,7 @@ fn strip_code(input: &str) -> String {
             if j < bytes.len() && bytes[j] == b'`' {
                 j += 1;
             }
-            for _ in i..j {
-                out.push(b' ');
-            }
+            out.resize(out.len() + (j - i), b' ');
             i = j;
             continue;
         }
@@ -765,7 +764,7 @@ pub async fn memory_mentions_wait(
     let actor = body.actor.trim().to_string();
     let limit = body.limit.unwrap_or(20).min(200);
     let timeout = body.timeout_seconds.unwrap_or(30).min(120);
-    let interval_ms = ((body.interval_seconds.unwrap_or(1.0)).max(0.1).min(5.0) * 1000.0) as u64;
+    let interval_ms = ((body.interval_seconds.unwrap_or(1.0)).clamp(0.1, 5.0) * 1000.0) as u64;
 
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(timeout);
@@ -1207,7 +1206,7 @@ pub async fn memory_self_revise(
     let properties = Value::Object(props);
 
     // Use prior labels (preserves verb kind) plus marker.
-    let mut labels: Vec<String> = prior.labels.iter().cloned().collect();
+    let mut labels: Vec<String> = prior.labels.to_vec();
     if !labels.iter().any(|l| l == "MemoryAtom") {
         labels.insert(0, "MemoryAtom".to_string());
     }

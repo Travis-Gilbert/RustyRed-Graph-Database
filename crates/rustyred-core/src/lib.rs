@@ -23,6 +23,7 @@ pub mod geometry;
 pub mod graph;
 pub mod graph_store;
 pub mod instant_kg;
+pub mod morphology;
 pub mod operation;
 pub mod plugin;
 pub mod spatial;
@@ -79,6 +80,12 @@ pub use instant_kg::{
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
+};
+pub use morphology::{
+    default_relation_weights, dual_graph_edges, is_morphological_relation,
+    message_pass as morphological_message_pass, morphological_edges_from_records, morphology_stats,
+    relation_weights_from_map, MorphologicalEdge, MorphologicalNodeKind, MorphologyError,
+    MorphologyStats, StreetSegmentTopology, CONNECTED_TO, FACED_TO, TOUCHED_TO,
 };
 pub use operation::{
     dispatch_operation, AlgorithmGraph, AlgorithmOperation, GraphCounts, MemoryEstimate,
