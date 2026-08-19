@@ -22,7 +22,8 @@ argument). That decision travels with the extract. It is not a claim
 that this snapshot is the place to build it.
 
 `public-site/` stays on-disk markdown until the extracted backend
-exists.
+exists. The compile/projection story is
+`docs/plans/public-projection.md`.
 
 ## Context
 
@@ -261,6 +262,8 @@ The version-pack refs can stay; they predate this ADR.
 
 ## Related
 
+- `docs/plans/public-projection.md` — travisgilbert.me as a Theorem
+  compile target. Companion plan; not a second model split.
 - `docs/technical/data-model.md` — shipped `0.9.1` graph snapshot
   (nodes, edges, epistemic types, content addressing). Not the
   document envelope.
