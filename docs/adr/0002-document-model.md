@@ -3,11 +3,26 @@
 Status: Proposed
 Date: 2026-08-19
 Decision drivers: Travis Gilbert
+Implementation target: extracted RustyRed / Theorem line, not this
+public `0.9.1` graph-first snapshot
 
-The decision is accepted as product direction. Status is Proposed
-because it is not implemented. This ADR is not a claim that the
-current public `0.9.1` snapshot already has document tables, collection
-tables, or a published-ref API.
+The three-way split below is accepted as product direction. Status is
+Proposed because it is not implemented.
+
+This standalone repo (`RustyRed-Graph-Database`, current `0.9.1`) is
+drastically different from Theorem. It does not take agents yet.
+Extracting the real RustyRed and updating this repo is follow-up work.
+The snapshot here is not a useful backend or control plane for the
+public site.
+
+Do not implement document tables, collection membership, or a
+published-ref API against `0.9.1` in this repo as it stands. This ADR
+still records the split (document / relational filing / graph
+argument). That decision travels with the extract. It is not a claim
+that this snapshot is the place to build it.
+
+`public-site/` stays on-disk markdown until the extracted backend
+exists.
 
 ## Context
 
@@ -39,8 +54,9 @@ document model. The missing piece is the split: what holds the
 document, what holds filing, what holds argument.
 
 The first consumer is the extracted thin public site
-(`public-site/` on travisgilbert.me). It will keep markdown on disk
-for now and later read published documents through this model.
+(`public-site/` on travisgilbert.me). It stays on-disk markdown until
+the extracted backend exists. The snapshot in this repo is not that
+backend.
 
 ## Decision
 
@@ -88,8 +104,9 @@ collection.
 
 Folders are tables. Do not encode the folder tree as graph edges.
 
-This is the product direction for filing. It is not a statement that
-`0.9.1` already ships SQL tables.
+This is the product direction for filing on the extracted line. It is
+not a statement that `0.9.1` already ships SQL tables, and it is not
+permission to add those tables to this snapshot.
 
 ### 3. Graph model holds argument
 
@@ -111,8 +128,8 @@ a parallel index.
 Stay aligned with markdown-theory: article / note / log are templates,
 not storage types.
 
-`public-site/` keeps markdown on disk until it can read the published
-ref of documents in a collection.
+`public-site/` stays on-disk markdown until the extracted backend
+exists.
 
 ### Out of the document envelope
 
@@ -202,12 +219,13 @@ do not live on the document row.
 
 ### Negative
 
-- `0.9.1` docs (`docs/technical/data-model.md` and the HTTP graph
-  surface) remain the shipped snapshot. This ADR is ahead of the
-  code. Readers must not treat Proposed as released.
-- Until a relational surface exists, any implementation that stuffs
-  collections into graph edges would contradict this decision even if
-  it "works" on today's store.
+- This repo's `0.9.1` docs (`docs/technical/data-model.md` and the HTTP
+  graph surface) remain the shipped snapshot. This ADR is not a build
+  ticket against that tree. Readers must not treat Proposed as
+  released here.
+- Implementing collection membership as graph edges on this snapshot
+  would still contradict the split, even if it "works" on today's
+  store. The fix is the extract, not a workaround in `0.9.1`.
 - Yjs persistence as `YjsDoc` nodes is a CRDT implementation detail,
   not the document envelope. Bridging buffer → working ref →
   published ref is follow-up work, not specified here as an API.
@@ -215,11 +233,13 @@ do not live on the document row.
 ### Operational
 
 - No engine, proto, or HTTP change in the PR that records this ADR.
-- `public-site/` continues to serve on-disk markdown until it can read
-  published documents through this model.
-- When implementation starts, document body is designated into the
-  existing BM25 and vector indexes rather than growing a third search
-  path.
+- Do not implement document tables, collection membership, or a
+  published-ref API against `0.9.1` in this repo as it stands.
+- `public-site/` stays on-disk markdown until the extracted backend
+  exists.
+- When implementation starts on the extracted / Theorem line, document
+  body is designated into the existing BM25 and vector indexes rather
+  than growing a third search path.
 - markdown-theory templates remain the presentation vocabulary for
   article / note / log. They do not become RustyRed storage types.
 - Technical reference for the live graph stays in
@@ -228,15 +248,16 @@ do not live on the document row.
 
 ## Reversibility
 
-Fully reversible until implementation lands. To revert the decision:
+Fully reversible until implementation lands on the extracted line. To
+revert the decision:
 
 1. Mark this ADR Superseded and point at the replacement.
-2. Keep storing collaborative buffers as `YjsDoc` graph nodes and
-   filing as labels or edges, which is what `0.9.1` already allows.
+2. Leave this `0.9.1` snapshot as it is: collaborative buffers as
+   `YjsDoc` graph nodes, no document tables here.
 
-After implementation, reversal is a migration: documents and
-membership tables would fold back into graph records. The version-pack
-refs can stay; they predate this ADR.
+After implementation on the extract, reversal is a migration:
+documents and membership tables would fold back into graph records.
+The version-pack refs can stay; they predate this ADR.
 
 ## Related
 
